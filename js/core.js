@@ -550,6 +550,41 @@
     return Array.from({ length: 42 }, (_, i) => addDays(start, i));
   }
 
+  /* ------------------------------------------------------------------ sync */
+
+  // Ids of plans that were added, changed or removed between two snapshots.
+  // Plans are updated immutably, so an unchanged plan keeps its identity.
+  function changedPlanIds(before, after) {
+    const previous = new Map(before.map((p) => [p.id, p]));
+    const ids = new Set();
+    for (const plan of after) {
+      if (previous.get(plan.id) !== plan) ids.add(plan.id);
+      previous.delete(plan.id);
+    }
+    for (const id of previous.keys()) ids.add(id);
+    return ids;
+  }
+
+  // Applies changes from the server. `data: null` means deleted. Plans with
+  // local edits that haven't been sent yet (`skip`) keep the local version.
+  function applyRemoteChanges(plans, changes, skip = new Set(), now = new Date()) {
+    const byId = new Map(plans.map((p) => [p.id, p]));
+    let changed = false;
+    for (const change of changes) {
+      if (!change || typeof change.id !== 'string' || skip.has(change.id)) continue;
+      if (change.data === null || change.data === undefined) {
+        if (byId.delete(change.id)) changed = true;
+        continue;
+      }
+      const incoming = normalizePlan({ ...change.data, id: change.id }, now);
+      const current = byId.get(change.id);
+      if (current && JSON.stringify(current) === JSON.stringify(incoming)) continue;
+      byId.set(change.id, incoming);
+      changed = true;
+    }
+    return changed ? [...byId.values()] : plans;
+  }
+
   /* --------------------------------------------------------- import/export */
 
   function exportData(plans, now = new Date()) {
@@ -661,6 +696,8 @@
     nextUp,
     computeStats,
     monthGrid,
+    changedPlanIds,
+    applyRemoteChanges,
     exportData,
     importData,
     samplePlans,

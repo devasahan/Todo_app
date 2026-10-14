@@ -3,8 +3,9 @@
 A simple planner for daily work. Each **plan** has a title, a description, a deadline and a status
 (**To do → In progress → Done**). You can also add steps, tags and a priority.
 
-It needs no install, no account and no server. Open the page and start planning. Your plans are
-saved in your browser.
+It needs no install and no server: open the page and start planning, and your plans are saved in
+your browser. Put it online (for example on PythonAnywhere, below) and you can also **sign in with
+an email and password** to see the same plans in every browser.
 
 ## Getting started
 
@@ -67,6 +68,16 @@ Click **Save**.
 **5. Go live.** Back on the **Web** tab, click the green **Reload** button and open
 `https://yourname.pythonanywhere.com`.
 
+**6. Turn on HTTPS only.** Near the bottom of the **Web** tab, in the **Security** section, switch
+**Force HTTPS** on and click **Reload** again. Your password is then always sent encrypted.
+
+**7. Create your Dayplan account.** On your site, click **Sign in** (top right) and create an
+account with your email and a new password. Use a password you don't use anywhere else. After the
+first account exists, sign-up closes, so strangers can't make accounts on your site.
+
+On any other browser or phone, open the same address, click **Sign in** and use the same email and
+password. Your plans appear and stay in sync.
+
 **If you see "Something went wrong".** On the **Web** tab, open the **error log** link in the
 **Log files** section. The last lines say what failed. A misspelled username in step 4 is the most
 common cause (`No module named 'dayplan_wsgi'`).
@@ -82,9 +93,18 @@ for another month.
 cd ~/Todo_app && git pull
 ```
 
-Your plans live in your browser, not on PythonAnywhere, so updating or reloading never touches
-them. A new address starts out empty: use **Export backup** and **Import backup** in the **⋯** menu
-to bring plans over from another copy.
+Updating never touches your plans: they're stored outside the code, in
+`/home/yourname/dayplan-data/`.
+
+**Forgot your password?** In a Bash console run the line below, type a new password twice, and
+sign in with it. This also signs that account out on every other device.
+
+```bash
+python3 ~/Todo_app/dayplan_api.py set-password you@example.com
+```
+
+The same command adds an account for someone else (family, a colleague), since sign-up is closed
+after the first account. `python3 ~/Todo_app/dayplan_api.py list-users` shows who has an account.
 
 ## What you can do
 
@@ -158,9 +178,27 @@ Press <kbd>Shift</kbd>+<kbd>Enter</kbd> to open the full editor with the parsed 
 
 ## Where your data lives
 
-Plans are stored in your browser's `localStorage`, on your device only. Nothing is sent anywhere.
-Each browser and device keeps its own copy, so use **Export backup** to move plans between them
-or to keep a safe copy. Clearing your browser's site data deletes your plans.
+**Not signed in:** plans are stored in your browser's `localStorage`, on your device only.
+Nothing is sent anywhere. Each browser keeps its own copy, so use **Export backup** to move plans
+between them or to keep a safe copy. Clearing your browser's site data deletes them.
+
+**Signed in:** plans are also saved to your account on the server, in a SQLite database at
+`../dayplan-data/dayplan.sqlite3` (next to the code, never inside it, and never on GitHub). Every
+change is sent within a second. Other browsers pick up changes when you open or switch back to
+them, and every minute while they're open. If you're offline, changes wait and are sent when
+you're back. The dot on your account button shows this: green is saved, amber is saving, grey is
+offline.
+
+When you sign in on a browser that already has plans, those plans are added to your account.
+Signing out removes the plans from that browser (they stay safe in your account), so nothing is
+left behind on a shared computer.
+
+How it's protected:
+- Passwords are never stored, only a salted PBKDF2-SHA256 hash (600,000 rounds).
+- You stay signed in with a random session token in an `HttpOnly`, `SameSite=Lax` cookie (and
+  `Secure` over HTTPS). Only a hash of the token is stored on the server.
+- Ten wrong passwords in 15 minutes lock that email for the rest of the 15 minutes.
+- Each account only ever sees its own plans.
 
 ## Project layout
 
@@ -168,9 +206,10 @@ or to keep a safe copy. Clearing your browser's site data deletes your plans.
 index.html          Page structure, editor dialog and shortcut sheet
 css/styles.css      All styling, light/dark themes and mobile layouts
 js/core.js          Pure logic: plan model, quick-add parser, deadlines, sorting, stats
-js/app.js           UI: rendering, drag & drop, editor, storage, shortcuts
+js/app.js           UI: rendering, drag & drop, editor, storage, sign-in and sync
 dayplan_wsgi.py     Serves the app on PythonAnywhere (only index.html, css/ and js/)
-tests/              Unit tests for js/core.js and dayplan_wsgi.py
+dayplan_api.py      Accounts and plan sync (/api/...), stored in SQLite; also a small CLI
+tests/              Unit tests for js/core.js, dayplan_wsgi.py and dayplan_api.py
 ```
 
 `js/core.js` doesn't touch the page at all, so all the rules (date parsing, what counts as
@@ -178,7 +217,7 @@ overdue, streaks and so on) are covered by fast unit tests:
 
 ```bash
 npm test               # app logic, with Node's built-in test runner (Node 18+)
-npm run test:server    # dayplan_wsgi.py, with Python's unittest (Python 3.8+)
+npm run test:server    # dayplan_wsgi.py and dayplan_api.py, with Python's unittest (Python 3.8+)
 ```
 
-No dependencies need to be installed.
+No dependencies need to be installed: the server side uses only Python's standard library.

@@ -1,8 +1,8 @@
 """WSGI entry point for hosting Dayplan on PythonAnywhere (or any WSGI host).
 
-Dayplan is a static site, so this only hands out its files: the page itself
-plus everything under css/ and js/. Nothing else in the repository (README,
-tests, .git, ...) is reachable.
+It hands out the app's files (the page itself plus everything under css/
+and js/) and sends /api/ requests (accounts and plan sync) to dayplan_api.py.
+Nothing else in the repository (README, tests, .git, ...) is reachable.
 
 On PythonAnywhere, point the web app's WSGI configuration file here:
 
@@ -11,6 +11,8 @@ On PythonAnywhere, point the web app's WSGI configuration file here:
     from dayplan_wsgi import application
 """
 from pathlib import Path
+
+import dayplan_api
 
 ROOT = Path(__file__).resolve().parent
 PUBLIC_DIRS = ('css', 'js')
@@ -49,6 +51,9 @@ def find_file(url_path):
 
 
 def application(environ, start_response):
+    if environ.get('PATH_INFO', '').startswith('/api/'):
+        return dayplan_api.handle(environ, start_response)
+
     method = environ.get('REQUEST_METHOD', 'GET')
     if method not in ('GET', 'HEAD'):
         start_response('405 Method Not Allowed', [('Allow', 'GET, HEAD'), ('Content-Type', 'text/plain')])

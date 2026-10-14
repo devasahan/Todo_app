@@ -50,6 +50,14 @@
     }
   }
 
+  function removeStorage(key) {
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      /* nothing to remove */
+    }
+  }
+
   let loadProblem = '';
 
   function loadPlans() {
@@ -118,8 +126,14 @@
   const filtersActive = () => Boolean(state.filters.query || state.filters.tag || state.filters.priority);
 
   function setPlans(plans) {
+    const before = state.plans;
     state.plans = plans;
     savePlans();
+    if (sync.user) {
+      for (const id of C.changedPlanIds(before, plans)) sync.pending.add(id);
+      saveSyncState();
+      scheduleSync();
+    }
     render();
   }
 
@@ -379,6 +393,7 @@
           <button type="button" class="btn primary" data-action="new">${icon('plus')} Create a plan</button>
           <button type="button" class="btn ghost" data-action="samples">${icon('sparkle')} Show me with sample plans</button>
         </div>
+        ${accountPromptHTML()}
       </section>`;
   }
 
@@ -1331,7 +1346,7 @@
       }
     });
     document.addEventListener('click', (e) => {
-      if (menu.open && !menu.contains(e.target)) menu.open = false;
+      for (const open of $$('details.menu[open]')) if (!open.contains(e.target)) open.open = false;
     });
     menu.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && menu.open) {
@@ -1345,6 +1360,409 @@
       if (file) importPlans(file);
     });
     for (const btn of $$('#shortcuts [data-close]')) btn.addEventListener('click', () => $('#shortcuts').close());
+  }
+
+  /* ------------------------------------------------------- accounts & sync */
+
+  // When the page is served by dayplan_wsgi.py (e.g. on PythonAnywhere),
+  // people can sign in and their plans are kept in their account, so every
+  // browser they sign in with shows the same plans. Opened as a plain file,
+  // none of this appears and plans stay in this browser only.
+
+  const SYNC_KEY = 'dayplan.sync.v1';
+  const LOGOUT_KEY = 'dayplan.logout-pending';
+  const SYNC_TEXT = {
+    saved: 'All changes saved to your account',
+    saving: 'Saving…',
+    offline: "You're offline. Changes will be saved when you reconnect.",
+    error: "Couldn't save your changes. Trying again…",
+  };
+
+  const sync = {
+    available: false, // the server supports accounts
+    signupOpen: false,
+    user: '', // email of the signed-in account
+    cursor: 0, // last server revision this browser has seen
+    pending: new Set(), // plan ids changed here and not yet saved to the account
+    running: null,
+    again: false,
+    timer: null,
+    retryDelay: 0,
+    status: 'saved',
+  };
+
+  function loadSyncState() {
+    try {
+      const saved = JSON.parse(readStorage(SYNC_KEY) || '{}');
+      if (typeof saved.user !== 'string' || !saved.user) return;
+      sync.user = saved.user;
+      sync.cursor = Number.isInteger(saved.cursor) && saved.cursor >= 0 ? saved.cursor : 0;
+      const pending = Array.isArray(saved.pending) ? saved.pending : [];
+      sync.pending = new Set(pending.filter((id) => typeof id === 'string'));
+    } catch {
+      /* start without an account */
+    }
+  }
+
+  function saveSyncState() {
+    if (!sync.user) {
+      removeStorage(SYNC_KEY);
+      return;
+    }
+    writeStorage(SYNC_KEY, JSON.stringify({ user: sync.user, cursor: sync.cursor, pending: [...sync.pending] }));
+  }
+
+  function clearSyncState() {
+    clearTimeout(sync.timer);
+    sync.user = '';
+    sync.cursor = 0;
+    sync.pending.clear();
+    sync.retryDelay = 0;
+    sync.status = 'saved';
+    saveSyncState();
+  }
+
+  // Another tab signed in, signed out or synced.
+  function adoptSyncStateFromOtherTab() {
+    const mine = new Set(sync.pending);
+    const wasUser = sync.user;
+    sync.user = '';
+    loadSyncState();
+    if (sync.user && sync.user === wasUser) for (const id of mine) sync.pending.add(id);
+    updateAccountUI();
+    render();
+  }
+
+  async function api(path, body) {
+    const response = await fetch(path, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      /* not JSON */
+    }
+    if (!response.ok) {
+      const err = new Error((data && data.error) || `The server answered ${response.status}.`);
+      err.status = response.status;
+      throw err;
+    }
+    return data;
+  }
+
+  function scheduleSync(delay = 700) {
+    if (!sync.user) return;
+    clearTimeout(sync.timer);
+    sync.timer = setTimeout(syncNow, delay);
+  }
+
+  // Sends local changes and fetches changes made in other browsers.
+  // Only one request runs at a time; calls made meanwhile run right after.
+  function syncNow() {
+    if (!sync.user || !sync.available) return Promise.resolve();
+    if (sync.running) {
+      sync.again = true;
+      return sync.running;
+    }
+    clearTimeout(sync.timer);
+    sync.running = runSync().finally(() => {
+      sync.running = null;
+      if (sync.again) {
+        sync.again = false;
+        scheduleSync(0);
+      }
+    });
+    return sync.running;
+  }
+
+  async function runSync() {
+    const user = sync.user;
+    const ids = [...sync.pending];
+    sync.pending.clear();
+    const changes = ids.map((id) => ({ id, data: findPlan(id) || null }));
+    if (ids.length) setSyncStatus('saving');
+    try {
+      const result = await api('api/sync', { cursor: sync.cursor, changes });
+      if (sync.user !== user) return; // signed out while this was running
+      if (result.reset) {
+        // The server has an older copy than this browser remembers: resend everything.
+        sync.cursor = 0;
+        for (const id of ids) sync.pending.add(id);
+        for (const plan of state.plans) sync.pending.add(plan.id);
+        saveSyncState();
+        sync.again = true;
+        return;
+      }
+      sync.cursor = result.cursor;
+      const next = C.applyRemoteChanges(state.plans, result.changes || [], sync.pending);
+      if (next !== state.plans) {
+        state.plans = next;
+        savePlans();
+        render();
+      }
+      sync.retryDelay = 0;
+      saveSyncState();
+      setSyncStatus(sync.pending.size ? 'saving' : 'saved');
+    } catch (err) {
+      if (sync.user !== user) return;
+      for (const id of ids) sync.pending.add(id);
+      saveSyncState();
+      if (err.status === 401) {
+        signedOutElsewhere();
+        return;
+      }
+      setSyncStatus(err.status ? 'error' : 'offline');
+      sync.retryDelay = Math.min(sync.retryDelay ? sync.retryDelay * 2 : 5000, 5 * 60 * 1000);
+      scheduleSync(sync.retryDelay);
+    }
+  }
+
+  // Signs this browser in to `email`. Plans already here are added to the account.
+  function startSession(email) {
+    sync.user = email;
+    sync.cursor = 0;
+    sync.pending = new Set(state.plans.map((p) => p.id));
+    sync.retryDelay = 0;
+    saveSyncState();
+    updateAccountUI();
+    render();
+    return syncNow();
+  }
+
+  // The server no longer knows this browser's sign-in (expired, or the
+  // password was changed). Plans stay here; signing in again merges them.
+  function signedOutElsewhere() {
+    const email = sync.user;
+    clearSyncState();
+    updateAccountUI();
+    render();
+    toast('You were signed out. Sign in again to keep your plans in sync.', {
+      action: 'Sign in',
+      onAction: () => openAuth('signin', email),
+    });
+  }
+
+  async function signOut() {
+    await syncNow();
+    if (
+      sync.pending.size &&
+      !window.confirm(
+        "Some changes haven't reached your account yet, maybe because you're offline. Sign out anyway and lose them on this browser?"
+      )
+    ) {
+      return;
+    }
+    try {
+      await api('api/logout', {});
+      removeStorage(LOGOUT_KEY);
+    } catch {
+      // Offline: finish signing out on the server next time the page loads.
+      writeStorage(LOGOUT_KEY, '1');
+    }
+    clearSyncState();
+    // Plans are safe in the account; don't leave them on a shared computer.
+    state.plans = [];
+    savePlans();
+    updateAccountUI();
+    render();
+    toast('Signed out. Your plans are safe in your account.');
+  }
+
+  function setSyncStatus(status) {
+    sync.status = status;
+    $('#sync-dot').dataset.status = status;
+    $('#sync-text').textContent = SYNC_TEXT[status];
+    $('#account summary').setAttribute('aria-label', `Account: ${sync.user}. ${SYNC_TEXT[status]}`);
+    $('#account summary').title = `${sync.user}\n${SYNC_TEXT[status]}`;
+  }
+
+  function updateAccountUI() {
+    const signedIn = Boolean(sync.user);
+    $('#sign-in').hidden = !sync.available || signedIn;
+    $('#account').hidden = !signedIn;
+    if (signedIn) {
+      $('#account-email').textContent = sync.user;
+      $('#account-initial').textContent = sync.user.charAt(0).toUpperCase();
+    } else {
+      $('#account').open = false;
+    }
+    setSyncStatus(sync.status);
+  }
+
+  function accountPromptHTML() {
+    if (!sync.available || sync.user) return '';
+    return sync.signupOpen
+      ? `<p class="account-prompt">Want your plans in every browser?
+           <button type="button" class="link" data-action="sign-up">Create an account</button></p>`
+      : `<p class="account-prompt">Already have an account?
+           <button type="button" class="link" data-action="sign-in">Sign in to see your plans</button></p>`;
+  }
+
+  // Passwords must never travel over plain http.
+  function ensureHttps() {
+    const local = ['localhost', '127.0.0.1', '[::1]', ''].includes(location.hostname);
+    if (location.protocol === 'http:' && !local) {
+      location.replace(`https://${location.host}${location.pathname}${location.search}${location.hash}`);
+      return false;
+    }
+    return true;
+  }
+
+  /* ---- sign-in dialog */
+
+  const auth = { dialog: $('#auth'), form: $('#auth-form'), mode: 'signin', busy: false };
+  const authField = (name) => auth.form.elements.namedItem(name);
+
+  function openAuth(mode = 'signin', email = '') {
+    if (!sync.available || !ensureHttps()) return;
+    auth.mode = mode === 'signup' && sync.signupOpen ? 'signup' : 'signin';
+    renderAuthMode();
+    if (email) authField('email').value = email;
+    authField('password').value = '';
+    $('#auth-error').hidden = true;
+    auth.dialog.showModal();
+    (authField('email').value ? authField('password') : authField('email')).focus();
+  }
+
+  function renderAuthMode() {
+    const signup = auth.mode === 'signup';
+    $('#auth-heading').textContent = signup ? 'Create your account' : 'Sign in';
+    $('#auth-intro').textContent = signup
+      ? 'Your plans will be saved to this account, so you can open them in any browser.'
+      : 'Sign in to see your plans in any browser.';
+    $('#auth-submit').textContent = signup ? 'Create account' : 'Sign in';
+    authField('password').setAttribute('autocomplete', signup ? 'new-password' : 'current-password');
+    $('#auth-hint').hidden = !signup;
+    const toggle = $('#auth-switch');
+    toggle.hidden = !sync.signupOpen;
+    toggle.textContent = signup ? 'I already have an account' : 'Create an account';
+  }
+
+  function showAuthError(message) {
+    const box = $('#auth-error');
+    box.textContent = message;
+    box.hidden = false;
+  }
+
+  async function submitAuth() {
+    if (auth.busy) return;
+    const signup = auth.mode === 'signup';
+    const email = authField('email').value.trim();
+    const password = authField('password').value;
+    if (!email || !password) {
+      showAuthError('Enter your email and password.');
+      return;
+    }
+    if (signup && password.length < 8) {
+      showAuthError('Use at least 8 characters for your password.');
+      return;
+    }
+    auth.busy = true;
+    $('#auth-submit').disabled = true;
+    $('#auth-error').hidden = true;
+    try {
+      const result = await api(signup ? 'api/register' : 'api/login', { email, password });
+      authField('password').value = '';
+      auth.dialog.close();
+      if (signup) sync.signupOpen = false;
+      const brought = state.plans.length;
+      await startSession(result.user.email);
+      if (signup) toast(`Account created. Your plans are now saved to ${result.user.email}.`);
+      else if (brought) toast(`Signed in. The ${brought} ${brought === 1 ? 'plan' : 'plans'} on this browser were added to your account.`);
+      else toast(`Signed in as ${result.user.email}.`);
+    } catch (err) {
+      showAuthError(err.status ? err.message : "Couldn't reach the server. Check your connection and try again.");
+    } finally {
+      auth.busy = false;
+      $('#auth-submit').disabled = false;
+    }
+  }
+
+  function setupAccounts() {
+    auth.form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      submitAuth();
+    });
+    auth.form.addEventListener('input', () => {
+      $('#auth-error').hidden = true;
+    });
+    $('#auth-switch').addEventListener('click', () => {
+      auth.mode = auth.mode === 'signup' ? 'signin' : 'signup';
+      renderAuthMode();
+      $('#auth-error').hidden = true;
+      authField('email').focus();
+    });
+    for (const btn of $$('#auth [data-close]')) btn.addEventListener('click', () => auth.dialog.close());
+    $('#sign-in').addEventListener('click', () => openAuth(sync.signupOpen ? 'signup' : 'signin'));
+
+    const menu = $('#account');
+    menu.addEventListener('click', async (e) => {
+      const item = e.target.closest('[data-account]');
+      if (!item) return;
+      menu.open = false;
+      if (item.dataset.account === 'sign-out') {
+        signOut();
+        return;
+      }
+      await syncNow();
+      if (sync.status === 'saved') toast('Everything is up to date.');
+    });
+    menu.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && menu.open) {
+        menu.open = false;
+        $('summary', menu).focus();
+      }
+    });
+
+    updateAccountUI();
+    connectToServer();
+  }
+
+  async function connectToServer() {
+    if (location.protocol === 'file:') return;
+    if (readStorage(LOGOUT_KEY)) {
+      try {
+        await api('api/logout', {});
+        removeStorage(LOGOUT_KEY);
+      } catch {
+        /* still offline; try again next time */
+      }
+    }
+    let me;
+    try {
+      me = await api('api/me');
+    } catch (err) {
+      if (sync.user && !err.status) {
+        // Offline with a saved sign-in: keep working and catch up later.
+        sync.available = true;
+        updateAccountUI();
+        setSyncStatus('offline');
+        scheduleSync(15000);
+      }
+      return; // no accounts on this server (e.g. static hosting)
+    }
+    sync.available = true;
+    sync.signupOpen = Boolean(me && me.signup);
+    if (!ensureHttps()) return;
+
+    const serverUser = me && me.user ? me.user.email : '';
+    if (serverUser && serverUser === sync.user) {
+      updateAccountUI();
+      render();
+      syncNow();
+    } else if (serverUser && !sync.user) {
+      await startSession(serverUser);
+    } else if (sync.user) {
+      signedOutElsewhere();
+    } else {
+      updateAccountUI();
+      render();
+    }
   }
 
   /* --------------------------------------------------------------- events */
@@ -1378,6 +1796,12 @@
           break;
         case 'samples':
           addSamples();
+          break;
+        case 'sign-in':
+          openAuth('signin');
+          break;
+        case 'sign-up':
+          openAuth('signup');
           break;
         case 'go':
           setView(el.dataset.view);
@@ -1529,14 +1953,22 @@
         state.plans = loadPlans();
         render();
       }
+      if (e.key === SYNC_KEY) adoptSyncStateFromOtherTab();
     });
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) render();
+      if (document.hidden) return;
+      render();
+      syncNow();
     });
+    window.addEventListener('online', () => syncNow());
     setInterval(() => {
-      if (!document.hidden && !state.dragId) render();
+      if (document.hidden || state.dragId) return;
+      render();
+      syncNow();
     }, 60 * 1000);
 
+    loadSyncState();
+    setupAccounts();
     render();
     if (loadProblem) toast(loadProblem);
   }

@@ -259,3 +259,40 @@ test('sample plans are valid and varied', () => {
   assert.deepEqual(new Set(samples.map((p) => p.status)), new Set(C.STATUSES));
   for (const p of samples) assert.deepEqual(C.normalizePlan(p, NOW), p);
 });
+
+test('changedPlanIds finds added, edited and removed plans', () => {
+  const a = plan({ id: 'a' });
+  const b = plan({ id: 'b' });
+  const c = plan({ id: 'c' });
+  const before = [a, b, c];
+  const after = [a, { ...b, title: 'Edited' }, plan({ id: 'd' })];
+  assert.deepEqual([...C.changedPlanIds(before, after)].sort(), ['b', 'c', 'd']);
+  assert.equal(C.changedPlanIds(before, [...before]).size, 0);
+});
+
+test('applyRemoteChanges merges server changes but keeps unsent local edits', () => {
+  const local = [plan({ id: 'a', title: 'Local A' }), plan({ id: 'b', title: 'Local B' }), plan({ id: 'c' })];
+  const result = C.applyRemoteChanges(
+    local,
+    [
+      { id: 'a', data: { title: 'Server A' } },
+      { id: 'b', data: { title: 'Server B' } },
+      { id: 'c', data: null },
+      { id: 'n', data: { title: 'New from phone', status: 'done' } },
+      { id: 'gone', data: null },
+      { bogus: true },
+    ],
+    new Set(['b']),
+    NOW
+  );
+  const byId = Object.fromEntries(result.map((p) => [p.id, p]));
+  assert.equal(byId.a.title, 'Server A');
+  assert.equal(byId.b.title, 'Local B'); // edited locally, not sent yet
+  assert.equal(byId.c, undefined);
+  assert.equal(byId.n.status, 'done');
+  assert.equal(result.length, 3);
+
+  // Identical data is not a change, so the same array comes back.
+  assert.equal(C.applyRemoteChanges(result, [{ id: 'a', data: { ...byId.a } }], new Set(), NOW), result);
+  assert.equal(C.applyRemoteChanges(result, [], new Set(), NOW), result);
+});

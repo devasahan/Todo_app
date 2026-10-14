@@ -2050,6 +2050,97 @@ select {
   text-align: right;
 }
 
+/* ------------------------------------------------------------- account */
+
+.sign-in-btn {
+  margin-right: 2px;
+}
+
+.avatar-btn {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.avatar {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--accent-bg);
+  color: var(--on-accent);
+  font-size: 14px;
+  font-weight: 700;
+  transition: box-shadow 0.15s;
+}
+
+.avatar-btn:hover .avatar,
+.account[open] .avatar {
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* Green: saved. Amber: saving. Grey: offline. Red: problem. */
+.sync-dot {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--bg);
+  border-radius: 50%;
+  background: var(--done);
+}
+
+.sync-dot[data-status='saving'] {
+  background: var(--medium);
+}
+
+.sync-dot[data-status='offline'] {
+  background: var(--todo);
+}
+
+.sync-dot[data-status='error'] {
+  background: var(--danger);
+}
+
+.account-info {
+  display: grid;
+  gap: 2px;
+  padding: 8px 12px 6px;
+  font-size: 13px;
+}
+
+.account-info strong {
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.sync-text {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.auth-intro {
+  color: var(--text-2);
+}
+
+.field-hint {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.account-prompt {
+  margin-top: 4px;
+  color: var(--text-2);
+  font-size: 14px;
+}
+
 /* --------------------------------------------------------------- toast */
 
 .toast {
@@ -2209,6 +2300,14 @@ select {
 
   .search input {
     width: 100%;
+  }
+
+  .sign-in-btn {
+    padding: 0 10px;
+  }
+
+  .sign-in-btn span {
+    display: none;
   }
 
   .search kbd {
