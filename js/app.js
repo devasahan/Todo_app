@@ -1381,7 +1381,11 @@
   const sync = {
     available: false, // the server supports accounts
     signupOpen: false,
+    first: false, // no account exists yet: the next one becomes the admin
     user: '', // email of the signed-in account
+    admin: false,
+    pendingUsers: 0, // sign-up requests waiting for the admin
+    notifiedPending: 0,
     cursor: 0, // last server revision this browser has seen
     pending: new Set(), // plan ids changed here and not yet saved to the account
     running: null,
@@ -1415,6 +1419,9 @@
   function clearSyncState() {
     clearTimeout(sync.timer);
     sync.user = '';
+    sync.admin = false;
+    sync.pendingUsers = 0;
+    sync.notifiedPending = 0;
     sync.cursor = 0;
     sync.pending.clear();
     sync.retryDelay = 0;
@@ -1499,6 +1506,7 @@
         return;
       }
       sync.cursor = result.cursor;
+      if (typeof result.pending === 'number') setPendingUsers(result.pending);
       const next = C.applyRemoteChanges(state.plans, result.changes || [], sync.pending);
       if (next !== state.plans) {
         state.plans = next;
@@ -1523,8 +1531,9 @@
   }
 
   // Signs this browser in to `email`. Plans already here are added to the account.
-  function startSession(email) {
+  function startSession(email, admin = false) {
     sync.user = email;
+    sync.admin = Boolean(admin);
     sync.cursor = 0;
     sync.pending = new Set(state.plans.map((p) => p.id));
     sync.retryDelay = 0;
@@ -1577,8 +1586,14 @@
     sync.status = status;
     $('#sync-dot').dataset.status = status;
     $('#sync-text').textContent = SYNC_TEXT[status];
-    $('#account summary').setAttribute('aria-label', `Account: ${sync.user}. ${SYNC_TEXT[status]}`);
-    $('#account summary').title = `${sync.user}\n${SYNC_TEXT[status]}`;
+    updateAccountLabel();
+  }
+
+  function updateAccountLabel() {
+    const waiting = sync.admin && sync.pendingUsers ? ` ${sync.pendingUsers} waiting for approval.` : '';
+    const summary = $('#account summary');
+    summary.setAttribute('aria-label', `Account: ${sync.user}. ${SYNC_TEXT[sync.status]}${waiting}`);
+    summary.title = `${sync.user}\n${SYNC_TEXT[sync.status]}${waiting ? `\n${waiting.trim()}` : ''}`;
   }
 
   function updateAccountUI() {
@@ -1592,13 +1607,43 @@
       $('#account').open = false;
     }
     setSyncStatus(sync.status);
+    updateAdminBadge();
+  }
+
+  // The admin sees how many people are waiting, on the avatar and in the menu.
+  function updateAdminBadge() {
+    const count = sync.admin ? sync.pendingUsers : 0;
+    $('#admin-item').hidden = !sync.admin;
+    for (const id of ['#avatar-badge', '#admin-count']) {
+      $(id).hidden = count === 0;
+      $(id).textContent = count;
+    }
+    updateAccountLabel();
+  }
+
+  function setPendingUsers(count) {
+    sync.pendingUsers = count;
+    updateAdminBadge();
+    if (sync.admin && count > sync.notifiedPending) {
+      toast(`${count} ${count === 1 ? 'person is' : 'people are'} waiting for your approval.`, {
+        action: 'Review',
+        onAction: openAdmin,
+      });
+    }
+    sync.notifiedPending = count;
   }
 
   function accountPromptHTML() {
     if (!sync.available || sync.user) return '';
+    const signIn = '<button type="button" class="link" data-action="sign-in">sign in</button>';
+    if (sync.first) {
+      return `<p class="account-prompt">Want your plans in every browser?
+        <button type="button" class="link" data-action="sign-up">Create the first account</button>
+        (you'll be the admin).</p>`;
+    }
     return sync.signupOpen
       ? `<p class="account-prompt">Want your plans in every browser?
-           <button type="button" class="link" data-action="sign-up">Create an account</button></p>`
+           <button type="button" class="link" data-action="sign-up">Create an account</button> or ${signIn}.</p>`
       : `<p class="account-prompt">Already have an account?
            <button type="button" class="link" data-action="sign-in">Sign in to see your plans</button></p>`;
   }
@@ -1621,6 +1666,7 @@
   function openAuth(mode = 'signin', email = '') {
     if (!sync.available || !ensureHttps()) return;
     auth.mode = mode === 'signup' && sync.signupOpen ? 'signup' : 'signin';
+    auth.requested = '';
     renderAuthMode();
     if (email) authField('email').value = email;
     authField('password').value = '';
@@ -1631,15 +1677,22 @@
 
   function renderAuthMode() {
     const signup = auth.mode === 'signup';
-    $('#auth-heading').textContent = signup ? 'Create your account' : 'Sign in';
-    $('#auth-intro').textContent = signup
-      ? 'Your plans will be saved to this account, so you can open them in any browser.'
-      : 'Sign in to see your plans in any browser.';
-    $('#auth-submit').textContent = signup ? 'Create account' : 'Sign in';
+    const requested = auth.mode === 'requested';
+    $('#auth-heading').textContent = requested ? 'Request sent' : signup ? 'Create your account' : 'Sign in';
+    let intro = 'Sign in to see your plans in any browser.';
+    if (requested) intro = auth.requested;
+    else if (signup && sync.first) {
+      intro = "You're the first person here, so this account will be the admin. Your plans are saved to it, so you can open them in any browser.";
+    } else if (signup) {
+      intro = 'Your plans will be saved to this account, so you can open them in any browser. The admin approves new accounts before you can sign in.';
+    }
+    $('#auth-intro').textContent = intro;
+    $('#auth-fields').hidden = requested;
+    $('#auth-submit').textContent = requested ? 'OK' : signup ? 'Create account' : 'Sign in';
     authField('password').setAttribute('autocomplete', signup ? 'new-password' : 'current-password');
     $('#auth-hint').hidden = !signup;
     const toggle = $('#auth-switch');
-    toggle.hidden = !sync.signupOpen;
+    toggle.hidden = requested || !sync.signupOpen;
     toggle.textContent = signup ? 'I already have an account' : 'Create an account';
   }
 
@@ -1651,6 +1704,10 @@
 
   async function submitAuth() {
     if (auth.busy) return;
+    if (auth.mode === 'requested') {
+      auth.dialog.close();
+      return;
+    }
     const signup = auth.mode === 'signup';
     const email = authField('email').value.trim();
     const password = authField('password').value;
@@ -1668,11 +1725,19 @@
     try {
       const result = await api(signup ? 'api/register' : 'api/login', { email, password });
       authField('password').value = '';
+      if (result.pending) {
+        // Later sign-ups wait for the admin: say so instead of signing in.
+        auth.mode = 'requested';
+        auth.requested = result.message;
+        renderAuthMode();
+        $('#auth-submit').focus();
+        return;
+      }
       auth.dialog.close();
-      if (signup) sync.signupOpen = false;
+      sync.first = false;
       const brought = state.plans.length;
-      await startSession(result.user.email);
-      if (signup) toast(`Account created. Your plans are now saved to ${result.user.email}.`);
+      await startSession(result.user.email, result.user.admin);
+      if (signup) toast(`Account created. You're the admin of this site, and your plans are saved to ${result.user.email}.`);
       else if (brought) toast(`Signed in. The ${brought} ${brought === 1 ? 'plan' : 'plans'} on this browser were added to your account.`);
       else toast(`Signed in as ${result.user.email}.`);
     } catch (err) {
@@ -1698,7 +1763,7 @@
       authField('email').focus();
     });
     for (const btn of $$('#auth [data-close]')) btn.addEventListener('click', () => auth.dialog.close());
-    $('#sign-in').addEventListener('click', () => openAuth(sync.signupOpen ? 'signup' : 'signin'));
+    $('#sign-in').addEventListener('click', () => openAuth(sync.first ? 'signup' : 'signin'));
 
     const menu = $('#account');
     menu.addEventListener('click', async (e) => {
@@ -1709,8 +1774,14 @@
         signOut();
         return;
       }
+      if (item.dataset.account === 'admin') {
+        openAdmin();
+        return;
+      }
+      const waitingBefore = sync.notifiedPending;
       await syncNow();
-      if (sync.status === 'saved') toast('Everything is up to date.');
+      // Don't cover a "people are waiting for approval" notice.
+      if (sync.status === 'saved' && sync.notifiedPending <= waitingBefore) toast('Everything is up to date.');
     });
     menu.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && menu.open) {
@@ -1719,8 +1790,140 @@
       }
     });
 
+    setupAdmin();
     updateAccountUI();
     connectToServer();
+  }
+
+  /* ---- admin: approve and manage accounts */
+
+  const admin = { dialog: $('#admin'), users: [], busy: false };
+  const STATUS_ORDER = { pending: 0, active: 1, disabled: 2 };
+  const STATUS_NAMES = { pending: 'Waiting for approval', active: 'Active', disabled: 'Turned off' };
+  const ADMIN_DONE = {
+    approve: (email) => `${email} can now sign in.`,
+    enable: (email) => `${email} can sign in again.`,
+    disable: (email) => `${email} is turned off and signed out.`,
+    delete: (email) => `Removed ${email}.`,
+  };
+
+  async function openAdmin() {
+    if (!sync.admin) return;
+    $('#account').open = false;
+    if (!admin.dialog.open) admin.dialog.showModal();
+    $('#admin-signup').disabled = true; // until the real setting has loaded
+    $('#admin-users').innerHTML = '<li class="user-empty muted">Loading…</li>';
+    try {
+      applyAdminOverview(await api('api/admin/users'));
+    } catch (err) {
+      adminError(err);
+    }
+  }
+
+  function applyAdminOverview(data) {
+    admin.users = data.users;
+    $('#admin-signup').checked = data.signup;
+    $('#admin-signup').disabled = false;
+    sync.notifiedPending = data.pending; // no "people are waiting" toast while looking at them
+    setPendingUsers(data.pending);
+    renderAdminUsers();
+  }
+
+  function renderAdminUsers() {
+    const users = [...admin.users].sort(
+      (a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || a.createdAt - b.createdAt
+    );
+    const button = (action, label, kind) =>
+      `<button type="button" class="btn small ${kind}" data-admin-action="${action}">${label}</button>`;
+    const rows = users.map((u) => {
+      const self = u.email === sync.user;
+      const date = new Date(u.createdAt * 1000).toLocaleDateString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      });
+      const meta = u.status === 'pending' ? `Asked on ${date}` : `Joined ${date} · ${u.plans} ${u.plans === 1 ? 'plan' : 'plans'}`;
+      let actions = '';
+      if (!self && u.status === 'pending') actions = button('approve', 'Approve', 'primary') + button('delete', 'Decline', 'ghost');
+      else if (!self && u.status === 'active') actions = button('disable', 'Turn off', 'ghost');
+      else if (!self) actions = button('enable', 'Turn on', 'ghost') + button('delete', 'Delete', 'danger');
+      return `
+        <li class="user-row st-${u.status}" data-email="${esc(u.email)}">
+          <div class="user-main">
+            <strong class="user-email">${esc(u.email)}</strong>
+            <span class="user-meta">${esc(meta)}</span>
+          </div>
+          <div class="user-tags">
+            ${self ? '<span class="status-chip st-you">You</span>' : ''}
+            ${u.admin ? '<span class="status-chip st-admin">Admin</span>' : ''}
+            ${self ? '' : `<span class="status-chip st-${u.status}">${STATUS_NAMES[u.status]}</span>`}
+          </div>
+          ${actions ? `<div class="user-actions">${actions}</div>` : ''}
+        </li>`;
+    });
+    const alone = !users.some((u) => u.email !== sync.user);
+    $('#admin-users').innerHTML =
+      rows.join('') +
+      (alone
+        ? '<li class="user-empty muted">No one else has an account yet. When people sign up, they appear here for you to approve.</li>'
+        : '');
+  }
+
+  function adminError(err) {
+    if (err.status === 401) {
+      admin.dialog.close();
+      signedOutElsewhere();
+      return;
+    }
+    if (err.status === 403) {
+      admin.dialog.close();
+      sync.admin = false;
+      updateAccountUI();
+    }
+    toast(err.status ? err.message : "Couldn't reach the server. Check your connection and try again.");
+  }
+
+  function setupAdmin() {
+    for (const btn of $$('#admin [data-close]')) btn.addEventListener('click', () => admin.dialog.close());
+
+    $('#admin-users').addEventListener('click', async (e) => {
+      const btn = e.target.closest('[data-admin-action]');
+      if (!btn || admin.busy) return;
+      const email = btn.closest('[data-email]').dataset.email;
+      const action = btn.dataset.adminAction;
+      const user = admin.users.find((u) => u.email === email);
+      if (action === 'delete') {
+        const question =
+          user && user.status === 'pending'
+            ? `Decline the request from ${email}?`
+            : `Delete ${email} and all of their plans? This can't be undone.`;
+        if (!window.confirm(question)) return;
+      }
+      admin.busy = true;
+      btn.disabled = true;
+      try {
+        applyAdminOverview(await api('api/admin/users', { email, action }));
+        const declined = action === 'delete' && user && user.status === 'pending';
+        toast(declined ? `Declined the request from ${email}.` : ADMIN_DONE[action](email));
+      } catch (err) {
+        btn.disabled = false;
+        adminError(err);
+      } finally {
+        admin.busy = false;
+      }
+    });
+
+    $('#admin-signup').addEventListener('change', async (e) => {
+      const wanted = e.target.checked;
+      try {
+        applyAdminOverview(await api('api/admin/settings', { signup: wanted }));
+        sync.signupOpen = wanted;
+        toast(wanted ? 'People can ask for an account again.' : 'New sign-ups are stopped.');
+      } catch (err) {
+        e.target.checked = !wanted;
+        adminError(err);
+      }
+    });
   }
 
   async function connectToServer() {
@@ -1748,15 +1951,18 @@
     }
     sync.available = true;
     sync.signupOpen = Boolean(me && me.signup);
+    sync.first = Boolean(me && me.first);
     if (!ensureHttps()) return;
 
     const serverUser = me && me.user ? me.user.email : '';
     if (serverUser && serverUser === sync.user) {
+      sync.admin = Boolean(me.user.admin);
       updateAccountUI();
       render();
+      if (typeof me.pending === 'number') setPendingUsers(me.pending);
       syncNow();
     } else if (serverUser && !sync.user) {
-      await startSession(serverUser);
+      await startSession(serverUser, me.user.admin);
     } else if (sync.user) {
       signedOutElsewhere();
     } else {

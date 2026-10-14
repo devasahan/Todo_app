@@ -60,6 +60,7 @@
             <summary class="avatar-btn" aria-label="Account">
               <span class="avatar" id="account-initial" aria-hidden="true"></span>
               <span class="sync-dot" id="sync-dot" data-status="saved" aria-hidden="true"></span>
+              <span class="avatar-badge" id="avatar-badge" aria-hidden="true" hidden></span>
             </summary>
             <div class="menu-list" role="menu">
               <div class="account-info">
@@ -68,6 +69,9 @@
                 <span class="sync-text" id="sync-text" role="status"></span>
               </div>
               <hr />
+              <button type="button" role="menuitem" data-account="admin" id="admin-item" hidden>
+                Manage users <span class="menu-count" id="admin-count" hidden></span>
+              </button>
               <button type="button" role="menuitem" data-account="sync">Sync now</button>
               <button type="button" role="menuitem" data-account="sign-out">Sign out</button>
             </div>
@@ -212,16 +216,18 @@
           </button>
         </header>
         <div class="modal-body">
-          <p class="auth-intro" id="auth-intro"></p>
-          <label class="field">
-            <span class="label">Email</span>
-            <input name="email" type="email" autocomplete="username" maxlength="254" required />
-          </label>
-          <label class="field">
-            <span class="label">Password</span>
-            <input name="password" type="password" autocomplete="current-password" maxlength="200" required />
-            <span class="field-hint" id="auth-hint" hidden>At least 8 characters. Don't reuse a password from another site.</span>
-          </label>
+          <p class="auth-intro" id="auth-intro" role="status"></p>
+          <div class="auth-fields" id="auth-fields">
+            <label class="field">
+              <span class="label">Email</span>
+              <input name="email" type="email" autocomplete="username" maxlength="254" required />
+            </label>
+            <label class="field">
+              <span class="label">Password</span>
+              <input name="password" type="password" autocomplete="current-password" maxlength="200" required />
+              <span class="field-hint" id="auth-hint" hidden>At least 8 characters. Don't reuse a password from another site.</span>
+            </label>
+          </div>
           <p class="field-error" id="auth-error" role="alert" hidden></p>
         </div>
         <footer class="modal-foot">
@@ -230,6 +236,27 @@
           <button type="submit" class="btn primary" id="auth-submit">Sign in</button>
         </footer>
       </form>
+    </dialog>
+
+    <dialog id="admin" class="modal" aria-labelledby="admin-heading">
+      <header class="modal-head">
+        <h2 id="admin-heading">Manage users</h2>
+        <button type="button" class="icon-btn" data-close aria-label="Close">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+        </button>
+      </header>
+      <div class="modal-body">
+        <label class="switch-row">
+          <input type="checkbox" id="admin-signup" />
+          <span class="switch" aria-hidden="true"></span>
+          <span class="switch-text">
+            <strong>Accept new sign-ups</strong>
+            <span class="muted">Anyone can ask for an account. Nobody can sign in until you approve them.</span>
+          </span>
+        </label>
+        <ul class="user-list" id="admin-users" aria-live="polite"></ul>
+        <p class="hint">You only see accounts here, never anyone's plans.</p>
+      </div>
     </dialog>
 
     <dialog id="shortcuts" class="modal modal-small" aria-labelledby="shortcuts-heading">

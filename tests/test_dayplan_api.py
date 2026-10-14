@@ -17,6 +17,11 @@ EMAIL = 'me@example.com'
 PASSWORD = 'correct horse battery'
 
 
+def sync_part(res):
+    """The sync fields of a response (an admin's replies also include a pending count)."""
+    return {k: v for k, v in res['json'].items() if k in ('cursor', 'changes', 'reset')}
+
+
 class Client:
     """A tiny browser: keeps the session cookie between requests."""
 
@@ -77,14 +82,21 @@ class ApiTestCase(unittest.TestCase):
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        os.environ.pop('DAYPLAN_OPEN_SIGNUP', None)
         dayplan_api._dummy_hash = None
         self.addCleanup(self.tmp.cleanup)
 
     def signed_in(self, email=EMAIL, password=PASSWORD):
+        """Signs up the site's first account (the admin)."""
         client = Client()
         res = client.post('/api/register', {'email': email, 'password': password})
         self.assertEqual(res['status'], 201, res['json'])
+        return client
+
+    def member(self, email, password=PASSWORD):
+        """An approved, signed-in second account."""
+        dayplan_api.set_password(dayplan_api.connect(), email, password)
+        client = Client()
+        self.assertEqual(client.post('/api/login', {'email': email, 'password': password})['status'], 200)
         return client
 
     def plan(self, plan_id, title='Plan', **fields):
@@ -92,23 +104,48 @@ class ApiTestCase(unittest.TestCase):
 
 
 class Accounts(ApiTestCase):
-    def test_first_account_can_sign_up_then_sign_up_closes(self):
+    def test_first_account_is_the_admin(self):
         anon = Client()
-        self.assertEqual(anon.get('/api/me')['json'], {'user': None, 'signup': True})
+        self.assertEqual(anon.get('/api/me')['json'], {'user': None, 'signup': True, 'first': True})
         client = self.signed_in()
-        self.assertEqual(client.get('/api/me')['json']['user'], {'email': EMAIL})
+        me = client.get('/api/me')['json']
+        self.assertEqual(me['user'], {'email': EMAIL, 'admin': True})
+        self.assertEqual(me['pending'], 0)
+        self.assertEqual(Client().get('/api/me')['json'], {'user': None, 'signup': True, 'first': False})
 
-        stranger = Client()
-        self.assertFalse(stranger.get('/api/me')['json']['signup'])
-        res = stranger.post('/api/register', {'email': 'other@example.com', 'password': PASSWORD})
+    def test_later_accounts_wait_for_approval(self):
+        admin = self.signed_in()
+        friend = Client()
+        res = friend.post('/api/register', {'email': 'friend@example.com', 'password': PASSWORD})
+        self.assertEqual(res['status'], 202)
+        self.assertTrue(res['json']['pending'])
+        self.assertNotIn('set_cookie', res)  # not signed in yet
+        self.assertIsNone(friend.get('/api/me')['json']['user'])
+
+        # Right password, but not approved yet.
+        res = friend.post('/api/login', {'email': 'friend@example.com', 'password': PASSWORD})
         self.assertEqual(res['status'], 403)
+        self.assertIn('approval', res['json']['error'])
+        # Wrong password still says only "wrong", revealing nothing about the account.
+        res = friend.post('/api/login', {'email': 'friend@example.com', 'password': 'not it at all'})
+        self.assertEqual(res['status'], 401)
 
-    def test_open_signup_setting(self):
+        self.assertEqual(admin.get('/api/me')['json']['pending'], 1)
+        sync = admin.post('/api/sync', {'cursor': 0, 'changes': []})['json']
+        self.assertEqual(sync['pending'], 1)
+
+        res = admin.post('/api/admin/users', {'email': 'friend@example.com', 'action': 'approve'})
+        self.assertEqual(res['status'], 200)
+        self.assertEqual(res['json']['pending'], 0)
+        res = friend.post('/api/login', {'email': 'friend@example.com', 'password': PASSWORD})
+        self.assertEqual(res['status'], 200)
+        self.assertEqual(res['json']['user'], {'email': 'friend@example.com', 'admin': False})
+        self.assertNotIn('pending', friend.get('/api/me')['json'])
+
+    def test_duplicate_email(self):
         self.signed_in()
-        with mock.patch.dict(os.environ, {'DAYPLAN_OPEN_SIGNUP': '1'}):
-            self.signed_in('friend@example.com')
-            res = Client().post('/api/register', {'email': EMAIL.upper(), 'password': PASSWORD})
-            self.assertEqual(res['status'], 409)
+        res = Client().post('/api/register', {'email': EMAIL.upper(), 'password': PASSWORD})
+        self.assertEqual(res['status'], 409)
 
     def test_password_is_hashed_never_stored(self):
         self.signed_in()
@@ -141,7 +178,7 @@ class Accounts(ApiTestCase):
         cookie = res['set_cookie']
         for flag in ('HttpOnly', 'SameSite=Lax', 'Secure', 'Path=/'):
             self.assertIn(flag, cookie)
-        self.assertEqual(client.get('/api/me')['json']['user'], {'email': EMAIL})
+        self.assertEqual(client.get('/api/me')['json']['user'], {'email': EMAIL, 'admin': True})
 
         self.assertEqual(client.post('/api/logout')['status'], 200)
         self.assertIsNone(client.get('/api/me')['json']['user'])
@@ -212,7 +249,7 @@ class Sync(ApiTestCase):
         laptop = self.signed_in()
         res = laptop.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a', 'Write report'), self.plan('b')]})
         self.assertEqual(res['status'], 200)
-        self.assertEqual(res['json'], {'cursor': 2, 'changes': []})  # nothing echoed back
+        self.assertEqual(sync_part(res), {'cursor': 2, 'changes': []})  # nothing echoed back
 
         phone = Client()
         phone.post('/api/login', {'email': EMAIL, 'password': PASSWORD})
@@ -223,7 +260,7 @@ class Sync(ApiTestCase):
 
         # The phone edits one plan and deletes the other.
         res = phone.post('/api/sync', {'cursor': 2, 'changes': [self.plan('a', 'Report v2'), {'id': 'b', 'data': None}]})
-        self.assertEqual(res['json'], {'cursor': 4, 'changes': []})
+        self.assertEqual(sync_part(res), {'cursor': 4, 'changes': []})
 
         res = laptop.post('/api/sync', {'cursor': 2, 'changes': []})
         changes = {c['id']: c['data'] for c in res['json']['changes']}
@@ -232,15 +269,14 @@ class Sync(ApiTestCase):
         self.assertEqual(res['json']['cursor'], 4)
 
         # Nothing new since then.
-        self.assertEqual(laptop.post('/api/sync', {'cursor': 4, 'changes': []})['json'], {'cursor': 4, 'changes': []})
+        self.assertEqual(sync_part(laptop.post('/api/sync', {'cursor': 4, 'changes': []})), {'cursor': 4, 'changes': []})
 
     def test_accounts_never_see_each_other(self):
         mine = self.signed_in()
         mine.post('/api/sync', {'cursor': 0, 'changes': [self.plan('secret', 'My diary')]})
-        with mock.patch.dict(os.environ, {'DAYPLAN_OPEN_SIGNUP': '1'}):
-            theirs = self.signed_in('other@example.com')
+        theirs = self.member('other@example.com')
         res = theirs.post('/api/sync', {'cursor': 0, 'changes': []})
-        self.assertEqual(res['json'], {'cursor': 0, 'changes': []})
+        self.assertEqual(sync_part(res), {'cursor': 0, 'changes': []})
         # Same plan id in another account is a separate plan.
         theirs.post('/api/sync', {'cursor': 0, 'changes': [self.plan('secret', 'Overwrite?')]})
         res = mine.post('/api/sync', {'cursor': 0, 'changes': []})
@@ -256,7 +292,7 @@ class Sync(ApiTestCase):
     def test_deleting_unknown_plan_is_harmless(self):
         client = self.signed_in()
         res = client.post('/api/sync', {'cursor': 0, 'changes': [{'id': 'ghost', 'data': None}]})
-        self.assertEqual(res['json'], {'cursor': 0, 'changes': []})
+        self.assertEqual(sync_part(res), {'cursor': 0, 'changes': []})
 
     def test_rejects_malformed_sync(self):
         client = self.signed_in()
@@ -293,6 +329,114 @@ class Sync(ApiTestCase):
         self.assertNotIn('secret', json.dumps(res['json']))
 
 
+class Admin(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self.admin = self.signed_in()
+        self.friend = self.member('friend@example.com')
+        self.friend.post('/api/sync', {'cursor': 0, 'changes': [self.plan('f1', 'Friend plan')]})
+
+    def act(self, action, email='friend@example.com', client=None):
+        return (client or self.admin).post('/api/admin/users', {'email': email, 'action': action})
+
+    def test_overview_lists_accounts_without_their_plans(self):
+        res = self.admin.get('/api/admin/users')
+        self.assertEqual(res['status'], 200)
+        users = {u['email']: u for u in res['json']['users']}
+        self.assertEqual(users[EMAIL]['admin'], True)
+        self.assertEqual(users['friend@example.com']['status'], 'active')
+        self.assertEqual(users['friend@example.com']['plans'], 1)
+        self.assertNotIn('Friend plan', json.dumps(res['json']))  # counts only, never content
+        self.assertTrue(res['json']['signup'])
+
+    def test_only_the_admin_can_manage(self):
+        self.assertEqual(self.friend.get('/api/admin/users')['status'], 403)
+        self.assertEqual(self.act('disable', EMAIL, client=self.friend)['status'], 403)
+        self.assertEqual(self.friend.post('/api/admin/settings', {'signup': False})['status'], 403)
+        self.assertEqual(Client().get('/api/admin/users')['status'], 401)
+        self.assertEqual(
+            self.admin.post('/api/admin/users', {'email': 'friend@example.com', 'action': 'approve'},
+                            origin='https://evil.example')['status'],
+            403,
+        )
+
+    def test_disable_signs_out_and_blocks_sign_in(self):
+        self.assertEqual(self.act('disable')['status'], 200)
+        self.assertIsNone(self.friend.get('/api/me')['json']['user'])
+        self.assertEqual(self.friend.post('/api/sync', {'cursor': 0, 'changes': []})['status'], 401)
+        res = Client().post('/api/login', {'email': 'friend@example.com', 'password': PASSWORD})
+        self.assertEqual(res['status'], 403)
+        self.assertIn('turned off', res['json']['error'])
+
+        self.assertEqual(self.act('enable')['status'], 200)
+        self.assertEqual(Client().post('/api/login', {'email': 'friend@example.com', 'password': PASSWORD})['status'], 200)
+
+    def test_delete_removes_account_and_plans(self):
+        res = self.act('delete')
+        self.assertEqual(res['status'], 200)
+        self.assertNotIn('friend@example.com', [u['email'] for u in res['json']['users']])
+        conn = dayplan_api.connect()
+        self.assertEqual(conn.execute('SELECT COUNT(*) FROM plans').fetchone()[0], 0)
+        self.assertEqual(self.act('delete')['status'], 404)
+
+    def test_admin_cannot_lock_themselves_out(self):
+        for action in ('disable', 'delete'):
+            self.assertEqual(self.act(action, EMAIL)['status'], 400)
+        self.assertEqual(self.admin.get('/api/me')['json']['user']['admin'], True)
+
+    def test_bad_admin_requests(self):
+        self.assertEqual(self.act('promote')['status'], 400)
+        self.assertEqual(self.admin.post('/api/admin/users', {'action': 'approve'})['status'], 400)
+        self.assertEqual(self.admin.post('/api/admin/settings', {'signup': 'no'})['status'], 400)
+
+    def test_stopping_sign_ups(self):
+        res = self.admin.post('/api/admin/settings', {'signup': False})
+        self.assertFalse(res['json']['signup'])
+        self.assertFalse(Client().get('/api/me')['json']['signup'])
+        res = Client().post('/api/register', {'email': 'new@example.com', 'password': PASSWORD})
+        self.assertEqual(res['status'], 403)
+        self.admin.post('/api/admin/settings', {'signup': True})
+        res = Client().post('/api/register', {'email': 'new@example.com', 'password': PASSWORD})
+        self.assertEqual(res['status'], 202)
+
+    def test_waiting_list_is_capped(self):
+        with mock.patch.object(dayplan_api, 'MAX_PENDING', 2):
+            for i in range(2):
+                self.assertEqual(Client().post('/api/register', {'email': f'p{i}@example.com', 'password': PASSWORD})['status'], 202)
+            self.assertEqual(Client().post('/api/register', {'email': 'p9@example.com', 'password': PASSWORD})['status'], 429)
+            self.act('delete', 'p0@example.com')  # declining frees a place
+            self.assertEqual(Client().post('/api/register', {'email': 'p9@example.com', 'password': PASSWORD})['status'], 202)
+
+
+class Upgrade(ApiTestCase):
+    def test_database_from_before_approvals(self):
+        """A site whose owner signed up before approvals existed keeps working, owner becomes admin."""
+        import sqlite3
+        path = Path(os.environ['DAYPLAN_DB'])
+        path.parent.mkdir(parents=True)
+        old = sqlite3.connect(str(path))
+        old.executescript('''
+            CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+                                rev INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+            CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+        ''')
+        old.execute('INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, 1)',
+                    (EMAIL, dayplan_api.hash_password(PASSWORD)))
+        old.execute('INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, 2)',
+                    ('second@example.com', dayplan_api.hash_password(PASSWORD)))
+        old.commit()
+        old.close()
+
+        owner = Client()
+        res = owner.post('/api/login', {'email': EMAIL, 'password': PASSWORD})
+        self.assertEqual(res['status'], 200)
+        self.assertEqual(res['json']['user'], {'email': EMAIL, 'admin': True})
+        res = Client().post('/api/login', {'email': 'second@example.com', 'password': PASSWORD})
+        self.assertEqual(res['json']['user'], {'email': 'second@example.com', 'admin': False})
+        dayplan_api.connect()  # running the upgrade again changes nothing
+        self.assertEqual(owner.get('/api/admin/users')['status'], 200)
+
+
 class CommandLine(ApiTestCase):
     def test_set_password_and_list_users(self):
         with mock.patch('getpass.getpass', side_effect=[PASSWORD, PASSWORD]), mock.patch('sys.stdout', new=io.StringIO()):
@@ -300,6 +444,7 @@ class CommandLine(ApiTestCase):
         with mock.patch('sys.stdout', new=io.StringIO()) as out:
             dayplan_api.main(['x', 'list-users'])
         self.assertIn('new@example.com', out.getvalue())
+        self.assertIn('(admin)', out.getvalue())  # first account made from the console is the admin
         with mock.patch('getpass.getpass', side_effect=[PASSWORD, 'different']), mock.patch('sys.stdout', new=io.StringIO()):
             self.assertEqual(dayplan_api.main(['x', 'set-password', 'new@example.com']), 1)
         self.assertEqual(Client().post('/api/login', {'email': 'new@example.com', 'password': PASSWORD})['status'], 200)
@@ -307,3 +452,15 @@ class CommandLine(ApiTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CommandLineApprovals(ApiTestCase):
+    def test_approve_and_make_admin(self):
+        self.signed_in()
+        Client().post('/api/register', {'email': 'waiting@example.com', 'password': PASSWORD})
+        with mock.patch('sys.stdout', new=io.StringIO()):
+            self.assertEqual(dayplan_api.main(['x', 'approve', 'Waiting@Example.com']), 0)
+            self.assertEqual(dayplan_api.main(['x', 'approve', 'nobody@example.com']), 1)
+            self.assertEqual(dayplan_api.main(['x', 'make-admin', 'waiting@example.com']), 0)
+        res = Client().post('/api/login', {'email': 'waiting@example.com', 'password': PASSWORD})
+        self.assertEqual(res['json']['user'], {'email': 'waiting@example.com', 'admin': True})

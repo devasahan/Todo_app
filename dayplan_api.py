@@ -4,14 +4,20 @@ Plans are stored per account in a SQLite file outside the repository
 (by default ../dayplan-data/dayplan.sqlite3, i.e. /home/<you>/dayplan-data/
 on PythonAnywhere), so `git pull` never touches them.
 
-Sign-up is open only until the first account exists. To allow more
-accounts, set DAYPLAN_OPEN_SIGNUP=1, or add people from a console:
+Anyone can ask for an account. The very first account becomes the admin
+and is active straight away; every later account waits until the admin
+approves it (in the app: account menu > Manage users). The admin can also
+turn accounts off, delete them, and stop new sign-ups.
 
-    python3 ~/Todo_app/dayplan_api.py set-password someone@example.com
+From a console:
+
     python3 ~/Todo_app/dayplan_api.py list-users
+    python3 ~/Todo_app/dayplan_api.py approve someone@example.com
+    python3 ~/Todo_app/dayplan_api.py set-password someone@example.com
+    python3 ~/Todo_app/dayplan_api.py make-admin someone@example.com
 
-`set-password` also resets a forgotten password (and signs that account
-out everywhere).
+`set-password` creates an active account or resets a forgotten password
+(and signs that account out everywhere).
 """
 import getpass
 import hashlib
@@ -41,6 +47,8 @@ MAX_PLAN_BYTES = 100_000
 MAX_PLANS = 10_000
 LOGIN_WINDOW_SECONDS = 15 * 60
 LOGIN_MAX_FAILURES = 10
+MAX_PENDING = 50  # unanswered sign-up requests, so strangers can't flood the database
+STATUSES = ('active', 'pending', 'disabled')
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 
 SCHEMA = """
@@ -49,7 +57,9 @@ CREATE TABLE IF NOT EXISTS users (
     email TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     rev INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    is_admin INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
@@ -67,6 +77,10 @@ CREATE INDEX IF NOT EXISTS plans_by_rev ON plans (user_id, rev);
 CREATE TABLE IF NOT EXISTS login_failures (
     email TEXT NOT NULL,
     at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 """
 
@@ -91,7 +105,24 @@ def connect():
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA foreign_keys = ON')
     conn.executescript(SCHEMA)
+    migrate(conn)
     return conn
+
+
+def migrate(conn):
+    """Upgrades databases created before approvals existed."""
+    columns = {row['name'] for row in conn.execute('PRAGMA table_info(users)')}
+    if 'is_admin' in columns:
+        return
+    try:
+        with conn:
+            if 'status' not in columns:
+                conn.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            conn.execute('ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0')
+            # Whoever created the site's first account is its admin.
+            conn.execute('UPDATE users SET is_admin = 1 WHERE id = (SELECT MIN(id) FROM users)')
+    except sqlite3.OperationalError:
+        pass  # another process upgraded the database at the same moment
 
 
 # ---------------------------------------------------------------- passwords
@@ -155,12 +186,25 @@ def count_users(conn):
     return conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]
 
 
+def count_pending(conn):
+    return conn.execute("SELECT COUNT(*) FROM users WHERE status = 'pending'").fetchone()[0]
+
+
+def get_setting(conn, key, default):
+    row = conn.execute('SELECT value FROM settings WHERE key = ?', (key,)).fetchone()
+    return row['value'] if row else default
+
+
 def signup_open(conn):
-    return os.environ.get('DAYPLAN_OPEN_SIGNUP') == '1' or count_users(conn) == 0
+    """Whether this site accepts new sign-up requests (the first account always can)."""
+    return count_users(conn) == 0 or get_setting(conn, 'signup', '1') == '1'
 
 
-def set_password(conn, email, password):
-    """Creates the account or replaces its password, and signs it out everywhere."""
+def set_password(conn, email, password, status='active', admin=False):
+    """Creates the account, or replaces its password and signs it out everywhere.
+
+    `status` and `admin` only apply when the account is new.
+    """
     hashed = hash_password(password)
     with conn:
         row = conn.execute('SELECT id FROM users WHERE email = ?', (email,)).fetchone()
@@ -169,8 +213,8 @@ def set_password(conn, email, password):
             conn.execute('DELETE FROM sessions WHERE user_id = ?', (row['id'],))
             return row['id']
         cur = conn.execute(
-            'INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)',
-            (email, hashed, int(time.time())),
+            'INSERT INTO users (email, password_hash, created_at, status, is_admin) VALUES (?, ?, ?, ?, ?)',
+            (email, hashed, int(time.time()), status, 1 if admin else 0),
         )
         return cur.lastrowid
 
@@ -205,10 +249,14 @@ def current_user(conn, environ):
     if not token:
         return None
     return conn.execute(
-        'SELECT users.id, users.email FROM sessions JOIN users ON users.id = sessions.user_id '
-        'WHERE sessions.token_hash = ? AND sessions.expires_at > ?',
+        'SELECT users.id, users.email, users.is_admin FROM sessions JOIN users ON users.id = sessions.user_id '
+        "WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND users.status = 'active'",
         (token_digest(token), int(time.time())),
     ).fetchone()
+
+
+def public_user(user):
+    return {'email': user['email'], 'admin': bool(user['is_admin'])}
 
 
 def is_https(environ):
@@ -227,18 +275,38 @@ def session_cookie(environ, token, max_age):
 
 def api_me(conn, environ, body):
     user = current_user(conn, environ)
-    return 200, {'user': {'email': user['email']} if user else None, 'signup': signup_open(conn)}, []
+    payload = {
+        'user': public_user(user) if user else None,
+        'signup': signup_open(conn),
+        'first': count_users(conn) == 0,
+    }
+    if user and user['is_admin']:
+        payload['pending'] = count_pending(conn)
+    return 200, payload, []
 
 
 def api_register(conn, environ, body):
-    if not signup_open(conn):
-        raise ApiError(403, 'Sign-up is closed on this site.')
+    """The first account becomes the active admin; later ones wait for approval."""
     email, password = read_credentials(body, creating=True)
+    first = count_users(conn) == 0
+    if not signup_open(conn):
+        raise ApiError(403, "This site isn't accepting new accounts right now.")
     if conn.execute('SELECT 1 FROM users WHERE email = ?', (email,)).fetchone():
         raise ApiError(409, 'An account with this email already exists. Sign in instead.')
-    user_id = set_password(conn, email, password)
-    token = create_session(conn, user_id)
-    return 201, {'user': {'email': email}}, [session_cookie(environ, token, SESSION_SECONDS)]
+    if not first and count_pending(conn) >= MAX_PENDING:
+        raise ApiError(429, 'Too many people are waiting for approval right now. Please try again later.')
+
+    if first:
+        user_id = set_password(conn, email, password, status='active', admin=True)
+        token = create_session(conn, user_id)
+        return 201, {'user': {'email': email, 'admin': True}}, [session_cookie(environ, token, SESSION_SECONDS)]
+
+    set_password(conn, email, password, status='pending')
+    return 202, {
+        'pending': True,
+        'message': "Thanks! Your account is waiting for the admin's approval. "
+                   'You can sign in once it has been approved.',
+    }, []
 
 
 def api_login(conn, environ, body):
@@ -250,7 +318,9 @@ def api_login(conn, environ, body):
     if failures >= LOGIN_MAX_FAILURES:
         raise ApiError(429, 'Too many attempts. Wait 15 minutes and try again.')
 
-    user = conn.execute('SELECT id, password_hash FROM users WHERE email = ?', (email,)).fetchone()
+    user = conn.execute(
+        'SELECT id, email, password_hash, status, is_admin FROM users WHERE email = ?', (email,)
+    ).fetchone()
     if user is None:
         burn_password_check(password)
     if user is None or not verify_password(password, user['password_hash']):
@@ -260,8 +330,13 @@ def api_login(conn, environ, body):
 
     with conn:
         conn.execute('DELETE FROM login_failures WHERE email = ?', (email,))
+    # Only reveal the account's state to someone who knows its password.
+    if user['status'] == 'pending':
+        raise ApiError(403, "Your account is waiting for the admin's approval. Please try again later.")
+    if user['status'] != 'active':
+        raise ApiError(403, 'This account has been turned off. Contact the admin of this site.')
     token = create_session(conn, user['id'])
-    return 200, {'user': {'email': email}}, [session_cookie(environ, token, SESSION_SECONDS)]
+    return 200, {'user': public_user(user)}, [session_cookie(environ, token, SESSION_SECONDS)]
 
 
 def api_logout(conn, environ, body):
@@ -345,7 +420,84 @@ def api_sync(conn, environ, body):
         for row in rows
         if row['id'] not in sent  # the client already has what it just sent
     ]
-    return 200, {'cursor': rev, 'changes': remote}, []
+    payload = {'cursor': rev, 'changes': remote}
+    if user['is_admin']:
+        payload['pending'] = count_pending(conn)  # keeps the admin's badge current
+    return 200, payload, []
+
+
+# -------------------------------------------------------------------- admin
+
+def require_admin(conn, environ):
+    user = current_user(conn, environ)
+    if user is None:
+        raise ApiError(401, 'Please sign in again.')
+    if not user['is_admin']:
+        raise ApiError(403, 'Only the admin can do that.')
+    return user
+
+
+def admin_overview(conn):
+    rows = conn.execute(
+        'SELECT users.email, users.status, users.is_admin, users.created_at, '
+        '(SELECT COUNT(*) FROM plans WHERE plans.user_id = users.id AND plans.data IS NOT NULL) AS plans '
+        'FROM users ORDER BY users.created_at, users.id'
+    ).fetchall()
+    users = [
+        {
+            'email': row['email'],
+            'status': row['status'],
+            'admin': bool(row['is_admin']),
+            'createdAt': row['created_at'],
+            'plans': row['plans'],
+        }
+        for row in rows
+    ]
+    return {'users': users, 'signup': get_setting(conn, 'signup', '1') == '1', 'pending': count_pending(conn)}
+
+
+def api_admin_users(conn, environ, body):
+    require_admin(conn, environ)
+    return 200, admin_overview(conn), []
+
+
+def api_admin_update_user(conn, environ, body):
+    """Body: {"email": "...", "action": "approve" | "disable" | "enable" | "delete"}."""
+    me = require_admin(conn, environ)
+    email = body.get('email')
+    action = body.get('action')
+    if action not in ('approve', 'disable', 'enable', 'delete') or not is_text(email, 254):
+        raise ApiError(400, 'Invalid request.')
+    target = conn.execute('SELECT id, status FROM users WHERE email = ?', (email,)).fetchone()
+    if target is None:
+        raise ApiError(404, "That account doesn't exist anymore.")
+    if target['id'] == me['id']:
+        raise ApiError(400, "You can't change your own account here.")
+
+    with conn:
+        if action in ('approve', 'enable'):
+            conn.execute("UPDATE users SET status = 'active' WHERE id = ?", (target['id'],))
+        elif action == 'disable':
+            conn.execute("UPDATE users SET status = 'disabled' WHERE id = ?", (target['id'],))
+            conn.execute('DELETE FROM sessions WHERE user_id = ?', (target['id'],))
+        else:
+            conn.execute('DELETE FROM plans WHERE user_id = ?', (target['id'],))
+            conn.execute('DELETE FROM sessions WHERE user_id = ?', (target['id'],))
+            conn.execute('DELETE FROM users WHERE id = ?', (target['id'],))
+    return 200, admin_overview(conn), []
+
+
+def api_admin_settings(conn, environ, body):
+    """Body: {"signup": true | false} to accept or stop new sign-up requests."""
+    require_admin(conn, environ)
+    if not isinstance(body.get('signup'), bool):
+        raise ApiError(400, 'Invalid request.')
+    with conn:
+        conn.execute(
+            'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value',
+            ('signup', '1' if body['signup'] else '0'),
+        )
+    return 200, admin_overview(conn), []
 
 
 ROUTES = {
@@ -354,6 +506,8 @@ ROUTES = {
     '/api/login': {'POST': api_login},
     '/api/logout': {'POST': api_logout},
     '/api/sync': {'POST': api_sync},
+    '/api/admin/users': {'GET': api_admin_users, 'POST': api_admin_update_user},
+    '/api/admin/settings': {'POST': api_admin_settings},
 }
 
 
@@ -424,7 +578,7 @@ def handle(environ, start_response):
 
 
 STATUS_TEXT = {
-    200: 'OK', 201: 'Created', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden',
+    200: 'OK', 201: 'Created', 202: 'Accepted', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden',
     404: 'Not Found', 405: 'Method Not Allowed', 409: 'Conflict', 413: 'Payload Too Large',
     415: 'Unsupported Media Type', 429: 'Too Many Requests', 500: 'Internal Server Error',
 }
@@ -433,11 +587,33 @@ STATUS_TEXT = {
 # -------------------------------------------------------------------- CLI
 
 def main(argv):
-    usage = 'Usage:\n  python3 dayplan_api.py set-password EMAIL\n  python3 dayplan_api.py list-users'
+    usage = (
+        'Usage:\n'
+        '  python3 dayplan_api.py list-users\n'
+        '  python3 dayplan_api.py approve EMAIL\n'
+        '  python3 dayplan_api.py set-password EMAIL\n'
+        '  python3 dayplan_api.py make-admin EMAIL'
+    )
     if len(argv) == 2 and argv[1] == 'list-users':
         conn = connect()
-        emails = [row['email'] for row in conn.execute('SELECT email FROM users ORDER BY id')]
-        print('\n'.join(emails) if emails else 'No accounts yet.')
+        rows = conn.execute('SELECT email, status, is_admin FROM users ORDER BY id').fetchall()
+        for row in rows:
+            print('{:<40} {}{}'.format(row['email'], row['status'], ' (admin)' if row['is_admin'] else ''))
+        if not rows:
+            print('No accounts yet.')
+        return 0
+    if len(argv) == 3 and argv[1] in ('approve', 'make-admin'):
+        email = argv[2].strip().lower()
+        conn = connect()
+        with conn:
+            if argv[1] == 'approve':
+                cur = conn.execute("UPDATE users SET status = 'active' WHERE email = ?", (email,))
+            else:
+                cur = conn.execute("UPDATE users SET is_admin = 1, status = 'active' WHERE email = ?", (email,))
+        if not cur.rowcount:
+            print('No account with that email. Run list-users to see all accounts.')
+            return 1
+        print('{} is now {}.'.format(email, 'active' if argv[1] == 'approve' else 'an admin'))
         return 0
     if len(argv) == 3 and argv[1] == 'set-password':
         email = argv[2].strip().lower()
@@ -451,7 +627,8 @@ def main(argv):
         if getpass.getpass('Type it again: ') != password:
             print('The passwords did not match. Nothing was changed.')
             return 1
-        set_password(connect(), email, password)
+        conn = connect()
+        set_password(conn, email, password, status='active', admin=count_users(conn) == 0)
         print('Password set for {}. Any old sign-ins for this account were ended.'.format(email))
         return 0
     print(usage)

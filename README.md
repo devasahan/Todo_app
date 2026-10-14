@@ -72,11 +72,26 @@ Click **Save**.
 **Force HTTPS** on and click **Reload** again. Your password is then always sent encrypted.
 
 **7. Create your Dayplan account.** On your site, click **Sign in** (top right) and create an
-account with your email and a new password. Use a password you don't use anywhere else. After the
-first account exists, sign-up closes, so strangers can't make accounts on your site.
+account with your email and a new password. Use a password you don't use anywhere else. **The first
+account is the admin.**
 
 On any other browser or phone, open the same address, click **Sign in** and use the same email and
 password. Your plans appear and stay in sync.
+
+### Letting other people use your site
+
+Like most websites, anyone can click **Sign in → Create an account**. Their account then waits for
+you: they see *"Request sent"*, and they can't sign in until you approve them.
+
+- A red number on your account button shows how many people are waiting.
+- Open your account button → **Manage users** to **Approve** or **Decline** each request.
+- You can also **Turn off** an account (that person is signed out immediately) and turn it back
+  on, or **Delete** it together with its plans.
+- Turn **Accept new sign-ups** off if you don't want any more requests (for example if strangers
+  start spamming). People with accounts can still sign in.
+
+Everyone's plans are private, including from you as admin: **Manage users** shows accounts and
+how many plans each has, never what's in them.
 
 **If you see "Something went wrong".** On the **Web** tab, open the **error log** link in the
 **Log files** section. The last lines say what failed. A misspelled username in step 4 is the most
@@ -96,15 +111,21 @@ cd ~/Todo_app && git pull
 Updating never touches your plans: they're stored outside the code, in
 `/home/yourname/dayplan-data/`.
 
-**Forgot your password?** In a Bash console run the line below, type a new password twice, and
-sign in with it. This also signs that account out on every other device.
+**Forgot a password?** The app can't send emails, so passwords are reset from a Bash console. Run
+the line below, type a new password twice, and sign in with it (or give it to the person who
+forgot theirs). This also signs that account out on every other device.
 
 ```bash
 python3 ~/Todo_app/dayplan_api.py set-password you@example.com
 ```
 
-The same command adds an account for someone else (family, a colleague), since sign-up is closed
-after the first account. `python3 ~/Todo_app/dayplan_api.py list-users` shows who has an account.
+Other console commands, handy if you can't get into the app:
+
+```bash
+python3 ~/Todo_app/dayplan_api.py list-users                 # everyone, with their status
+python3 ~/Todo_app/dayplan_api.py approve friend@example.com
+python3 ~/Todo_app/dayplan_api.py make-admin friend@example.com
+```
 
 ## What you can do
 
@@ -198,7 +219,9 @@ How it's protected:
 - You stay signed in with a random session token in an `HttpOnly`, `SameSite=Lax` cookie (and
   `Secure` over HTTPS). Only a hash of the token is stored on the server.
 - Ten wrong passwords in 15 minutes lock that email for the rest of the 15 minutes.
-- Each account only ever sees its own plans.
+- Each account only ever sees its own plans. The admin manages accounts, not their contents.
+- New accounts can't sign in until the admin approves them, and at most 50 requests can wait at
+  once, so strangers can't fill up the database.
 
 ## Project layout
 
