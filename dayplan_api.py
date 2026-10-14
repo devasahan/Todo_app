@@ -16,9 +16,12 @@ From a console:
     python3 ~/Todo_app/dayplan_api.py set-password someone@example.com
     python3 ~/Todo_app/dayplan_api.py make-admin someone@example.com
 
-`set-password` creates an active account or resets a forgotten password
-(and signs that account out everywhere).
+`set-password` resets a forgotten password (and signs that account out
+everywhere); `add-user` creates an active account; `make-admin` makes an
+account the admin, creating it first if needed. After restoring the
+database file from a backup, run `new-epoch` so every browser resyncs.
 """
+import calendar
 import getpass
 import hashlib
 import hmac
@@ -51,6 +54,16 @@ MAX_PENDING = 50  # unanswered sign-up requests, so strangers can't flood the da
 # Password hashing is deliberately slow (~0.4 s). Cap it site-wide so a flood of
 # sign-in or sign-up attempts with ever-changing emails can't tie up the server.
 MAX_PASSWORD_CHECKS_PER_MINUTE = 30
+# ...and give each visitor address only a share of that, so one stranger
+# can't use it all up and keep everyone else from signing in.
+MAX_PASSWORD_CHECKS_PER_ADDRESS = 5
+# A deletion from a device whose clock runs ahead must not beat later work:
+# its time is capped at the server's clock plus this margin.
+MAX_CLOCK_AHEAD_MS = 60_000
+WRONG_OR_WAITING = (
+    'Wrong email or password. (If you asked for an account recently, '
+    "you can sign in once the admin has approved it.)"
+)
 REQUEST_SENT = (
     "Thanks! Your request has been sent. Once the admin approves it, you can sign in. "
     '(If you already have an account, just sign in.)'
@@ -58,7 +71,7 @@ REQUEST_SENT = (
 STATUSES = ('active', 'pending', 'disabled')
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 # Plan versions are compared by their ISO-8601 UTC time, e.g. 2026-10-14T09:30:00.000Z.
-STAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$')
+STAMP_RE = re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?Z$')
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -90,7 +103,8 @@ CREATE TABLE IF NOT EXISTS login_failures (
     ip TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS password_checks (
-    at INTEGER NOT NULL
+    at INTEGER NOT NULL,
+    ip TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -146,16 +160,60 @@ def migrate(conn):
                         stamp = json.loads(row['data']).get('updatedAt', '')
                     except (ValueError, AttributeError):
                         stamp = ''
-                    if isinstance(stamp, str) and STAMP_RE.match(stamp):
+                    if canonical_stamp(stamp):
                         conn.execute(
                             'UPDATE plans SET updated_at = ? WHERE user_id = ? AND id = ?',
-                            (stamp, row['user_id'], row['id']),
+                            (canonical_stamp(stamp), row['user_id'], row['id']),
                         )
         if 'ip' not in columns_of(conn, 'login_failures'):
             with conn:
                 conn.execute("ALTER TABLE login_failures ADD COLUMN ip TEXT NOT NULL DEFAULT ''")
+        if 'ip' not in columns_of(conn, 'password_checks'):
+            with conn:
+                conn.execute("ALTER TABLE password_checks ADD COLUMN ip TEXT NOT NULL DEFAULT ''")
+        # Plans deleted before deletions carried a time: date them now, so an
+        # older copy offered later can't bring them back.
+        with conn:
+            conn.execute(
+                "UPDATE plans SET updated_at = ? WHERE data IS NULL AND updated_at = ''", (server_stamp(),)
+            )
     except sqlite3.OperationalError:
         pass  # another process upgraded the database at the same moment
+
+
+# Stamps are stored as YYYY-MM-DDTHH:MM:SS.mmmZ (like the browser's
+# toISOString()), so comparing them as text compares them in time.
+
+def stamp_ms(stamp):
+    """Milliseconds since 1970 for an ISO UTC stamp, or None if it isn't one."""
+    match = STAMP_RE.match(stamp) if isinstance(stamp, str) else None
+    if not match:
+        return None
+    try:
+        seconds = calendar.timegm(time.strptime(match.group(1), '%Y-%m-%dT%H:%M:%S'))
+    except (ValueError, OverflowError):
+        return None
+    return seconds * 1000 + int(((match.group(2) or '') + '000')[:3])
+
+
+def format_stamp(ms):
+    return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(ms // 1000)) + '.{:03d}Z'.format(ms % 1000)
+
+
+def canonical_stamp(stamp):
+    ms = stamp_ms(stamp)
+    return format_stamp(ms) if ms is not None else ''
+
+
+def server_stamp(offset_ms=0):
+    """The server's time (plus an offset) as a stamp."""
+    return format_stamp(int(time.time() * 1000) + offset_ms)
+
+
+def stamp_after(stamp):
+    """The stamp 1 ms after `stamp` (or the server's time if it isn't valid)."""
+    ms = stamp_ms(stamp)
+    return format_stamp(ms + 1) if ms is not None else server_stamp()
 
 
 def database_epoch(conn):
@@ -189,15 +247,18 @@ def verify_password(password, stored):
 _dummy_hash = None
 
 
-def reserve_password_check(conn):
-    """Counts a password check against the site-wide limit, or refuses it."""
+def reserve_password_check(conn, ip):
+    """Counts a password check against the per-address and site-wide limits, or refuses it."""
     now = int(time.time())
     with conn:
         conn.execute('DELETE FROM password_checks WHERE at < ?', (now - 60,))
+        mine = conn.execute('SELECT COUNT(*) FROM password_checks WHERE ip = ?', (ip,)).fetchone()[0]
+        if mine >= MAX_PASSWORD_CHECKS_PER_ADDRESS:
+            raise ApiError(429, 'Too many attempts. Please wait a minute and try again.')
         recent = conn.execute('SELECT COUNT(*) FROM password_checks').fetchone()[0]
         if recent >= MAX_PASSWORD_CHECKS_PER_MINUTE:
             raise ApiError(429, 'Too many sign-in attempts on this site right now. Please wait a minute and try again.')
-        conn.execute('INSERT INTO password_checks (at) VALUES (?)', (now,))
+        conn.execute('INSERT INTO password_checks (at, ip) VALUES (?, ?)', (now, ip))
 
 
 def burn_password_check(password):
@@ -360,7 +421,7 @@ def api_register(conn, environ, body):
         raise ApiError(403, "This site isn't accepting new accounts right now.")
     if not first and count_pending(conn) >= MAX_PENDING:
         raise ApiError(429, 'Too many people are waiting for approval right now. Please try again later.')
-    reserve_password_check(conn)
+    reserve_password_check(conn, client_ip(environ))
     hashed = hash_password(password)  # slow, so done before taking the database lock
 
     with conn:
@@ -395,23 +456,23 @@ def api_login(conn, environ, body):
     ).fetchone()[0]
     if failures >= LOGIN_MAX_FAILURES:
         raise ApiError(429, 'Too many attempts. Wait 15 minutes and try again.')
-    reserve_password_check(conn)
+    reserve_password_check(conn, ip)
 
     user = conn.execute(
         'SELECT id, email, password_hash, status, is_admin FROM users WHERE email = ?', (email,)
     ).fetchone()
     if user is None:
         burn_password_check(password)
-    if user is None or not verify_password(password, user['password_hash']):
+    # A request that is still waiting for approval gets the same answer as a
+    # wrong password: otherwise a stranger could sign up with any email and
+    # then sign in to find out whether that email already had an account.
+    if user is None or not verify_password(password, user['password_hash']) or user['status'] == 'pending':
         with conn:
             conn.execute('INSERT INTO login_failures (email, at, ip) VALUES (?, ?, ?)', (email, now, ip))
-        raise ApiError(401, 'Wrong email or password.')
+        raise ApiError(401, WRONG_OR_WAITING)
 
     with conn:
         conn.execute('DELETE FROM login_failures WHERE email = ? AND ip = ?', (email, ip))
-    # Only reveal the account's state to someone who knows its password.
-    if user['status'] == 'pending':
-        raise ApiError(403, "Your account is waiting for the admin's approval. Please try again later.")
     if user['status'] != 'active':
         raise ApiError(403, 'This account has been turned off. Contact the admin of this site.')
     token = create_session(conn, user['id'])
@@ -427,9 +488,15 @@ def api_logout(conn, environ, body):
 
 
 def change_stamp(change, data):
-    """The time a change was made: the plan's updatedAt, or deletedAt for a deletion."""
+    """The time a change was made: the plan's updatedAt, or deletedAt for a deletion.
+
+    A deletion without any deletedAt comes from an older version of the app
+    still open in some tab; it gets the server's time. Invalid times lose.
+    """
+    if data is None and 'deletedAt' not in change:
+        return server_stamp()
     stamp = data.get('updatedAt') if data is not None else change.get('deletedAt')
-    return stamp if isinstance(stamp, str) and STAMP_RE.match(stamp) else ''
+    return canonical_stamp(stamp)
 
 
 def api_sync(conn, environ, body):
@@ -477,9 +544,15 @@ def api_sync(conn, environ, body):
     with conn:
         conn.execute('BEGIN IMMEDIATE')
         rev = conn.execute('SELECT rev FROM users WHERE id = ?', (user['id'],)).fetchone()[0]
-        if (client_epoch and client_epoch != epoch) or cursor > rev:
-            # This database isn't the one the browser synced with (e.g. it was
-            # restored from a copy): the browser starts over.
+        if client_epoch and client_epoch != epoch:
+            # This database isn't the one the browser synced with: start over.
+            return 200, {'epoch': epoch, 'reset': True}, []
+        if cursor > rev:
+            # The database went backwards (restored from a copy, which keeps the
+            # old epoch). Give it a new epoch so *every* browser starts over,
+            # not just the ones that happen to be ahead.
+            epoch = secrets.token_hex(8)
+            conn.execute("UPDATE settings SET value = ? WHERE key = 'epoch'", (epoch,))
             return 200, {'epoch': epoch, 'reset': True}, []
 
         saved, stale = set(), set()
@@ -493,6 +566,13 @@ def api_sync(conn, environ, body):
             if row is not None and not stamp > row['updated_at']:
                 stale.add(plan_id)  # the server has the same or a newer version
                 continue
+            if data is None:
+                # A deletion from a device whose clock runs ahead would beat
+                # later work on other devices: cap its time (but keep it newer
+                # than the version it deletes).
+                cap = server_stamp(MAX_CLOCK_AHEAD_MS)
+                if stamp > cap:
+                    stamp = max(cap, stamp_after(row['updated_at'])) if row is not None else cap
             if data is not None and not (row and row['live']):
                 live = conn.execute(
                     'SELECT COUNT(*) FROM plans WHERE user_id = ? AND data IS NOT NULL', (user['id'],)
@@ -690,6 +770,18 @@ STATUS_TEXT = {
 
 # -------------------------------------------------------------------- CLI
 
+def read_new_password(email):
+    """Asks twice for a new password; None if it's too short or doesn't match."""
+    password = getpass.getpass('New password for {}: '.format(email))
+    if len(password) < MIN_PASSWORD:
+        print('Use at least {} characters.'.format(MIN_PASSWORD))
+        return None
+    if getpass.getpass('Type it again: ') != password:
+        print('The passwords did not match. Nothing was changed.')
+        return None
+    return password
+
+
 def main(argv):
     usage = (
         'Usage:\n'
@@ -697,8 +789,16 @@ def main(argv):
         '  python3 dayplan_api.py approve EMAIL\n'
         '  python3 dayplan_api.py set-password EMAIL     (existing account)\n'
         '  python3 dayplan_api.py add-user EMAIL         (new, active account)\n'
-        '  python3 dayplan_api.py make-admin EMAIL'
+        '  python3 dayplan_api.py make-admin EMAIL       (creates the account if needed)\n'
+        '  python3 dayplan_api.py new-epoch              (after restoring the database file)'
     )
+    if len(argv) == 2 and argv[1] == 'new-epoch':
+        conn = connect()
+        with conn:
+            conn.execute("DELETE FROM settings WHERE key = 'epoch'")
+        database_epoch(conn)
+        print('Done. Every browser will reload its plans from the server on its next sync.')
+        return 0
     if len(argv) == 2 and argv[1] == 'list-users':
         conn = connect()
         rows = conn.execute('SELECT email, status, is_admin FROM users ORDER BY id').fetchall()
@@ -707,6 +807,18 @@ def main(argv):
         if not rows:
             print('No accounts yet.')
         return 0
+    if len(argv) == 3 and argv[1] == 'make-admin':
+        email = argv[2].strip().lower()
+        conn = connect()
+        if not EMAIL_RE.match(email):
+            print('That does not look like an email address.')
+            return 1
+        if not conn.execute('SELECT 1 FROM users WHERE email = ?', (email,)).fetchone():
+            print('There is no account for {} yet, so one will be created.'.format(email))
+            password = read_new_password(email)
+            if password is None:
+                return 1
+            set_password(conn, email, password, status='active', admin=True)
     if len(argv) == 3 and argv[1] in ('approve', 'make-admin'):
         email = argv[2].strip().lower()
         conn = connect()
@@ -734,12 +846,8 @@ def main(argv):
         if argv[1] == 'add-user' and exists:
             print('That account already exists. Use set-password to change its password.')
             return 1
-        password = getpass.getpass('New password for {}: '.format(email))
-        if len(password) < MIN_PASSWORD:
-            print('Use at least {} characters.'.format(MIN_PASSWORD))
-            return 1
-        if getpass.getpass('Type it again: ') != password:
-            print('The passwords did not match. Nothing was changed.')
+        password = read_new_password(email)
+        if password is None:
             return 1
         set_password(conn, email, password, status='active', admin=count_users(conn) == 0)
         if exists:

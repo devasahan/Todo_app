@@ -342,7 +342,8 @@
         ...fields,
         id: uid(),
         status,
-        order: peers.length ? Math.min(...peers) - 1 : 0,
+        // A little randomness so two devices adding at once don't get the same order.
+        order: (peers.length ? Math.min(...peers) - 1 : 0) - Math.random() / 2,
         createdAt: stamp,
         updatedAt: stamp,
         startedAt: status === 'in_progress' ? stamp : '',
@@ -386,33 +387,44 @@
     const plan = plans.find((p) => p.id === id);
     if (!plan || !STATUSES.includes(toStatus)) return plans;
 
-    const column = plans
-      .filter((p) => p.status === toStatus && p.id !== id)
-      .sort((a, b) => a.order - b.order);
+    const column = plans.filter((p) => p.status === toStatus && p.id !== id).sort(byOrder);
     let index = beforeId ? column.findIndex((p) => p.id === beforeId) : -1;
     if (index < 0) index = column.length;
 
     const above = column[index - 1];
     const below = column[index];
+    // Somewhere in the middle of the gap (not exactly halfway), so two devices
+    // moving cards into the same gap at once don't pick the same number.
+    const jitter = 0.25 + Math.random() / 2;
     let order;
-    if (above && below) order = (above.order + below.order) / 2;
-    else if (below) order = below.order - 1;
-    else if (above) order = above.order + 1;
+    if (above && below) order = above.order + (below.order - above.order) * jitter;
+    else if (below) order = below.order - 1 - jitter / 2;
+    else if (above) order = above.order + 1 + jitter / 2;
     else order = 0;
 
     const moved = { ...withStatus(plan, toStatus, now), order, updatedAt: nextStamp(plan.updatedAt, now) };
-    if (above && below && !(order > above.order && order < below.order)) {
-      // Ran out of room between two neighbours (very rare): renumber the column.
-      column.splice(index, 0, moved);
-      const orders = new Map(column.map((p, i) => [p.id, i]));
-      return plans.map((p) => {
-        if (p.id === id) return { ...moved, order: orders.get(id) };
-        return orders.has(p.id) && p.order !== orders.get(p.id)
-          ? { ...p, order: orders.get(p.id), updatedAt: nextStamp(p.updatedAt, now) }
-          : p;
-      });
+    if (!above || !below || (order > above.order && order < below.order)) {
+      return plans.map((p) => (p.id === id ? moved : p));
     }
-    return plans.map((p) => (p.id === id ? moved : p));
+
+    // No room between the neighbours (equal orders, or after very many moves
+    // into one gap): re-space just the cards packed around the gap, never the
+    // whole column, so as few plans as possible change.
+    let lo = index - 1;
+    let hi = index;
+    const packed = (a, b) => !(b.order - a.order > Math.max(1, Math.abs(a.order)) * 1e-9);
+    while (lo > 0 && packed(column[lo - 1], column[lo])) lo -= 1;
+    while (hi < column.length - 1 && packed(column[hi], column[hi + 1])) hi += 1;
+    const cluster = column.slice(lo, hi + 1);
+    cluster.splice(index - lo, 0, moved);
+    const floor = lo > 0 ? column[lo - 1].order : column[lo].order - cluster.length - 1;
+    const ceiling = hi < column.length - 1 ? column[hi + 1].order : column[hi].order + cluster.length + 1;
+    const step = (ceiling - floor) / (cluster.length + 1);
+    const respaced = new Map(cluster.map((p, i) => [p.id, floor + step * (i + 1)]));
+    return plans.map((p) => {
+      if (p.id === id) return { ...moved, order: respaced.get(id) };
+      return respaced.has(p.id) ? { ...p, order: respaced.get(p.id), updatedAt: nextStamp(p.updatedAt, now) } : p;
+    });
   }
 
   function checklistProgress(plan) {
@@ -445,6 +457,11 @@
     return plan.dueDate ? `${plan.dueDate} ${plan.dueTime || '24:00'}` : '~';
   }
 
+  // Manual order, with the id as a tie-break so every device shows the same order.
+  function byOrder(a, b) {
+    return a.order - b.order || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  }
+
   function byDeadline(a, b) {
     const ka = deadlineKey(a);
     const kb = deadlineKey(b);
@@ -454,7 +471,6 @@
 
   function sortPlans(plans, mode = 'manual') {
     const list = [...plans];
-    const byOrder = (a, b) => a.order - b.order;
     switch (mode) {
       case 'deadline':
         return list.sort((a, b) => byDeadline(a, b) || byOrder(a, b));
@@ -463,7 +479,7 @@
           (a, b) => PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority] || byDeadline(a, b) || byOrder(a, b)
         );
       case 'newest':
-        return list.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        return list.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || byOrder(a, b));
       default:
         return list.sort(byOrder);
     }
@@ -503,7 +519,7 @@
     }
 
     for (const key of ['overdue', 'today', 'inProgress', 'upcoming', 'later']) {
-      groups[key].sort((a, b) => byDeadline(a, b) || a.order - b.order);
+      groups[key].sort((a, b) => byDeadline(a, b) || byOrder(a, b));
     }
     groups.doneToday.sort((a, b) => b.completedAt.localeCompare(a.completedAt));
     return groups;

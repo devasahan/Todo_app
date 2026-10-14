@@ -75,9 +75,11 @@ Click **Save**.
 use anywhere else. **The first account on the site becomes its admin**, so do this before you
 share the address with anyone.
 
-(If someone else got there first, you'll see *"Request sent"* instead of being signed in. Fix it
-from a Bash console: `python3 ~/Todo_app/dayplan_api.py make-admin you@example.com`, sign in,
-then use **Manage users** to turn off and delete the other account.)
+(If someone else got there first, you'll see *"Request sent"* or *"isn't accepting new accounts"*
+instead of being signed in. Fix it from a Bash console with
+`python3 ~/Todo_app/dayplan_api.py make-admin you@example.com`. It creates your account if
+needed and asks you for a password. Then sign in and use **Manage users** to turn off and delete
+the other account.)
 
 On any other browser or phone, open the same address, click **Sign in** and use the same email and
 password. Your plans appear and stay in sync.
@@ -134,8 +136,13 @@ into the app:
 python3 ~/Todo_app/dayplan_api.py list-users                 # everyone, with their status
 python3 ~/Todo_app/dayplan_api.py add-user friend@example.com     # a new, approved account
 python3 ~/Todo_app/dayplan_api.py approve friend@example.com
-python3 ~/Todo_app/dayplan_api.py make-admin friend@example.com
+python3 ~/Todo_app/dayplan_api.py make-admin friend@example.com    # creates it if needed
 ```
+
+**Backups of the server data.** Your plans are in `/home/yourname/dayplan-data/dayplan.sqlite3`;
+download a copy from the **Files** tab now and then. If you ever put an older copy back, run
+`python3 ~/Todo_app/dayplan_api.py new-epoch` afterwards and **Reload** the web app, so every
+browser reloads its plans from the server.
 
 ### Moving plans you already have onto the site
 
@@ -244,9 +251,10 @@ How it's protected:
 - You stay signed in with a random session token in an `HttpOnly`, `SameSite=Lax` cookie (and
   `Secure` over HTTPS). Only a hash of the token is stored on the server.
 - Ten wrong passwords in 15 minutes from one place lock that email there for the rest of the 15
-  minutes (so a stranger can't lock you out of your own account), and the whole site checks at
-  most 30 passwords a minute, so a flood of guesses can't slow it down. People who are already
-  signed in aren't affected.
+  minutes, so a stranger can't lock you out of your own account. Each internet connection can try
+  at most 5 passwords a minute, and the whole site checks at most 30 a minute, so a flood of
+  guesses can't slow it down. A very large flood from many connections can delay new sign-ins
+  while it lasts; people who are already signed in aren't affected.
 - Each account only ever sees its own plans. The admin manages accounts, not their contents.
 - New accounts can't sign in until the admin approves them, and at most 50 requests can wait at
   once, so strangers can't fill up the database.

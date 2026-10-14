@@ -143,7 +143,7 @@ test('createPlan puts new plans at the top of their column', () => {
   const created = C.createPlan({ title: 'New', status: 'in_progress' }, existing, NOW);
   assert.equal(created.startedAt, NOW.toISOString());
   const top = C.createPlan({ title: 'Top' }, existing, NOW);
-  assert.equal(top.order, -1);
+  assert.ok(top.order < 0 && top.order >= -1.5);
 });
 
 test('movePlan changes status and reorders the target column', () => {
@@ -191,10 +191,37 @@ test('movePlan changes only the moved plan and marks it as changed', () => {
   assert.equal(done.find((p) => p.id === 'x').status, 'in_progress');
 });
 
-test('movePlan renumbers only when two orders leave no room in between', () => {
-  const plans = [plan({ id: 'a', order: 1 }), plan({ id: 'b', order: 1 + Number.EPSILON }), plan({ id: 'm', order: 50 })];
+test('movePlan with no room re-spaces only the tied cards', () => {
+  const plans = [
+    plan({ id: 'first', order: -10 }),
+    plan({ id: 'a', order: 1 }),
+    plan({ id: 'b', order: 1 }), // tied with a (e.g. added on two devices at once)
+    plan({ id: 'last', order: 20 }),
+    plan({ id: 'm', order: 50 }),
+  ];
   const moved = C.movePlan(plans, 'm', 'todo', 'b', NOW);
-  assert.deepEqual(C.sortPlans(moved).map((p) => p.id), ['a', 'm', 'b']);
+  assert.deepEqual(C.sortPlans(moved).map((p) => p.id), ['first', 'a', 'm', 'b', 'last']);
+  const changed = [...C.changedPlanIds(plans, moved)].sort();
+  assert.deepEqual(changed, ['a', 'b', 'm']); // never the whole column
+});
+
+test('equal orders always sort the same way on every device', () => {
+  const x = plan({ id: 'x', order: 3 });
+  const y = plan({ id: 'y', order: 3 });
+  assert.deepEqual(C.sortPlans([y, x]).map((p) => p.id), ['x', 'y']);
+  assert.deepEqual(C.sortPlans([x, y]).map((p) => p.id), ['x', 'y']);
+});
+
+test('many moves into the same gap keep working', () => {
+  let plans = [plan({ id: 'a', order: 0 }), plan({ id: 'b', order: 1 })];
+  for (let i = 0; i < 80; i += 1) {
+    plans = [...plans, plan({ id: `n${i}`, order: 100 + i })];
+    plans = C.movePlan(plans, `n${i}`, 'todo', 'b', NOW); // always just above b
+  }
+  const ids = C.sortPlans(plans).map((p) => p.id);
+  assert.equal(ids[0], 'a');
+  assert.equal(ids[ids.length - 1], 'b');
+  assert.equal(ids[ids.length - 2], 'n79');
 });
 
 test('filters match title, description, tags and steps', () => {

@@ -127,12 +127,16 @@
 
   // A plan brought back (undo, import) is a new change, newer than `over`.
   const restored = (plan, over = plan) => ({ ...plan, updatedAt: C.nextStamp(over.updatedAt) });
+  // Undoing a delete must also be newer than the deletion, which was stamped
+  // just after the plan's own time.
+  const undeleted = (plan) => restored(plan, { updatedAt: C.nextStamp(plan.updatedAt) });
 
   function setPlans(plans) {
     const before = state.plans;
     state.plans = plans;
     savePlans();
     if (sync.user) trackChanges(before, plans);
+    else trackDeletesWhileSignedOut(before, plans);
     render();
   }
 
@@ -176,7 +180,7 @@
       onAction: () => {
         if (findPlan(id)) return;
         const plans = [...state.plans];
-        plans.splice(Math.min(index, plans.length), 0, restored(plan));
+        plans.splice(Math.min(index, plans.length), 0, undeleted(plan));
         setPlans(plans);
       },
     });
@@ -710,6 +714,8 @@
       const item = e.target instanceof Element && e.target.closest('[draggable="true"][data-id]');
       if (!item) return;
       state.dragId = item.dataset.id;
+      // dragend still reaches the card itself if it was replaced meanwhile.
+      item.addEventListener('dragend', endDrag, { once: true });
       e.dataTransfer.effectAllowed = 'move';
       e.dataTransfer.setData('text/plain', item.dataset.id);
       requestAnimationFrame(() => {
@@ -958,7 +964,17 @@
 
     const before = findPlan(editor.id);
     if (!before) {
-      toast('This plan was deleted in the meantime.');
+      const edited = JSON.stringify(values) !== JSON.stringify(editor.original);
+      if (!edited) {
+        toast('This plan was deleted on another device.');
+        return;
+      }
+      // Don't throw away what was typed: save it again as a plan.
+      const plan = addPlan(values);
+      toast(`“${truncate(plan.title)}” was deleted on another device. Your version was saved again.`, {
+        action: 'Undo',
+        onAction: () => setPlans(state.plans.filter((p) => p.id !== plan.id)),
+      });
       return;
     }
     // Only fields changed in the editor are saved, onto the plan as it is now,
@@ -1379,7 +1395,7 @@
     setPlans(state.plans.filter((p) => p.status !== 'done'));
     toast(`Cleared ${done.length} completed ${done.length === 1 ? 'plan' : 'plans'}`, {
       action: 'Undo',
-      onAction: () => setPlans([...state.plans, ...done.filter((d) => !findPlan(d.id)).map(restored)]),
+      onAction: () => setPlans([...state.plans, ...done.filter((d) => !findPlan(d.id)).map(undeleted)]),
     });
   }
 
@@ -1513,15 +1529,49 @@
 
   // Remembers which plans changed (or were deleted, and when) so they get sent.
   function trackChanges(before, after) {
-    const now = new Date().toISOString();
+    const old = new Map(before.map((p) => [p.id, p]));
     const present = new Set(after.map((p) => p.id));
     for (const id of C.changedPlanIds(before, after)) {
       sync.pending.add(id);
+      // A deletion is stamped later than the version it removes, like an edit,
+      // so it sticks even if this device's clock runs behind.
       if (present.has(id)) sync.deletedAt.delete(id);
-      else sync.deletedAt.set(id, now);
+      else sync.deletedAt.set(id, C.nextStamp(old.has(id) ? old.get(id).updatedAt : ''));
     }
     saveSyncState();
     scheduleSync();
+  }
+
+  // Deletions that hadn't reached the account when this browser was signed
+  // out by the server (expired sign-in, password reset), plus any made since.
+  // They're sent when the same account signs in again, so those plans don't
+  // come back.
+  const UNSENT_DELETES_KEY = 'dayplan.unsent-deletes.v1';
+
+  function loadUnsentDeletes() {
+    try {
+      const saved = JSON.parse(readStorage(UNSENT_DELETES_KEY) || 'null');
+      return saved && typeof saved.user === 'string' && saved.deleted && typeof saved.deleted === 'object' ? saved : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function keepUnsentDeletes(user, deleted) {
+    if (Object.keys(deleted).length) writeStorage(UNSENT_DELETES_KEY, JSON.stringify({ user, deleted }));
+    else removeStorage(UNSENT_DELETES_KEY);
+  }
+
+  // Called for every change while signed out.
+  function trackDeletesWhileSignedOut(before, after) {
+    const saved = loadUnsentDeletes();
+    if (!saved) return;
+    const present = new Set(after.map((p) => p.id));
+    for (const plan of before) {
+      if (!present.has(plan.id)) saved.deleted[plan.id] = C.nextStamp(plan.updatedAt);
+    }
+    for (const id of Object.keys(saved.deleted)) if (present.has(id)) delete saved.deleted[id]; // undone
+    keepUnsentDeletes(saved.user, saved.deleted);
   }
 
   // Another tab signed in, signed out or synced.
@@ -1541,7 +1591,8 @@
       sync.notifiedPending = 0;
     }
     updateAccountUI();
-    render();
+    if (state.dragId) state.renderAfterDrag = true;
+    else render();
     if (sync.user) syncNow(); // also refreshes the admin's waiting count
   }
 
@@ -1683,6 +1734,15 @@
     sync.pending = new Set(state.plans.map((p) => p.id));
     sync.inflight.clear();
     sync.deletedAt.clear();
+    const unsent = loadUnsentDeletes();
+    if (unsent && unsent.user === email) {
+      for (const [id, at] of Object.entries(unsent.deleted)) {
+        if (findPlan(id)) continue;
+        sync.pending.add(id);
+        sync.deletedAt.set(id, at);
+      }
+    }
+    removeStorage(UNSENT_DELETES_KEY);
     sync.retryDelay = 0;
     removeStorage(LOGOUT_KEY); // this sign-in replaces any unfinished sign-out
     saveSyncState();
@@ -1695,6 +1755,11 @@
   // password was changed). Plans stay here; signing in again merges them.
   function signedOutElsewhere() {
     const email = sync.user;
+    const deleted = {};
+    for (const id of new Set([...sync.pending, ...sync.inflight])) {
+      if (!findPlan(id) && sync.deletedAt.has(id)) deleted[id] = sync.deletedAt.get(id);
+    }
+    keepUnsentDeletes(email, deleted);
     clearSyncState();
     updateAccountUI();
     render();
@@ -1724,7 +1789,9 @@
       writeStorage(LOGOUT_KEY, '1');
     }
     clearSyncState();
+    removeStorage(UNSENT_DELETES_KEY);
     // Plans are safe in the account; don't leave them on a shared computer.
+    // (Set directly, not through setPlans: clearing this browser is not a deletion.)
     state.plans = [];
     savePlans();
     updateAccountUI();
@@ -2389,7 +2456,8 @@
     window.addEventListener('storage', (e) => {
       if (e.key === STORAGE_KEY) {
         state.plans = loadPlans();
-        render();
+        if (state.dragId) state.renderAfterDrag = true;
+        else render();
       }
       if (e.key === SYNC_KEY) adoptSyncStateFromOtherTab();
     });

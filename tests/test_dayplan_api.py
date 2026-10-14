@@ -93,6 +93,8 @@ class ApiTestCase(unittest.TestCase):
         patches = [
             mock.patch.dict(os.environ, {'DAYPLAN_DB': os.path.join(self.tmp.name, 'data', 'db.sqlite3')}),
             mock.patch.object(dayplan_api, 'PBKDF2_ITERATIONS', 1000),  # keep tests fast
+            # Every test client shares one address; tests of the per-address limit lower it.
+            mock.patch.object(dayplan_api, 'MAX_PASSWORD_CHECKS_PER_ADDRESS', 1000),
         ]
         for patch in patches:
             patch.start()
@@ -140,13 +142,13 @@ class Accounts(ApiTestCase):
         self.assertNotIn('set_cookie', res)  # not signed in yet
         self.assertIsNone(friend.get('/api/me')['json']['user'])
 
-        # Right password, but not approved yet.
-        res = friend.post('/api/login', {'email': 'friend@example.com', 'password': PASSWORD})
-        self.assertEqual(res['status'], 403)
-        self.assertIn('approval', res['json']['error'])
-        # Wrong password still says only "wrong", revealing nothing about the account.
-        res = friend.post('/api/login', {'email': 'friend@example.com', 'password': 'not it at all'})
-        self.assertEqual(res['status'], 401)
+        # Right password, but not approved yet: the same answer as a wrong password,
+        # so nobody can use sign-up + sign-in to find out who has an account.
+        waiting = friend.post('/api/login', {'email': 'friend@example.com', 'password': PASSWORD})
+        wrong = friend.post('/api/login', {'email': 'friend@example.com', 'password': 'not it at all'})
+        self.assertEqual(waiting['status'], 401)
+        self.assertEqual(waiting['json'], wrong['json'])
+        self.assertIn('approved', waiting['json']['error'])
 
         self.assertEqual(admin.get('/api/me')['json']['pending'], 1)
         sync = admin.post('/api/sync', {'cursor': 0, 'changes': []})['json']
@@ -264,6 +266,19 @@ class Accounts(ApiTestCase):
         owner = Client()
         owner.ip = '198.51.100.7'
         self.assertEqual(owner.post('/api/login', {'email': EMAIL, 'password': PASSWORD})['status'], 200)
+
+    def test_each_address_gets_only_a_share_of_password_checks(self):
+        self.signed_in()
+        with mock.patch.object(dayplan_api, 'MAX_PASSWORD_CHECKS_PER_ADDRESS', 2):
+            stranger = Client()
+            stranger.ip = '203.0.113.9'
+            for i in range(2):
+                self.assertEqual(stranger.post('/api/login', {'email': f'x{i}@example.com', 'password': PASSWORD})['status'], 401)
+            res = stranger.post('/api/login', {'email': 'x9@example.com', 'password': PASSWORD})
+            self.assertEqual(res['status'], 429)
+            owner = Client()
+            owner.ip = '198.51.100.7'
+            self.assertEqual(owner.post('/api/login', {'email': EMAIL, 'password': PASSWORD})['status'], 200)
 
     def test_simultaneous_first_sign_ups_make_one_admin(self):
         results = []
@@ -385,13 +400,41 @@ class Sync(ApiTestCase):
         res = client.post('/api/sync', {'cursor': 2, 'changes': [self.plan('a', 'Undone delete')]})  # e.g. Undo
         self.assertEqual(sync_part(res), {'cursor': 3, 'changes': []})
 
-    def test_changes_without_a_valid_time_lose(self):
+    def test_changes_with_an_invalid_time_lose(self):
         client = self.signed_in()
-        client.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a')]})
-        res = client.post('/api/sync', {'cursor': 1, 'changes': [{'id': 'a', 'data': None}]})
+        client.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a', at=stamp(0))]})
+        res = client.post('/api/sync', {'cursor': 1, 'changes': [{'id': 'a', 'data': None, 'deletedAt': 'yesterday'}]})
         self.assertEqual(res['json']['changes'][0]['data']['title'], 'Plan')
         res = client.post('/api/sync', {'cursor': 1, 'changes': [self.plan('a', 'x', at='yesterday')]})
         self.assertEqual(res['json']['changes'][0]['data']['title'], 'Plan')
+
+    def test_deletion_from_an_old_app_version_uses_the_server_time(self):
+        client = self.signed_in()
+        client.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a', at=stamp(0))]})
+        res = client.post('/api/sync', {'cursor': 1, 'changes': [{'id': 'a', 'data': None}]})  # no deletedAt key
+        self.assertEqual(sync_part(res), {'cursor': 2, 'changes': []})
+
+    def test_times_in_other_iso_formats_compare_correctly(self):
+        client = self.signed_in()
+        client.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a', 'First', at='2026-10-14T09:00:00.500Z')]})
+        # Without milliseconds, 09:00:00Z is *earlier*, even though "Z" sorts after "." as text.
+        res = client.post('/api/sync', {'cursor': 1, 'changes': [self.plan('a', 'Older', at='2026-10-14T09:00:00Z')]})
+        self.assertEqual(res['json']['changes'][0]['data']['title'], 'First')
+        res = client.post('/api/sync', {'cursor': 1, 'changes': [self.plan('a', 'Newer', at='2026-10-14T09:00:01Z')]})
+        self.assertEqual(sync_part(res), {'cursor': 2, 'changes': []})
+
+    def test_deletion_from_a_clock_running_ahead_cannot_beat_later_work(self):
+        client = self.signed_in()
+        client.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a', at=dayplan_api.server_stamp(-60_000))]})
+        two_hours_ahead = dayplan_api.server_stamp(2 * 3600 * 1000)
+        client.post('/api/sync', {'cursor': 1, 'changes': [self.deleted('a', at=two_hours_ahead)]})
+        conn = dayplan_api.connect()
+        stored = conn.execute("SELECT updated_at FROM plans WHERE id = 'a'").fetchone()[0]
+        self.assertLess(stored, dayplan_api.server_stamp(dayplan_api.MAX_CLOCK_AHEAD_MS + 5000))
+        # An edit made a little later on a correct clock wins.
+        later = dayplan_api.server_stamp(dayplan_api.MAX_CLOCK_AHEAD_MS + 1000)
+        res = client.post('/api/sync', {'cursor': 2, 'changes': [self.plan('a', 'Still needed', at=later)]})
+        self.assertEqual(sync_part(res), {'cursor': 3, 'changes': []})
 
     def test_restored_database_makes_browsers_start_over(self):
         client = self.signed_in()
@@ -403,6 +446,17 @@ class Sync(ApiTestCase):
         other = client.post('/api/sync', {'epoch': 'from-another-copy', 'cursor': 1, 'changes': [self.plan('b')]})
         self.assertEqual(other['json'], {'epoch': epoch, 'reset': True})
         self.assertEqual(sync_part(client.post('/api/sync', {'cursor': 0, 'changes': []}))['cursor'], 1)  # b not saved
+
+    def test_a_database_that_went_backwards_gets_a_new_epoch(self):
+        """A restored copy keeps its epoch; the first browser that is ahead triggers a new one."""
+        laptop = self.signed_in()
+        epoch = laptop.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a'), self.plan('b')]})['json']['epoch']
+        ahead = laptop.post('/api/sync', {'epoch': epoch, 'cursor': 9, 'changes': []})['json']
+        self.assertTrue(ahead['reset'])
+        self.assertNotEqual(ahead['epoch'], epoch)
+        # A browser that was *behind* the restored copy is told to start over too.
+        behind = laptop.post('/api/sync', {'epoch': epoch, 'cursor': 1, 'changes': []})['json']
+        self.assertEqual(behind, {'epoch': ahead['epoch'], 'reset': True})
 
     def test_cursor_ahead_of_server_asks_for_reset(self):
         client = self.signed_in()
@@ -549,6 +603,7 @@ class Upgrade(ApiTestCase):
         ''')
         old.execute('INSERT INTO plans VALUES (1, ?, ?, 1)',
                     ('p1', json.dumps({'id': 'p1', 'title': 'Old plan', 'updatedAt': '2026-10-01T08:00:00.000Z'})))
+        old.execute("INSERT INTO plans VALUES (1, 'gone', NULL, 2)")  # deleted before the upgrade
         old.execute('INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, 1)',
                     (EMAIL, dayplan_api.hash_password(PASSWORD)))
         old.execute('INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, 2)',
@@ -566,7 +621,10 @@ class Upgrade(ApiTestCase):
         self.assertEqual(owner.get('/api/admin/users')['status'], 200)
         # Old plans got their times, so an older copy can't overwrite them.
         res = owner.post('/api/sync', {'cursor': 0, 'changes': [self.plan('p1', 'Stale', at='2026-09-01T00:00:00.000Z')]})
-        self.assertEqual(res['json']['changes'][0]['data']['title'], 'Old plan')
+        self.assertEqual({c['id']: c['data']['title'] if c['data'] else None for c in res['json']['changes']}['p1'], 'Old plan')
+        # A plan deleted before the upgrade stays deleted when an old copy is offered.
+        res = owner.post('/api/sync', {'cursor': 0, 'changes': [self.plan('gone', 'Back?', at=dayplan_api.server_stamp(-60_000))]})
+        self.assertIsNone({c['id']: c['data'] for c in res['json']['changes']}['gone'])
 
 
 class CommandLine(ApiTestCase):
@@ -606,3 +664,21 @@ class CommandLineApprovals(ApiTestCase):
             self.assertEqual(dayplan_api.main(['x', 'make-admin', 'waiting@example.com']), 0)
         res = Client().post('/api/login', {'email': 'waiting@example.com', 'password': PASSWORD})
         self.assertEqual(res['json']['user'], {'email': 'waiting@example.com', 'admin': True})
+
+
+class CommandLineRecovery(ApiTestCase):
+    def test_make_admin_creates_a_missing_account(self):
+        # A stranger grabbed the site and turned sign-ups off; the owner has no account.
+        self.signed_in('stranger@example.com')
+        with mock.patch('getpass.getpass', side_effect=[PASSWORD, PASSWORD]), mock.patch('sys.stdout', new=io.StringIO()):
+            self.assertEqual(dayplan_api.main(['x', 'make-admin', 'owner@example.com']), 0)
+        res = Client().post('/api/login', {'email': 'owner@example.com', 'password': PASSWORD})
+        self.assertEqual(res['json']['user'], {'email': 'owner@example.com', 'admin': True})
+
+    def test_new_epoch(self):
+        client = self.signed_in()
+        epoch = client.post('/api/sync', {'cursor': 0, 'changes': []})['json']['epoch']
+        with mock.patch('sys.stdout', new=io.StringIO()):
+            self.assertEqual(dayplan_api.main(['x', 'new-epoch']), 0)
+        res = client.post('/api/sync', {'epoch': epoch, 'cursor': 0, 'changes': []})['json']
+        self.assertTrue(res['reset'])
