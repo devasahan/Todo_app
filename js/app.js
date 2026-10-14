@@ -125,8 +125,8 @@
   const visiblePlans = () => state.plans.filter((p) => C.matchesFilters(p, state.filters));
   const filtersActive = () => Boolean(state.filters.query || state.filters.tag || state.filters.priority);
 
-  const nowStamp = () => new Date().toISOString();
-  const restored = (plan) => ({ ...plan, updatedAt: nowStamp() });
+  // A plan brought back (undo, import) is a new change, newer than `over`.
+  const restored = (plan, over = plan) => ({ ...plan, updatedAt: C.nextStamp(over.updatedAt) });
 
   function setPlans(plans) {
     const before = state.plans;
@@ -151,7 +151,7 @@
   function updatePlan(id, changes) {
     const now = new Date();
     setPlans(
-      state.plans.map((p) => (p.id === id ? C.normalizePlan({ ...p, ...changes, updatedAt: now.toISOString() }, now) : p))
+      state.plans.map((p) => (p.id === id ? C.normalizePlan({ ...p, ...changes, updatedAt: C.nextStamp(p.updatedAt, now) }, now) : p))
     );
   }
 
@@ -976,7 +976,7 @@
     let plans = state.plans;
     if (Object.keys(changes).length) {
       plans = plans.map((p) =>
-        p.id === editor.id ? C.normalizePlan({ ...p, ...changes, updatedAt: now.toISOString() }, now) : p
+        p.id === editor.id ? C.normalizePlan({ ...p, ...changes, updatedAt: C.nextStamp(p.updatedAt, now) }, now) : p
       );
     }
     if (newStatus) plans = placeAtTop(plans, editor.id, newStatus);
@@ -1339,7 +1339,7 @@
         const previous = byId.get(plan.id) || null;
         if (previous && sameContent(previous, plan)) continue;
         touched.push({ id: plan.id, previous });
-        byId.set(plan.id, restored(plan));
+        byId.set(plan.id, restored(plan, previous || plan));
       }
       setPlans([...byId.values()]);
       const added = touched.filter((t) => !t.previous).length;
@@ -1354,7 +1354,7 @@
           // other devices in the meantime are kept.
           const current = new Map(state.plans.map((p) => [p.id, p]));
           for (const { id, previous } of touched) {
-            if (previous) current.set(id, restored(previous));
+            if (previous) current.set(id, restored(previous, current.get(id) || previous));
             else current.delete(id);
           }
           setPlans([...current.values()]);

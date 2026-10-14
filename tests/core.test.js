@@ -327,3 +327,16 @@ test('applyRemoteChanges merges server changes but keeps unsent local edits', ()
   assert.equal(C.applyRemoteChanges(result, [{ id: 'a', data: { ...byId.a } }], new Set(), NOW), result);
   assert.equal(C.applyRemoteChanges(result, [], new Set(), NOW), result);
 });
+
+test('nextStamp is now, but always later than the version it replaces', () => {
+  assert.equal(C.nextStamp('2026-10-14T09:00:00.000Z', NOW), NOW.toISOString());
+  // The other device's clock was ahead: still strictly newer.
+  const ahead = new Date(NOW.getTime() + 10 * 60 * 1000).toISOString();
+  assert.ok(C.nextStamp(ahead, NOW) > ahead);
+  assert.equal(C.nextStamp('', NOW), NOW.toISOString());
+  assert.equal(C.nextStamp('garbage', NOW), NOW.toISOString());
+  // Status changes and moves use it too.
+  const p = plan({ updatedAt: ahead });
+  assert.ok(C.withStatus(p, 'done', NOW).updatedAt > ahead);
+  assert.ok(C.movePlan([p], p.id, 'todo', null, NOW)[0].updatedAt > ahead);
+});

@@ -352,6 +352,14 @@
     );
   }
 
+  // The time of a change: now, but always later than the version it replaces,
+  // so an edit made on a device whose clock runs behind still counts as newer.
+  function nextStamp(previous, now = new Date()) {
+    const before = Date.parse(previous || '');
+    const time = Number.isNaN(before) ? now.getTime() : Math.max(now.getTime(), before + 1);
+    return new Date(time).toISOString();
+  }
+
   // Returns a copy of the plan in the new status, keeping timestamps honest.
   function withStatus(plan, status, now = new Date()) {
     if (!STATUSES.includes(status) || plan.status === status) return plan;
@@ -359,7 +367,7 @@
     return {
       ...plan,
       status,
-      updatedAt: stamp,
+      updatedAt: nextStamp(plan.updatedAt, now),
       startedAt: status === 'todo' ? '' : plan.startedAt || (status === 'in_progress' ? stamp : ''),
       completedAt: status === 'done' ? stamp : '',
     };
@@ -392,7 +400,7 @@
     else if (above) order = above.order + 1;
     else order = 0;
 
-    const moved = { ...withStatus(plan, toStatus, now), order, updatedAt: now.toISOString() };
+    const moved = { ...withStatus(plan, toStatus, now), order, updatedAt: nextStamp(plan.updatedAt, now) };
     if (above && below && !(order > above.order && order < below.order)) {
       // Ran out of room between two neighbours (very rare): renumber the column.
       column.splice(index, 0, moved);
@@ -400,7 +408,7 @@
       return plans.map((p) => {
         if (p.id === id) return { ...moved, order: orders.get(id) };
         return orders.has(p.id) && p.order !== orders.get(p.id)
-          ? { ...p, order: orders.get(p.id), updatedAt: now.toISOString() }
+          ? { ...p, order: orders.get(p.id), updatedAt: nextStamp(p.updatedAt, now) }
           : p;
       });
     }
@@ -699,6 +707,7 @@
     createPlan,
     withStatus,
     nextStatus,
+    nextStamp,
     movePlan,
     checklistProgress,
     matchesFilters,
