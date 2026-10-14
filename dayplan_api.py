@@ -48,6 +48,13 @@ MAX_PLANS = 10_000
 LOGIN_WINDOW_SECONDS = 15 * 60
 LOGIN_MAX_FAILURES = 10
 MAX_PENDING = 50  # unanswered sign-up requests, so strangers can't flood the database
+# Password hashing is deliberately slow (~0.4 s). Cap it site-wide so a flood of
+# sign-in or sign-up attempts with ever-changing emails can't tie up the server.
+MAX_PASSWORD_CHECKS_PER_MINUTE = 30
+REQUEST_SENT = (
+    "Thanks! Your request has been sent. Once the admin approves it, you can sign in. "
+    '(If you already have an account, just sign in.)'
+)
 STATUSES = ('active', 'pending', 'disabled')
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 
@@ -76,6 +83,9 @@ CREATE TABLE IF NOT EXISTS plans (
 CREATE INDEX IF NOT EXISTS plans_by_rev ON plans (user_id, rev);
 CREATE TABLE IF NOT EXISTS login_failures (
     email TEXT NOT NULL,
+    at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS password_checks (
     at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS settings (
@@ -146,6 +156,17 @@ def verify_password(password, stored):
 
 
 _dummy_hash = None
+
+
+def reserve_password_check(conn):
+    """Counts a password check against the site-wide limit, or refuses it."""
+    now = int(time.time())
+    with conn:
+        conn.execute('DELETE FROM password_checks WHERE at < ?', (now - 60,))
+        recent = conn.execute('SELECT COUNT(*) FROM password_checks').fetchone()[0]
+        if recent >= MAX_PASSWORD_CHECKS_PER_MINUTE:
+            raise ApiError(429, 'Too many sign-in attempts on this site right now. Please wait a minute and try again.')
+        conn.execute('INSERT INTO password_checks (at) VALUES (?)', (now,))
 
 
 def burn_password_check(password):
@@ -286,27 +307,30 @@ def api_me(conn, environ, body):
 
 
 def api_register(conn, environ, body):
-    """The first account becomes the active admin; later ones wait for approval."""
+    """The first account becomes the active admin; later ones wait for approval.
+
+    For later sign-ups the answer is the same whether or not the email already
+    has an account (and takes as long), so strangers can't use sign-up to find
+    out who uses this site.
+    """
     email, password = read_credentials(body, creating=True)
     first = count_users(conn) == 0
     if not signup_open(conn):
         raise ApiError(403, "This site isn't accepting new accounts right now.")
-    if conn.execute('SELECT 1 FROM users WHERE email = ?', (email,)).fetchone():
-        raise ApiError(409, 'An account with this email already exists. Sign in instead.')
     if not first and count_pending(conn) >= MAX_PENDING:
         raise ApiError(429, 'Too many people are waiting for approval right now. Please try again later.')
+    reserve_password_check(conn)
 
     if first:
         user_id = set_password(conn, email, password, status='active', admin=True)
         token = create_session(conn, user_id)
         return 201, {'user': {'email': email, 'admin': True}}, [session_cookie(environ, token, SESSION_SECONDS)]
 
-    set_password(conn, email, password, status='pending')
-    return 202, {
-        'pending': True,
-        'message': "Thanks! Your account is waiting for the admin's approval. "
-                   'You can sign in once it has been approved.',
-    }, []
+    if conn.execute('SELECT 1 FROM users WHERE email = ?', (email,)).fetchone():
+        burn_password_check(password)  # same time as creating an account; nothing changes
+    else:
+        set_password(conn, email, password, status='pending')
+    return 202, {'pending': True, 'message': REQUEST_SENT}, []
 
 
 def api_login(conn, environ, body):
@@ -317,6 +341,7 @@ def api_login(conn, environ, body):
     failures = conn.execute('SELECT COUNT(*) FROM login_failures WHERE email = ?', (email,)).fetchone()[0]
     if failures >= LOGIN_MAX_FAILURES:
         raise ApiError(429, 'Too many attempts. Wait 15 minutes and try again.')
+    reserve_password_check(conn)
 
     user = conn.execute(
         'SELECT id, email, password_hash, status, is_admin FROM users WHERE email = ?', (email,)

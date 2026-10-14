@@ -142,10 +142,35 @@ class Accounts(ApiTestCase):
         self.assertEqual(res['json']['user'], {'email': 'friend@example.com', 'admin': False})
         self.assertNotIn('pending', friend.get('/api/me')['json'])
 
-    def test_duplicate_email(self):
+    def test_sign_up_does_not_reveal_existing_accounts(self):
         self.signed_in()
-        res = Client().post('/api/register', {'email': EMAIL.upper(), 'password': PASSWORD})
-        self.assertEqual(res['status'], 409)
+        existing = Client().post('/api/register', {'email': EMAIL.upper(), 'password': 'attacker password'})
+        new = Client().post('/api/register', {'email': 'brand-new@example.com', 'password': PASSWORD})
+        self.assertEqual(existing['status'], new['status'])
+        self.assertEqual(existing['json'], new['json'])
+        self.assertNotIn('set_cookie', existing)
+        # The existing account is untouched: same password, still the admin.
+        res = Client().post('/api/login', {'email': EMAIL, 'password': PASSWORD})
+        self.assertEqual(res['json']['user'], {'email': EMAIL, 'admin': True})
+        self.assertEqual(Client().post('/api/login', {'email': EMAIL, 'password': 'attacker password'})['status'], 401)
+
+    def test_site_wide_limit_on_password_checks(self):
+        self.signed_in()
+        with mock.patch.object(dayplan_api, 'MAX_PASSWORD_CHECKS_PER_MINUTE', 3):
+            # The first sign-up above happened before the patch but still counts: 1 used.
+            for i in range(2):
+                res = Client().post('/api/login', {'email': f'ghost{i}@example.com', 'password': PASSWORD})
+                self.assertEqual(res['status'], 401)
+            res = Client().post('/api/login', {'email': 'ghost9@example.com', 'password': PASSWORD})
+            self.assertEqual(res['status'], 429)
+            self.assertIn('wait a minute', res['json']['error'])
+            res = Client().post('/api/register', {'email': 'new@example.com', 'password': PASSWORD})
+            self.assertEqual(res['status'], 429)
+            # Signed-in people keep working: sessions don't need a password check.
+        conn = dayplan_api.connect()
+        with conn:
+            conn.execute('UPDATE password_checks SET at = at - 61')
+        self.assertEqual(Client().post('/api/login', {'email': EMAIL, 'password': PASSWORD})['status'], 200)
 
     def test_password_is_hashed_never_stored(self):
         self.signed_in()

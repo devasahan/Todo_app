@@ -1166,8 +1166,25 @@
     el.classList.remove('show');
     clearTimeout(toastTimer);
     setTimeout(() => {
-      if (!el.classList.contains('show')) el.hidden = true;
+      if (el.classList.contains('show')) return;
+      el.hidden = true;
+      try {
+        if (el.matches(':popover-open')) el.hidePopover();
+      } catch {
+        /* no Popover API */
+      }
     }, 250);
+  }
+
+  // Shown as a popover so it sits above any open dialog (e.g. Manage users).
+  function raiseToast(el) {
+    if (typeof el.showPopover !== 'function') return;
+    try {
+      if (el.matches(':popover-open')) el.hidePopover(); // re-show to come out on top
+      el.showPopover();
+    } catch {
+      /* fall back to the normal fixed position */
+    }
   }
 
   function toast(message, { action = '', onAction = null } = {}) {
@@ -1183,6 +1200,7 @@
         }
       : null;
     el.hidden = false;
+    raiseToast(el);
     requestAnimationFrame(() => el.classList.add('show'));
     toastDuration = action ? 7000 : 3500;
     clearTimeout(toastTimer);
@@ -1400,6 +1418,7 @@
       const saved = JSON.parse(readStorage(SYNC_KEY) || '{}');
       if (typeof saved.user !== 'string' || !saved.user) return;
       sync.user = saved.user;
+      sync.admin = saved.admin === true;
       sync.cursor = Number.isInteger(saved.cursor) && saved.cursor >= 0 ? saved.cursor : 0;
       const pending = Array.isArray(saved.pending) ? saved.pending : [];
       sync.pending = new Set(pending.filter((id) => typeof id === 'string'));
@@ -1413,7 +1432,10 @@
       removeStorage(SYNC_KEY);
       return;
     }
-    writeStorage(SYNC_KEY, JSON.stringify({ user: sync.user, cursor: sync.cursor, pending: [...sync.pending] }));
+    writeStorage(
+      SYNC_KEY,
+      JSON.stringify({ user: sync.user, admin: sync.admin, cursor: sync.cursor, pending: [...sync.pending] })
+    );
   }
 
   function clearSyncState() {
@@ -1434,10 +1456,17 @@
     const mine = new Set(sync.pending);
     const wasUser = sync.user;
     sync.user = '';
+    sync.admin = false;
     loadSyncState();
-    if (sync.user && sync.user === wasUser) for (const id of mine) sync.pending.add(id);
+    if (sync.user && sync.user === wasUser) {
+      for (const id of mine) sync.pending.add(id);
+    } else {
+      sync.pendingUsers = 0;
+      sync.notifiedPending = 0;
+    }
     updateAccountUI();
     render();
+    if (sync.user) syncNow(); // also refreshes the admin's waiting count
   }
 
   async function api(path, body) {
@@ -1506,7 +1535,14 @@
         return;
       }
       sync.cursor = result.cursor;
-      if (typeof result.pending === 'number') setPendingUsers(result.pending);
+      // Only admins get a waiting count, so its presence is the source of truth.
+      const isAdmin = typeof result.pending === 'number';
+      if (isAdmin !== sync.admin) {
+        sync.admin = isAdmin;
+        if (!isAdmin) sync.pendingUsers = 0;
+        updateAccountUI();
+      }
+      if (isAdmin) setPendingUsers(result.pending);
       const next = C.applyRemoteChanges(state.plans, result.changes || [], sync.pending);
       if (next !== state.plans) {
         state.plans = next;
@@ -1621,9 +1657,11 @@
     updateAccountLabel();
   }
 
-  function setPendingUsers(count) {
+  function setPendingUsers(count, { fromOverview = false } = {}) {
+    const changed = count !== sync.pendingUsers;
     sync.pendingUsers = count;
     updateAdminBadge();
+    if (changed && !fromOverview && admin.dialog.open) refreshAdmin();
     if (sync.admin && count > sync.notifiedPending) {
       toast(`${count} ${count === 1 ? 'person is' : 'people are'} waiting for your approval.`, {
         action: 'Review',
@@ -1727,9 +1765,14 @@
       authField('password').value = '';
       if (result.pending) {
         // Later sign-ups wait for the admin: say so instead of signing in.
+        if (!auth.dialog.open) {
+          toast(result.message); // closed while the request was running
+          return;
+        }
         auth.mode = 'requested';
         auth.requested = result.message;
         renderAuthMode();
+        $('#auth-submit').disabled = false;
         $('#auth-submit').focus();
         return;
       }
@@ -1737,11 +1780,31 @@
       sync.first = false;
       const brought = state.plans.length;
       await startSession(result.user.email, result.user.admin);
-      if (signup) toast(`Account created. You're the admin of this site, and your plans are saved to ${result.user.email}.`);
-      else if (brought) toast(`Signed in. The ${brought} ${brought === 1 ? 'plan' : 'plans'} on this browser were added to your account.`);
-      else toast(`Signed in as ${result.user.email}.`);
+      let message = `Signed in as ${result.user.email}.`;
+      if (signup) message = `Account created. You're the admin of this site, and your plans are saved to ${result.user.email}.`;
+      else if (brought) message = `Signed in. The ${brought} ${brought === 1 ? 'plan' : 'plans'} on this browser were added to your account.`;
+      const waiting = sync.admin ? sync.pendingUsers : 0;
+      if (waiting) {
+        message += ` ${waiting} ${waiting === 1 ? 'person is' : 'people are'} waiting for your approval.`;
+        toast(message, { action: 'Review', onAction: openAdmin });
+      } else {
+        toast(message);
+      }
     } catch (err) {
-      showAuthError(err.status ? err.message : "Couldn't reach the server. Check your connection and try again.");
+      if (signup && err.status === 403) {
+        // Sign-ups were stopped while this dialog was open.
+        sync.signupOpen = false;
+        auth.mode = 'signin';
+        renderAuthMode();
+        render();
+        showAuthError(`${err.message} If you already have an account, you can sign in.`);
+      } else {
+        showAuthError(err.status ? err.message : "Couldn't reach the server. Check your connection and try again.");
+      }
+      if (auth.dialog.open) {
+        $('#auth-submit').disabled = false;
+        authField(authField('email').value ? 'password' : 'email').focus();
+      }
     } finally {
       auth.busy = false;
       $('#auth-submit').disabled = false;
@@ -1807,26 +1870,50 @@
     delete: (email) => `Removed ${email}.`,
   };
 
-  async function openAdmin() {
+  function openAdmin() {
     if (!sync.admin) return;
     $('#account').open = false;
-    if (!admin.dialog.open) admin.dialog.showModal();
+    admin.users = [];
+    $('#admin-error').hidden = true;
     $('#admin-signup').disabled = true; // until the real setting has loaded
     $('#admin-users').innerHTML = '<li class="user-empty muted">Loading…</li>';
+    if (!admin.dialog.open) admin.dialog.showModal();
+    $('#admin-heading').focus();
+    refreshAdmin();
+  }
+
+  async function refreshAdmin() {
     try {
       applyAdminOverview(await api('api/admin/users'));
     } catch (err) {
+      if (!admin.users.length && admin.dialog.open && err.status !== 401 && err.status !== 403) {
+        admin.failed = true;
+        $('#admin-users').innerHTML = `
+          <li class="user-empty">Couldn't load the accounts. Check your connection.
+            <button type="button" class="link" data-admin-retry>Try again</button></li>`;
+        return;
+      }
       adminError(err);
     }
   }
 
   function applyAdminOverview(data) {
+    admin.failed = false;
     admin.users = data.users;
+    $('#admin-error').hidden = true;
     $('#admin-signup').checked = data.signup;
     $('#admin-signup').disabled = false;
     sync.notifiedPending = data.pending; // no "people are waiting" toast while looking at them
-    setPendingUsers(data.pending);
+    setPendingUsers(data.pending, { fromOverview: true });
     renderAdminUsers();
+  }
+
+  // After the list re-renders, keep keyboard focus near where it was.
+  function focusAdminRow(email, index) {
+    const rows = $$('#admin-users .user-row');
+    const row = rows.find((r) => r.dataset.email === email) || rows[Math.min(index, rows.length - 1)];
+    const target = row && row.querySelector('button');
+    (target || $('#admin-heading')).focus();
   }
 
   function renderAdminUsers() {
@@ -1875,20 +1962,39 @@
       signedOutElsewhere();
       return;
     }
+    const message = err.status ? err.message : "Couldn't reach the server. Check your connection and try again.";
     if (err.status === 403) {
       admin.dialog.close();
       sync.admin = false;
+      saveSyncState();
       updateAccountUI();
+      toast(message);
+      return;
     }
-    toast(err.status ? err.message : "Couldn't reach the server. Check your connection and try again.");
+    const box = $('#admin-error');
+    box.textContent = message;
+    box.hidden = false;
+    if (err.status === 404) refreshAdmin(); // someone else changed the list
   }
 
   function setupAdmin() {
     for (const btn of $$('#admin [data-close]')) btn.addEventListener('click', () => admin.dialog.close());
+    admin.dialog.addEventListener('close', () => {
+      if (!$('#account').hidden) $('#account summary').focus();
+    });
+    window.addEventListener('online', () => {
+      if (admin.dialog.open && admin.failed) refreshAdmin();
+    });
 
     $('#admin-users').addEventListener('click', async (e) => {
+      if (e.target.closest('[data-admin-retry]')) {
+        $('#admin-users').innerHTML = '<li class="user-empty muted">Loading…</li>';
+        refreshAdmin();
+        return;
+      }
       const btn = e.target.closest('[data-admin-action]');
       if (!btn || admin.busy) return;
+      const rowIndex = $$('#admin-users .user-row').indexOf(btn.closest('.user-row'));
       const email = btn.closest('[data-email]').dataset.email;
       const action = btn.dataset.adminAction;
       const user = admin.users.find((u) => u.email === email);
@@ -1903,6 +2009,7 @@
       btn.disabled = true;
       try {
         applyAdminOverview(await api('api/admin/users', { email, action }));
+        focusAdminRow(email, rowIndex);
         const declined = action === 'delete' && user && user.status === 'pending';
         toast(declined ? `Declined the request from ${email}.` : ADMIN_DONE[action](email));
       } catch (err) {
@@ -1957,6 +2064,7 @@
     const serverUser = me && me.user ? me.user.email : '';
     if (serverUser && serverUser === sync.user) {
       sync.admin = Boolean(me.user.admin);
+      saveSyncState();
       updateAccountUI();
       render();
       if (typeof me.pending === 'number') setPendingUsers(me.pending);

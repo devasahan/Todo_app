@@ -65,15 +65,19 @@ the exact folder, for example `/home/yourname`.
 
 Click **Save**.
 
-**5. Go live.** Back on the **Web** tab, click the green **Reload** button and open
-`https://yourname.pythonanywhere.com`.
+**5. Turn on HTTPS only.** Near the bottom of the **Web** tab, in the **Security** section, switch
+**Force HTTPS** on. Passwords are then always sent encrypted.
 
-**6. Turn on HTTPS only.** Near the bottom of the **Web** tab, in the **Security** section, switch
-**Force HTTPS** on and click **Reload** again. Your password is then always sent encrypted.
+**6. Go live.** Scroll up on the **Web** tab and click the green **Reload** button.
 
-**7. Create your Dayplan account.** On your site, click **Sign in** (top right) and create an
-account with your email and a new password. Use a password you don't use anywhere else. **The first
-account is the admin.**
+**7. Create your Dayplan account right away.** Open `https://yourname.pythonanywhere.com`, click
+**Sign in** (top right) and create an account with your email and a new password that you don't
+use anywhere else. **The first account on the site becomes its admin**, so do this before you
+share the address with anyone.
+
+(If someone else got there first, you'll see *"Request sent"* instead of being signed in. Fix it
+from a Bash console: `python3 ~/Todo_app/dayplan_api.py make-admin you@example.com`, sign in,
+then use **Manage users** to turn off and delete the other account.)
 
 On any other browser or phone, open the same address, click **Sign in** and use the same email and
 password. Your plans appear and stay in sync.
@@ -81,7 +85,9 @@ password. Your plans appear and stay in sync.
 ### Letting other people use your site
 
 Like most websites, anyone can click **Sign in → Create an account**. Their account then waits for
-you: they see *"Request sent"*, and they can't sign in until you approve them.
+you: they see *"Request sent"*, and they can't sign in until you approve them. (Sign-up gives the
+same answer whether or not an email already has an account, so strangers can't use it to find out
+who uses your site.)
 
 - A red number on your account button shows how many people are waiting.
 - Open your account button → **Manage users** to **Approve** or **Decline** each request.
@@ -218,7 +224,9 @@ How it's protected:
 - Passwords are never stored, only a salted PBKDF2-SHA256 hash (600,000 rounds).
 - You stay signed in with a random session token in an `HttpOnly`, `SameSite=Lax` cookie (and
   `Secure` over HTTPS). Only a hash of the token is stored on the server.
-- Ten wrong passwords in 15 minutes lock that email for the rest of the 15 minutes.
+- Ten wrong passwords in 15 minutes lock that email for the rest of the 15 minutes, and the whole
+  site checks at most 30 passwords a minute, so a flood of guesses can't slow it down. People who
+  are already signed in aren't affected.
 - Each account only ever sees its own plans. The admin manages accounts, not their contents.
 - New accounts can't sign in until the admin approves them, and at most 50 requests can wait at
   once, so strangers can't fill up the database.

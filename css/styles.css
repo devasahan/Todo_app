@@ -2344,11 +2344,14 @@ select {
 
 /* --------------------------------------------------------------- toast */
 
+/* The toast is a popover so it can appear above open dialogs (top layer). */
 .toast {
   position: fixed;
-  left: 50%;
-  bottom: 24px;
+  inset: auto auto 24px 50%;
   z-index: 60;
+  margin: 0;
+  border: 0;
+  overflow: visible;
   display: flex;
   align-items: center;
   gap: 16px;

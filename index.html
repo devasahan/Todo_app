@@ -240,7 +240,7 @@
 
     <dialog id="admin" class="modal" aria-labelledby="admin-heading">
       <header class="modal-head">
-        <h2 id="admin-heading">Manage users</h2>
+        <h2 id="admin-heading" tabindex="-1">Manage users</h2>
         <button type="button" class="icon-btn" data-close aria-label="Close">
           <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
         </button>
@@ -254,6 +254,7 @@
             <span class="muted">Anyone can ask for an account. Nobody can sign in until you approve them.</span>
           </span>
         </label>
+        <p class="field-error" id="admin-error" role="alert" hidden></p>
         <ul class="user-list" id="admin-users" aria-live="polite"></ul>
         <p class="hint">You only see accounts here, never anyone's plans.</p>
       </div>
@@ -278,7 +279,7 @@
       </dl>
     </dialog>
 
-    <div id="toast" class="toast" role="status" aria-live="polite" hidden>
+    <div id="toast" class="toast" role="status" aria-live="polite" popover="manual" hidden>
       <span id="toast-text"></span>
       <button type="button" id="toast-action" class="toast-action" hidden></button>
     </div>
