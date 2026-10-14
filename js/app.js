@@ -1,0 +1,1545 @@
+/* Dayplan UI: rendering, interactions and persistence. Depends on js/core.js. */
+(function () {
+  'use strict';
+
+  const C = window.PlanCore;
+  const STORAGE_KEY = 'dayplan.plans.v1';
+  const PREFS_KEY = 'dayplan.prefs.v1';
+  const VIEWS = ['today', 'board', 'calendar'];
+  const SORTS = { manual: 'My order', deadline: 'Deadline', priority: 'Priority', newest: 'Newest' };
+
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+  const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ESCAPES[ch]);
+  const truncate = (s, n = 40) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
+  const ICONS = {
+    alert: '<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5M12 16v.5"/>',
+    check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+    chevronLeft: '<path d="M15 6l-6 6 6 6"/>',
+    chevronRight: '<path d="M9 6l6 6-6 6"/>',
+    clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    flag: '<path d="M5 21V4M5 4h11l-2 4 2 4H5"/>',
+    flame: '<path d="M12 3c1 3 5 5 5 10a5 5 0 0 1-10 0c0-2 1-3.5 2-4.5 0 2 1 3 2 3 0-3-1-5 1-8.5z"/>',
+    play: '<path d="M8 5.5v13l10-6.5z"/>',
+    plus: '<path d="M12 5v14M5 12h14"/>',
+    sparkle: '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/>',
+    steps: '<path d="M10 6h10M10 12h10M10 18h10"/><path d="M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"/>',
+    target: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
+    x: '<path d="M6 6l12 12M18 6L6 18"/>',
+  };
+  const icon = (name) => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
+
+  /* -------------------------------------------------------------- storage */
+
+  function readStorage(key) {
+    try {
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  }
+
+  function writeStorage(key, value) {
+    try {
+      localStorage.setItem(key, value);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  let loadProblem = '';
+
+  function loadPlans() {
+    const raw = readStorage(STORAGE_KEY);
+    if (!raw) return [];
+    try {
+      return C.importData(raw);
+    } catch (err) {
+      // Never silently throw away someone's plans: keep the unreadable copy.
+      console.error('Dayplan: stored plans could not be read.', err);
+      writeStorage(`${STORAGE_KEY}.unreadable-${Date.now()}`, raw);
+      loadProblem = 'Your saved plans could not be read. A backup copy was kept in browser storage.';
+      return [];
+    }
+  }
+
+  function savePlans() {
+    if (!writeStorage(STORAGE_KEY, JSON.stringify(C.exportData(state.plans)))) {
+      toast('Could not save. Browser storage may be full or disabled.');
+    }
+  }
+
+  function loadPrefs() {
+    const defaults = { view: 'today', sort: 'manual', theme: '' };
+    try {
+      const prefs = { ...defaults, ...JSON.parse(readStorage(PREFS_KEY) || '{}') };
+      if (!VIEWS.includes(prefs.view)) prefs.view = defaults.view;
+      if (!(prefs.sort in SORTS)) prefs.sort = defaults.sort;
+      return prefs;
+    } catch {
+      return defaults;
+    }
+  }
+
+  function savePrefs() {
+    writeStorage(PREFS_KEY, JSON.stringify(state.prefs));
+  }
+
+  function detectWeekStart() {
+    try {
+      const locale = new Intl.Locale(navigator.language);
+      const info = typeof locale.getWeekInfo === 'function' ? locale.getWeekInfo() : locale.weekInfo;
+      if (info && info.firstDay) return info.firstDay % 7; // Intl uses 7 for Sunday
+    } catch {
+      /* older browsers: fall through */
+    }
+    return 1;
+  }
+
+  /* ---------------------------------------------------------------- state */
+
+  const today = new Date();
+  const state = {
+    plans: loadPlans(),
+    prefs: loadPrefs(),
+    filters: { query: '', tag: '', priority: '' },
+    calendarMonth: new Date(today.getFullYear(), today.getMonth(), 1),
+    selectedDay: C.toISODate(today),
+    weekStart: detectWeekStart(),
+    dragId: null,
+    dropBeforeId: null,
+  };
+
+  const findPlan = (id) => state.plans.find((p) => p.id === id);
+  const visiblePlans = () => state.plans.filter((p) => C.matchesFilters(p, state.filters));
+  const filtersActive = () => Boolean(state.filters.query || state.filters.tag || state.filters.priority);
+
+  function setPlans(plans) {
+    state.plans = plans;
+    savePlans();
+    render();
+  }
+
+  // Moves a plan into `status`, placing it first in that column.
+  function placeAtTop(plans, id, status) {
+    const top = C.sortPlans(plans.filter((p) => p.status === status && p.id !== id))[0];
+    return C.movePlan(plans, id, status, top ? top.id : null);
+  }
+
+  function addPlan(fields) {
+    const plan = C.createPlan(fields, state.plans);
+    setPlans([plan, ...state.plans]);
+    return plan;
+  }
+
+  function updatePlan(id, changes) {
+    const now = new Date();
+    setPlans(
+      state.plans.map((p) => (p.id === id ? C.normalizePlan({ ...p, ...changes, updatedAt: now.toISOString() }, now) : p))
+    );
+  }
+
+  function changeStatus(id, status, origin) {
+    const plan = findPlan(id);
+    if (!plan || plan.status === status) return;
+    const point = origin ? centerOf(origin) : null;
+    setPlans(placeAtTop(state.plans, id, status));
+    if (status === 'done') {
+      celebrate(point);
+      toast(`Done: “${truncate(plan.title)}”`, { action: 'Undo', onAction: () => changeStatus(id, plan.status) });
+    }
+  }
+
+  function deletePlan(id) {
+    const index = state.plans.findIndex((p) => p.id === id);
+    if (index < 0) return;
+    const plan = state.plans[index];
+    setPlans(state.plans.filter((p) => p.id !== id));
+    toast(`Deleted “${truncate(plan.title)}”`, {
+      action: 'Undo',
+      onAction: () => {
+        if (findPlan(id)) return;
+        const plans = [...state.plans];
+        plans.splice(Math.min(index, plans.length), 0, plan);
+        setPlans(plans);
+      },
+    });
+  }
+
+  function setView(view) {
+    if (!VIEWS.includes(view)) return;
+    state.prefs.view = view;
+    savePrefs();
+    render();
+    window.scrollTo({ top: 0 });
+  }
+
+  function setTagFilter(tag) {
+    state.filters.tag = state.filters.tag === tag ? '' : tag;
+    render();
+  }
+
+  /* -------------------------------------------------------------- helpers */
+
+  function centerOf(el) {
+    const r = el.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }
+
+  const relativeFormat = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
+  const TIME_UNITS = [
+    ['year', 31536000000],
+    ['month', 2592000000],
+    ['week', 604800000],
+    ['day', 86400000],
+    ['hour', 3600000],
+    ['minute', 60000],
+  ];
+
+  function timeAgo(iso) {
+    const diff = new Date(iso).getTime() - Date.now();
+    for (const [unit, ms] of TIME_UNITS) {
+      if (Math.abs(diff) >= ms) return relativeFormat.format(Math.round(diff / ms), unit);
+    }
+    return 'just now';
+  }
+
+  function duration(ms) {
+    for (const [unit, size] of TIME_UNITS.slice(3)) {
+      if (ms >= size) {
+        const n = Math.round(ms / size);
+        return `${n} ${unit}${n === 1 ? '' : 's'}`;
+      }
+    }
+    return 'under a minute';
+  }
+
+  function greeting(now) {
+    const h = now.getHours();
+    if (h < 5) return 'Burning the midnight oil';
+    if (h < 12) return 'Good morning';
+    if (h < 17) return 'Good afternoon';
+    if (h < 22) return 'Good evening';
+    return 'Winding down';
+  }
+
+  /* ------------------------------------------------------------ rendering */
+
+  function render() {
+    const restore = focusMemo();
+    const view = state.prefs.view;
+    document.body.dataset.view = view;
+    for (const tab of $$('.view-tab')) {
+      if (tab.dataset.view === view) tab.setAttribute('aria-current', 'page');
+      else tab.removeAttribute('aria-current');
+    }
+    renderFilters();
+    $('#view').innerHTML = view === 'board' ? boardHTML() : view === 'calendar' ? calendarHTML() : todayHTML();
+    updateBadges();
+    restore();
+  }
+
+  // Keeps keyboard focus on the same control after a re-render.
+  function focusMemo() {
+    const active = document.activeElement;
+    if (!active || active === document.body || !$('#view').contains(active)) return () => {};
+    const id = active.closest('[data-id]')?.dataset.id;
+    const action = active.dataset.action;
+    return () => {
+      if (!id) return;
+      // The same plan can appear twice (e.g. "Focus now" and its section).
+      for (const host of $$(`#view [data-id="${CSS.escape(id)}"]`)) {
+        const target = !action || host.dataset.action === action ? host : host.querySelector(`[data-action="${action}"]`);
+        if (target) {
+          target.focus({ preventScroll: true });
+          return;
+        }
+      }
+    };
+  }
+
+  function updateBadges() {
+    const stats = C.computeStats(state.plans);
+    const urgent = stats.overdue + stats.dueToday;
+    const badge = $('[data-badge="today"]');
+    badge.hidden = urgent === 0;
+    badge.textContent = urgent;
+    badge.classList.toggle('alert', stats.overdue > 0);
+    badge.title = `${stats.overdue} overdue, ${stats.dueToday} due today`;
+    document.title = urgent ? `(${urgent}) Dayplan` : 'Dayplan';
+  }
+
+  function renderFilters() {
+    const box = $('#filters');
+    if (!state.plans.length) {
+      box.innerHTML = '';
+      return;
+    }
+    const { tag, priority } = state.filters;
+    const tags = C.allTags(state.plans);
+    const pill = (value, label, count) => `
+      <button type="button" class="pill${value === tag ? ' active' : ''}" data-action="filter-tag" data-tag="${esc(value)}" aria-pressed="${value === tag}">
+        ${label}${count ? ` <span class="pill-count">${count}</span>` : ''}
+      </button>`;
+    const option = (value, label, current) =>
+      `<option value="${value}"${value === current ? ' selected' : ''}>${label}</option>`;
+
+    box.innerHTML = `
+      <div class="filter-chips" role="group" aria-label="Filter by tag">
+        ${tags.length ? pill('', 'All tags') + tags.map((t) => pill(t.name, `#${esc(t.name)}`, t.count)).join('') : ''}
+      </div>
+      <div class="filter-controls">
+        <label class="select">
+          <span class="sr-only">Filter by priority</span>
+          <select data-filter="priority">
+            ${option('', 'Any priority', priority)}
+            ${C.PRIORITIES.slice().reverse().map((p) => option(p, `${C.PRIORITY_LABELS[p]} priority`, priority)).join('')}
+          </select>
+        </label>
+        ${
+          state.prefs.view === 'board'
+            ? `<label class="select">
+                <span class="sr-only">Sort cards by</span>
+                <select data-filter="sort">
+                  ${Object.entries(SORTS).map(([v, l]) => option(v, `Sort: ${l}`, state.prefs.sort)).join('')}
+                </select>
+              </label>`
+            : ''
+        }
+        ${filtersActive() ? `<button type="button" class="pill" data-action="clear-filters">${icon('x')} Clear filters</button>` : ''}
+      </div>`;
+  }
+
+  function statusButton(plan) {
+    const next = C.STATUS_LABELS[C.nextStatus(plan.status)].toLowerCase();
+    const label = `${C.STATUS_LABELS[plan.status]}. Mark as ${next}`;
+    return `<button type="button" class="status-btn s-${plan.status}" data-action="cycle" aria-label="${esc(label)}" title="${esc(label)}">${icon('check')}</button>`;
+  }
+
+  function metaHTML(plan, now) {
+    const due = C.dueInfo(plan, now);
+    const progress = C.checklistProgress(plan);
+    const parts = [];
+    if (due.state !== 'none') {
+      parts.push(
+        `<span class="chip due due-${due.state}" title="${esc(due.full)}">${icon(due.state === 'overdue' ? 'alert' : 'clock')}${esc(due.label)}</span>`
+      );
+    }
+    if (plan.priority === 'high') parts.push(`<span class="chip prio-high">${icon('flag')}High</span>`);
+    if (progress.total) {
+      const complete = progress.done === progress.total ? ' complete' : '';
+      parts.push(`<span class="chip steps${complete}" title="Steps done">${icon('steps')}${progress.done}/${progress.total}</span>`);
+    }
+    for (const t of plan.tags) {
+      parts.push(
+        `<button type="button" class="chip tag" data-action="filter-tag" data-tag="${esc(t)}" title="Show only #${esc(t)}">#${esc(t)}</button>`
+      );
+    }
+    return parts.length ? `<div class="card-meta">${parts.join('')}</div>` : '';
+  }
+
+  function cardHTML(plan, { now = new Date(), draggable = false, row = false } = {}) {
+    const progress = C.checklistProgress(plan);
+    const status = row && plan.status !== 'todo'
+      ? `<span class="status-tag s-${plan.status}">${C.STATUS_LABELS[plan.status]}</span>`
+      : '';
+    return `
+      <article class="card${row ? ' row' : ''} p-${plan.priority} is-${plan.status}" data-id="${esc(plan.id)}" data-action="edit"
+        tabindex="0" ${draggable ? 'draggable="true"' : ''} aria-label="${esc(plan.title)}, ${C.STATUS_LABELS[plan.status]}">
+        ${statusButton(plan)}
+        <div class="card-main">
+          <h3 class="card-title">${esc(plan.title)}</h3>
+          ${plan.description ? `<p class="card-desc">${esc(plan.description)}</p>` : ''}
+          ${metaHTML(plan, now)}
+          ${progress.total ? `<div class="progress" aria-hidden="true"><span style="width:${progress.pct}%"></span></div>` : ''}
+        </div>
+        ${status}
+      </article>`;
+  }
+
+  function emptyStateHTML() {
+    return `
+      <section class="empty">
+        <svg class="empty-art" viewBox="0 0 160 120" aria-hidden="true">
+          <rect x="22" y="18" width="116" height="88" rx="14" class="ea-card"/>
+          <rect x="38" y="38" width="14" height="14" rx="5" class="ea-box done"/>
+          <path d="M41.5 45l3 3 5-6" class="ea-check"/>
+          <rect x="60" y="41" width="56" height="8" rx="4" class="ea-line"/>
+          <rect x="38" y="62" width="14" height="14" rx="5" class="ea-box"/>
+          <rect x="60" y="65" width="42" height="8" rx="4" class="ea-line"/>
+          <circle cx="132" cy="22" r="14" class="ea-sun"/>
+        </svg>
+        <h2>Plan your day, one step at a time</h2>
+        <p>Type a plan in the box above, for example <em>“Call the bank tomorrow 10am #errands”</em>.
+           Give it a deadline, break it into steps and move it from <strong>To do</strong> to <strong>Done</strong>.</p>
+        <div class="empty-actions">
+          <button type="button" class="btn primary" data-action="new">${icon('plus')} Create a plan</button>
+          <button type="button" class="btn ghost" data-action="samples">${icon('sparkle')} Show me with sample plans</button>
+        </div>
+      </section>`;
+  }
+
+  function noMatchesHTML() {
+    return `
+      <section class="empty small">
+        <h2>No plans match</h2>
+        <p>Nothing fits the current search or filters.</p>
+        <button type="button" class="btn ghost" data-action="clear-filters">Clear filters</button>
+      </section>`;
+  }
+
+  /* ---- Today */
+
+  function todayHTML() {
+    if (!state.plans.length) return emptyStateHTML();
+    const now = new Date();
+    const plans = visiblePlans();
+    const stats = C.computeStats(state.plans, now);
+    const groups = C.groupForToday(plans, now);
+    const focus = C.nextUp(plans, now);
+
+    const remaining = stats.todayTotal - stats.doneToday;
+    let summary;
+    if (!stats.todayTotal) summary = 'Nothing is due today. A good day to get ahead.';
+    else if (!remaining) summary = 'Everything due today is done. Nice work!';
+    else summary = `${remaining} ${remaining === 1 ? 'plan' : 'plans'} left for today.`;
+    if (stats.overdue && remaining) summary += ` ${stats.overdue} overdue ${stats.overdue === 1 ? 'needs' : 'need'} attention.`;
+
+    const circumference = 2 * Math.PI * 52;
+    const ringOffset = circumference * (1 - stats.todayPct / 100);
+    const pills = [
+      `<span class="stat"><span><strong>${stats.dueToday}</strong> due today</span></span>`,
+      stats.overdue
+        ? `<span class="stat warn">${icon('alert')}<span><strong>${stats.overdue}</strong> overdue</span></span>`
+        : '',
+      `<span class="stat"><span><strong>${stats.in_progress}</strong> in progress</span></span>`,
+      `<span class="stat"><span><strong>${stats.doneThisWeek}</strong> done this week</span></span>`,
+      stats.streak
+        ? `<span class="stat streak" title="Days in a row with at least one plan finished">${icon('flame')}<span><strong>${stats.streak}</strong>-day streak</span></span>`
+        : '',
+    ].join('');
+
+    const section = (key, title, list) =>
+      list.length
+        ? `<section class="today-section ${key}" aria-label="${title}">
+            <h2 class="section-title">${title}<span class="count">${list.length}</span></h2>
+            <div class="row-list">${list.map((p) => cardHTML(p, { now, row: true })).join('')}</div>
+          </section>`
+        : '';
+
+    const sections = [
+      section('overdue', 'Overdue', groups.overdue),
+      section('due-today', 'Due today', groups.today),
+      section('doing', 'In progress', groups.inProgress),
+      section('upcoming', 'Next 7 days', groups.upcoming),
+    ].join('');
+
+    const doneToday = groups.doneToday.length
+      ? `<details class="today-section done-today">
+          <summary class="section-title">Finished today<span class="count">${groups.doneToday.length}</span></summary>
+          <div class="row-list">${groups.doneToday.map((p) => cardHTML(p, { now, row: true })).join('')}</div>
+        </details>`
+      : '';
+
+    const later = groups.later.length
+      ? `<p class="later-note">${groups.later.length} more ${groups.later.length === 1 ? 'plan is' : 'plans are'} further out or ${groups.later.length === 1 ? 'has' : 'have'} no deadline.
+           <button type="button" class="link" data-action="go" data-view="board">See them on the board</button></p>`
+      : '';
+
+    return `
+      <section class="hero">
+        <div class="hero-text">
+          <p class="eyebrow">${esc(now.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' }))}</p>
+          <h1>${greeting(now)}</h1>
+          <p class="hero-sub">${esc(summary)}</p>
+          <div class="stat-pills">${pills}</div>
+        </div>
+        <div class="ring" role="img" aria-label="${stats.doneToday} of ${stats.todayTotal} plans for today done">
+          <svg viewBox="0 0 120 120" aria-hidden="true">
+            <circle class="ring-track" cx="60" cy="60" r="52"/>
+            <circle class="ring-value${stats.todayTotal && !remaining ? ' complete' : ''}" cx="60" cy="60" r="52"
+              stroke-dasharray="${circumference.toFixed(1)}" stroke-dashoffset="${ringOffset.toFixed(1)}"/>
+          </svg>
+          <div class="ring-label">
+            <strong>${stats.todayTotal ? `${stats.doneToday}/${stats.todayTotal}` : icon('sparkle')}</strong>
+            <span>${stats.todayTotal ? 'done today' : 'clear day'}</span>
+          </div>
+        </div>
+      </section>
+      ${focus ? focusHTML(focus, now) : ''}
+      ${sections || doneToday || later ? `${sections}${doneToday}${later}` : filtersActive() ? noMatchesHTML() : ''}`;
+  }
+
+  function focusHTML(plan, now) {
+    const start =
+      plan.status === 'todo'
+        ? `<button type="button" class="btn ghost" data-action="set-status" data-status="in_progress">${icon('play')} Start</button>`
+        : '';
+    return `
+      <section class="focus" data-id="${esc(plan.id)}" aria-label="Focus now">
+        <div class="focus-text">
+          <p class="eyebrow">${icon('target')} Focus now</p>
+          <h2 class="focus-title">${esc(plan.title)}</h2>
+          ${metaHTML(plan, now)}
+        </div>
+        <div class="focus-actions">
+          ${start}
+          <button type="button" class="btn primary" data-action="set-status" data-status="done">${icon('check')} Mark done</button>
+          <button type="button" class="btn ghost" data-action="edit">Open</button>
+        </div>
+      </section>`;
+  }
+
+  /* ---- Board */
+
+  function boardHTML() {
+    const now = new Date();
+    const plans = visiblePlans();
+    const emptyText = {
+      todo: 'Nothing waiting. Add a plan above.',
+      in_progress: 'Drag a plan here, or press its circle, when you start it.',
+      done: 'Finished plans land here.',
+    };
+    const columns = C.STATUSES.map((status) => {
+      const items = C.sortPlans(
+        plans.filter((p) => p.status === status),
+        state.prefs.sort
+      );
+      const label = C.STATUS_LABELS[status];
+      return `
+        <section class="column col-${status}" aria-label="${label}">
+          <header class="column-head">
+            <span class="column-dot s-${status}" aria-hidden="true"></span>
+            <h2>${label}</h2>
+            <span class="count">${items.length}</span>
+            <button type="button" class="icon-btn small" data-action="new" data-status="${status}" title="Add a plan to ${label}" aria-label="Add a plan to ${label}">${icon('plus')}</button>
+          </header>
+          <div class="column-body" data-drop-status="${status}">
+            ${items.map((p) => cardHTML(p, { now, draggable: true })).join('') || `<p class="column-empty">${filtersActive() ? 'No matching plans.' : emptyText[status]}</p>`}
+          </div>
+        </section>`;
+    });
+    return `<div class="board">${columns.join('')}</div>`;
+  }
+
+  /* ---- Calendar */
+
+  function calendarHTML() {
+    const now = new Date();
+    const todayKey = C.toISODate(now);
+    const month = state.calendarMonth;
+    const days = C.monthGrid(month.getFullYear(), month.getMonth(), state.weekStart);
+    const plans = visiblePlans();
+
+    const byDate = new Map();
+    for (const p of C.sortPlans(plans.filter((plan) => plan.dueDate), 'deadline')) {
+      if (!byDate.has(p.dueDate)) byDate.set(p.dueDate, []);
+      byDate.get(p.dueDate).push(p);
+    }
+    const unscheduled = C.sortPlans(plans.filter((p) => !p.dueDate && p.status !== 'done'));
+    const chip = (p) => `
+      <button type="button" class="cal-chip s-${p.status} p-${p.priority}" data-action="edit" data-id="${esc(p.id)}" draggable="true"
+        title="${esc(p.title)}${p.dueTime ? ` at ${esc(C.formatTime(p.dueTime))}` : ''}">
+        <span class="cal-title">${esc(p.title)}</span>
+      </button>`;
+
+    const headers = days
+      .slice(0, 7)
+      .map(
+        (d) => `<div class="cal-weekday" role="columnheader" aria-label="${esc(d.toLocaleDateString(undefined, { weekday: 'long' }))}">
+          <span class="wd-long">${esc(d.toLocaleDateString(undefined, { weekday: 'short' }))}</span>
+          <span class="wd-short">${esc(d.toLocaleDateString(undefined, { weekday: 'narrow' }))}</span>
+        </div>`
+      )
+      .join('');
+
+    const weeks = [];
+    for (let w = 0; w < 6; w += 1) {
+      const cells = days.slice(w * 7, w * 7 + 7).map((d) => {
+        const key = C.toISODate(d);
+        const items = byDate.get(key) || [];
+        const open = items.filter((p) => p.status !== 'done');
+        const classes = ['cal-day'];
+        if (d.getMonth() !== month.getMonth()) classes.push('outside');
+        if (key === todayKey) classes.push('today');
+        if (key === state.selectedDay) classes.push('selected');
+        if (key < todayKey) classes.push('past');
+        if (open.some((p) => C.dueInfo(p, now).state === 'overdue')) classes.push('has-overdue');
+        const label = `${d.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}${items.length ? `, ${items.length} ${items.length === 1 ? 'plan' : 'plans'}` : ''}`;
+        return `
+          <div class="${classes.join(' ')}" role="gridcell" data-action="select-day" data-date="${key}" data-drop-date="${key}">
+            <button type="button" class="cal-num" data-action="select-day" data-date="${key}" aria-label="${esc(label)}"
+              ${key === state.selectedDay ? 'aria-pressed="true"' : 'aria-pressed="false"'}>${d.getDate()}</button>
+            <div class="cal-items">
+              ${items.slice(0, 3).map(chip).join('')}
+              ${items.length > 3 ? `<span class="cal-more">+${items.length - 3} more</span>` : ''}
+            </div>
+            ${items.length ? `<span class="cal-dots" aria-hidden="true">${items.slice(0, 4).map((p) => `<i class="s-${p.status}"></i>`).join('')}</span>` : ''}
+          </div>`;
+      });
+      weeks.push(`<div class="cal-week" role="row">${cells.join('')}</div>`);
+    }
+
+    return `
+      <div class="calendar-layout">
+        <section class="calendar" aria-label="Calendar">
+          <header class="cal-head">
+            <h2>${esc(month.toLocaleDateString(undefined, { month: 'long', year: 'numeric' }))}</h2>
+            <div class="cal-nav">
+              <button type="button" class="icon-btn" data-action="cal-prev" aria-label="Previous month" title="Previous month ([)">${icon('chevronLeft')}</button>
+              <button type="button" class="btn ghost small" data-action="cal-today">Today</button>
+              <button type="button" class="icon-btn" data-action="cal-next" aria-label="Next month" title="Next month (])">${icon('chevronRight')}</button>
+            </div>
+          </header>
+          <div class="cal-grid" role="grid" aria-label="${esc(month.toLocaleDateString(undefined, { month: 'long', year: 'numeric' }))}">
+            <div class="cal-week cal-weekdays" role="row">${headers}</div>
+            ${weeks.join('')}
+          </div>
+          <p class="hint">Tip: drag a plan onto another day to reschedule it. Double-click a day to add a plan.</p>
+        </section>
+
+        <aside class="cal-side">
+          ${dayPanelHTML(byDate.get(state.selectedDay) || [], now)}
+          <section class="unscheduled" data-drop-date="" aria-label="Plans without a deadline">
+            <header class="side-head">
+              <h3>No deadline <span class="count">${unscheduled.length}</span></h3>
+            </header>
+            <p class="hint">Drag one onto a day to schedule it. Drop a scheduled plan here to clear its deadline.</p>
+            <div class="chip-list">${unscheduled.map(chip).join('') || '<p class="muted">Every open plan has a deadline.</p>'}</div>
+          </section>
+        </aside>
+      </div>`;
+  }
+
+  function dayPanelHTML(plans, now) {
+    const day = C.parseISODate(state.selectedDay) || C.startOfDay(now);
+    const label = day.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+    return `
+      <section class="day-panel" aria-label="Plans on ${esc(label)}">
+        <header class="side-head">
+          <h3>${esc(label)}</h3>
+          <button type="button" class="btn primary small" data-action="new" data-date="${state.selectedDay}">${icon('plus')} Add</button>
+        </header>
+        <div class="row-list">
+          ${plans.map((p) => cardHTML(p, { now, row: true })).join('') || '<p class="muted">Nothing planned for this day yet.</p>'}
+        </div>
+      </section>`;
+  }
+
+  // Selecting a day only touches the grid highlight and the side panel, so
+  // the cells stay in place (and a double-click on them still registers).
+  function selectDay(date) {
+    const d = C.parseISODate(date);
+    if (!d) return;
+    state.selectedDay = date;
+    const month = state.calendarMonth;
+    if (d.getMonth() !== month.getMonth() || d.getFullYear() !== month.getFullYear()) {
+      state.calendarMonth = new Date(d.getFullYear(), d.getMonth(), 1);
+      render();
+      return;
+    }
+    for (const cell of $$('#view .cal-day')) {
+      const on = cell.dataset.date === date;
+      cell.classList.toggle('selected', on);
+      cell.querySelector('.cal-num').setAttribute('aria-pressed', String(on));
+    }
+    const plans = C.sortPlans(
+      visiblePlans().filter((p) => p.dueDate === date),
+      'deadline'
+    );
+    $('#view .day-panel').outerHTML = dayPanelHTML(plans, new Date());
+  }
+
+  function shiftMonth(delta) {
+    const m = state.calendarMonth;
+    state.calendarMonth = new Date(m.getFullYear(), m.getMonth() + delta, 1);
+    render();
+  }
+
+  /* --------------------------------------------------------- drag & drop */
+
+  const indicator = document.createElement('div');
+  indicator.className = 'drop-indicator';
+
+  function clearDropTargets() {
+    for (const el of $$('.drop-target')) el.classList.remove('drop-target');
+    indicator.remove();
+  }
+
+  function endDrag() {
+    state.dragId = null;
+    state.dropBeforeId = null;
+    clearDropTargets();
+    for (const el of $$('.dragging')) el.classList.remove('dragging');
+    document.body.classList.remove('is-dragging');
+  }
+
+  function setupDragAndDrop() {
+    const view = $('#view');
+
+    view.addEventListener('dragstart', (e) => {
+      const item = e.target instanceof Element && e.target.closest('[draggable="true"][data-id]');
+      if (!item) return;
+      state.dragId = item.dataset.id;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', item.dataset.id);
+      requestAnimationFrame(() => {
+        item.classList.add('dragging');
+        document.body.classList.add('is-dragging');
+      });
+    });
+
+    view.addEventListener('dragover', (e) => {
+      if (!state.dragId) return;
+      const zone = e.target.closest('[data-drop-status], [data-drop-date]');
+      if (!zone) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      if (!zone.classList.contains('drop-target')) {
+        clearDropTargets();
+        zone.classList.add('drop-target');
+      }
+      if (zone.dataset.dropStatus && state.prefs.sort === 'manual') {
+        const cards = $$('.card:not(.dragging)', zone);
+        const before = cards.find((card) => {
+          const r = card.getBoundingClientRect();
+          return e.clientY < r.top + r.height / 2;
+        });
+        state.dropBeforeId = before ? before.dataset.id : null;
+        if (before) zone.insertBefore(indicator, before);
+        else zone.appendChild(indicator);
+      }
+    });
+
+    view.addEventListener('dragleave', (e) => {
+      const zone = e.target.closest('.drop-target');
+      if (zone && !zone.contains(e.relatedTarget)) clearDropTargets();
+    });
+
+    view.addEventListener('drop', (e) => {
+      const zone = e.target.closest('[data-drop-status], [data-drop-date]');
+      const id = state.dragId;
+      const plan = id && findPlan(id);
+      if (!zone || !plan) return;
+      e.preventDefault();
+      const beforeId = state.prefs.sort === 'manual' ? state.dropBeforeId : null;
+      endDrag();
+
+      if (zone.dataset.dropStatus) {
+        const status = zone.dataset.dropStatus;
+        // With an automatic sort, dropping into the same column changes nothing.
+        if (status === plan.status && state.prefs.sort !== 'manual') return;
+        setPlans(C.movePlan(state.plans, id, status, beforeId));
+        if (status === 'done' && plan.status !== 'done') {
+          celebrate({ x: e.clientX, y: e.clientY });
+          toast(`Done: “${truncate(plan.title)}”`, { action: 'Undo', onAction: () => changeStatus(id, plan.status) });
+        }
+        return;
+      }
+
+      const date = zone.dataset.dropDate;
+      if (plan.dueDate === date) return;
+      const previous = { dueDate: plan.dueDate, dueTime: plan.dueTime };
+      updatePlan(id, { dueDate: date });
+      const message = date
+        ? `Moved “${truncate(plan.title)}” to ${C.formatDate(C.parseISODate(date))}`
+        : `Removed the deadline from “${truncate(plan.title)}”`;
+      toast(message, { action: 'Undo', onAction: () => updatePlan(id, previous) });
+    });
+
+    view.addEventListener('dragend', endDrag);
+  }
+
+  /* --------------------------------------------------------------- editor */
+
+  const editor = {
+    dialog: $('#editor'),
+    form: $('#editor-form'),
+    id: null,
+    tags: [],
+    checklist: [],
+    snapshot: '',
+  };
+  const field = (name) => editor.form.elements.namedItem(name);
+
+  function renderSegmented(containerId, name, values, labels, current) {
+    $(`#${containerId}`).innerHTML = values
+      .map(
+        (v) => `<label class="seg seg-${v}">
+          <input type="radio" name="${name}" value="${v}"${v === current ? ' checked' : ''} />
+          <span>${labels[v]}</span>
+        </label>`
+      )
+      .join('');
+  }
+
+  function openEditor(plan = null, defaults = {}) {
+    editor.id = plan ? plan.id : null;
+    const source = plan || {
+      title: '',
+      description: '',
+      dueDate: '',
+      dueTime: '',
+      status: 'todo',
+      priority: 'medium',
+      tags: [],
+      checklist: [],
+      ...defaults,
+    };
+
+    field('title').value = source.title;
+    field('description').value = source.description || '';
+    field('dueDate').value = source.dueDate || '';
+    field('dueTime').value = source.dueTime || '';
+    renderSegmented('status-options', 'status', C.STATUSES, C.STATUS_LABELS, source.status);
+    renderSegmented('priority-options', 'priority', C.PRIORITIES, C.PRIORITY_LABELS, source.priority);
+    editor.tags = [...source.tags];
+    editor.checklist = source.checklist.map((item) => ({ ...item }));
+    $('#tag-input').value = '';
+    $('#step-input').value = '';
+    renderTagChips();
+    renderSteps();
+    $('#tag-suggestions').innerHTML = C.allTags(state.plans)
+      .map((t) => `<option value="${esc(t.name)}"></option>`)
+      .join('');
+
+    $('#editor-heading').textContent = plan ? 'Edit plan' : 'New plan';
+    $('#editor-delete').hidden = !plan;
+    $('#editor-meta').textContent = plan ? metaLine(plan) : '';
+    $('#title-error').hidden = true;
+    editor.snapshot = editorSnapshot();
+    editor.dialog.showModal();
+    const title = field('title');
+    title.focus();
+    title.setSelectionRange(title.value.length, title.value.length);
+  }
+
+  function metaLine(plan) {
+    const parts = [`Created ${timeAgo(plan.createdAt)}`];
+    if (plan.startedAt && plan.status !== 'todo') parts.push(`started ${timeAgo(plan.startedAt)}`);
+    if (plan.completedAt) {
+      parts.push(`finished ${timeAgo(plan.completedAt)}`);
+      const from = plan.startedAt || plan.createdAt;
+      const took = new Date(plan.completedAt) - new Date(from);
+      if (took > 0) parts.push(`took ${duration(took)}`);
+    }
+    return parts.join(' · ');
+  }
+
+  function editorSnapshot() {
+    return JSON.stringify([
+      field('title').value,
+      field('description').value,
+      field('dueDate').value,
+      field('dueTime').value,
+      field('status').value,
+      field('priority').value,
+      editor.tags,
+      editor.checklist,
+      $('#tag-input').value,
+      $('#step-input').value,
+    ]);
+  }
+
+  function requestCloseEditor() {
+    if (editorSnapshot() !== editor.snapshot && !window.confirm('Discard your changes to this plan?')) return false;
+    editor.dialog.close();
+    return true;
+  }
+
+  function renderTagChips() {
+    $('#tag-chips').innerHTML = editor.tags
+      .map(
+        (t, i) => `<span class="chip tag">#${esc(t)}
+          <button type="button" class="chip-remove" data-remove-tag="${i}" aria-label="Remove tag ${esc(t)}">${icon('x')}</button>
+        </span>`
+      )
+      .join('');
+  }
+
+  function addTag(value) {
+    const tag = C.normalizeTag(value);
+    if (tag && !editor.tags.includes(tag) && editor.tags.length < 20) editor.tags.push(tag);
+    renderTagChips();
+  }
+
+  function renderSteps() {
+    $('#steps-list').innerHTML = editor.checklist
+      .map(
+        (item, i) => `
+        <li class="step${item.done ? ' done' : ''}" data-index="${i}">
+          <input type="checkbox" class="step-check"${item.done ? ' checked' : ''} aria-label="Step ${i + 1} done" />
+          <input type="text" class="step-text" value="${esc(item.text)}" maxlength="300" aria-label="Step ${i + 1}" />
+          <button type="button" class="icon-btn small step-remove" aria-label="Remove step ${i + 1}">${icon('x')}</button>
+        </li>`
+      )
+      .join('');
+    updateStepsSummary();
+  }
+
+  function updateStepsSummary() {
+    const total = editor.checklist.length;
+    const done = editor.checklist.filter((item) => item.done).length;
+    $('#steps-count').textContent = total ? `${done} of ${total} done` : '';
+    const bar = $('#steps-progress');
+    bar.hidden = !total;
+    bar.firstElementChild.style.width = total ? `${Math.round((done / total) * 100)}%` : '0';
+    $('#finish-hint').hidden = !(total && done === total && field('status').value !== 'done');
+  }
+
+  function saveEditor() {
+    const title = field('title').value.trim();
+    if (!title) {
+      $('#title-error').hidden = false;
+      field('title').focus();
+      return;
+    }
+    if ($('#tag-input').value.trim()) addTag($('#tag-input').value);
+    if ($('#step-input').value.trim()) {
+      editor.checklist.push({ id: C.uid(), text: $('#step-input').value.trim(), done: false });
+    }
+
+    let dueDate = field('dueDate').value;
+    const dueTime = field('dueTime').value;
+    if (dueTime && !dueDate) dueDate = C.toISODate(new Date());
+    const fields = {
+      title,
+      description: field('description').value.trim(),
+      dueDate,
+      dueTime: dueDate ? dueTime : '',
+      priority: field('priority').value,
+      tags: editor.tags,
+      checklist: editor.checklist.filter((item) => item.text.trim()),
+    };
+    const status = field('status').value;
+    const point = centerOf(editor.form.querySelector('[type="submit"]'));
+    editor.dialog.close();
+
+    if (!editor.id) {
+      const plan = addPlan({ ...fields, status });
+      if (status === 'done') celebrate(point);
+      toast(`Added “${truncate(plan.title)}”`);
+      return;
+    }
+
+    const before = findPlan(editor.id);
+    if (!before) {
+      toast('This plan was deleted in the meantime.');
+      return;
+    }
+    const now = new Date();
+    let plans = state.plans.map((p) =>
+      p.id === editor.id ? C.normalizePlan({ ...p, ...fields, updatedAt: now.toISOString() }, now) : p
+    );
+    if (status !== before.status) plans = placeAtTop(plans, editor.id, status);
+    setPlans(plans);
+    if (status === 'done' && before.status !== 'done') celebrate(point);
+  }
+
+  function setupEditor() {
+    const { dialog, form } = editor;
+
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      saveEditor();
+    });
+
+    form.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        saveEditor();
+      }
+    });
+
+    dialog.addEventListener('cancel', (e) => {
+      e.preventDefault();
+      requestCloseEditor();
+    });
+
+    for (const btn of $$('[data-close]', dialog)) btn.addEventListener('click', requestCloseEditor);
+
+    field('title').addEventListener('input', () => {
+      $('#title-error').hidden = true;
+    });
+
+    $('#editor-delete').addEventListener('click', () => {
+      const id = editor.id;
+      editor.dialog.close();
+      deletePlan(id);
+    });
+
+    $('.quick-dates', form).addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-due]');
+      if (!btn) return;
+      const value = btn.dataset.due;
+      const now = new Date();
+      if (value === '') {
+        field('dueDate').value = '';
+        field('dueTime').value = '';
+      } else if (value === 'next-week') {
+        field('dueDate').value = C.toISODate(C.addDays(now, (1 - now.getDay() + 7) % 7 || 7));
+      } else {
+        field('dueDate').value = C.toISODate(C.addDays(now, Number(value)));
+      }
+    });
+
+    form.addEventListener('change', (e) => {
+      if (e.target.name === 'status') updateStepsSummary();
+    });
+
+    // Tags
+    const tagInput = $('#tag-input');
+    tagInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ',') {
+        e.preventDefault();
+        if (tagInput.value.trim()) addTag(tagInput.value);
+        tagInput.value = '';
+      } else if (e.key === 'Backspace' && !tagInput.value && editor.tags.length) {
+        editor.tags.pop();
+        renderTagChips();
+      }
+    });
+    tagInput.addEventListener('change', () => {
+      // Picking from the datalist fires "change" without a keypress.
+      if (C.allTags(state.plans).some((t) => t.name === tagInput.value)) {
+        addTag(tagInput.value);
+        tagInput.value = '';
+      }
+    });
+    $('#tag-chips').addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-remove-tag]');
+      if (!btn) return;
+      editor.tags.splice(Number(btn.dataset.removeTag), 1);
+      renderTagChips();
+      tagInput.focus();
+    });
+
+    // Steps
+    const stepInput = $('#step-input');
+    stepInput.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' || e.ctrlKey || e.metaKey) return;
+      e.preventDefault();
+      const value = stepInput.value.trim();
+      if (!value) return;
+      editor.checklist.push({ id: C.uid(), text: value, done: false });
+      stepInput.value = '';
+      renderSteps();
+    });
+
+    const list = $('#steps-list');
+    const indexOf = (el) => Number(el.closest('.step').dataset.index);
+    list.addEventListener('change', (e) => {
+      if (!e.target.classList.contains('step-check')) return;
+      const item = editor.checklist[indexOf(e.target)];
+      item.done = e.target.checked;
+      e.target.closest('.step').classList.toggle('done', item.done);
+      updateStepsSummary();
+    });
+    list.addEventListener('input', (e) => {
+      if (e.target.classList.contains('step-text')) editor.checklist[indexOf(e.target)].text = e.target.value;
+    });
+    list.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && e.target.classList.contains('step-text') && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        stepInput.focus();
+      }
+    });
+    list.addEventListener('click', (e) => {
+      const btn = e.target.closest('.step-remove');
+      if (!btn) return;
+      editor.checklist.splice(indexOf(btn), 1);
+      renderSteps();
+      stepInput.focus();
+    });
+
+    $('#finish-hint').addEventListener('click', () => {
+      const done = editor.form.querySelector('input[name="status"][value="done"]');
+      done.checked = true;
+      updateStepsSummary();
+    });
+  }
+
+  /* ------------------------------------------------------------ quick add */
+
+  function setupQuickAdd() {
+    const form = $('#quick-add');
+    const input = $('#qa-input');
+
+    const openDetails = () => {
+      const parsed = C.parseQuickAdd(input.value);
+      openEditor(null, {
+        title: parsed.title,
+        dueDate: parsed.dueDate,
+        dueTime: parsed.dueTime,
+        priority: parsed.priority || 'medium',
+        tags: parsed.tags,
+      });
+      input.value = '';
+      renderQuickPreview();
+    };
+
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      if (!input.value.trim()) {
+        input.focus();
+        return;
+      }
+      const parsed = C.parseQuickAdd(input.value);
+      if (!parsed.title) {
+        form.classList.remove('shake');
+        void form.offsetWidth; // restart the animation
+        form.classList.add('shake');
+        toast('Add a few words that describe the plan.');
+        return;
+      }
+      const plan = addPlan({ ...parsed, priority: parsed.priority || 'medium' });
+      input.value = '';
+      renderQuickPreview();
+      const due = C.dueInfo(plan);
+      const hidden = !C.matchesFilters(plan, state.filters) ? ' (hidden by filters)' : '';
+      toast(`Added “${truncate(plan.title)}”${due.state !== 'none' ? `, ${due.label.toLowerCase()}` : ''}${hidden}`, {
+        action: 'Edit',
+        onAction: () => findPlan(plan.id) && openEditor(findPlan(plan.id)),
+      });
+    });
+
+    input.addEventListener('input', renderQuickPreview);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && e.shiftKey) {
+        e.preventDefault();
+        openDetails();
+      } else if (e.key === 'Escape') {
+        input.value = '';
+        renderQuickPreview();
+        input.blur();
+      }
+    });
+    $('#qa-details').addEventListener('click', openDetails);
+  }
+
+  function renderQuickPreview() {
+    const value = $('#qa-input').value;
+    const box = $('#qa-preview');
+    $('#quick-add').classList.toggle('has-text', Boolean(value.trim()));
+    if (!value.trim()) {
+      box.innerHTML = '';
+      return;
+    }
+    const parsed = C.parseQuickAdd(value);
+    const chips = [];
+    if (parsed.dueDate) {
+      const due = C.dueInfo({ ...parsed, status: 'todo' });
+      chips.push(`<span class="chip due due-${due.state}">${icon('clock')}${esc(due.full)}</span>`);
+    }
+    if (parsed.priority) chips.push(`<span class="chip prio-${parsed.priority}">${icon('flag')}${C.PRIORITY_LABELS[parsed.priority]}</span>`);
+    for (const t of parsed.tags) chips.push(`<span class="chip tag">#${esc(t)}</span>`);
+    box.innerHTML = chips.length
+      ? `<span class="qa-title">${parsed.title ? `“${esc(truncate(parsed.title, 60))}”` : '<em>Needs a title</em>'}</span>${chips.join('')}`
+      : '';
+  }
+
+  /* -------------------------------------------------------------- toasts */
+
+  let toastTimer = null;
+  let toastDuration = 0;
+
+  function hideToast() {
+    const el = $('#toast');
+    el.classList.remove('show');
+    clearTimeout(toastTimer);
+    setTimeout(() => {
+      if (!el.classList.contains('show')) el.hidden = true;
+    }, 250);
+  }
+
+  function toast(message, { action = '', onAction = null } = {}) {
+    const el = $('#toast');
+    const btn = $('#toast-action');
+    $('#toast-text').textContent = message;
+    btn.hidden = !action;
+    btn.textContent = action;
+    btn.onclick = action
+      ? () => {
+          hideToast();
+          onAction();
+        }
+      : null;
+    el.hidden = false;
+    requestAnimationFrame(() => el.classList.add('show'));
+    toastDuration = action ? 7000 : 3500;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(hideToast, toastDuration);
+  }
+
+  /* ------------------------------------------------------------ confetti */
+
+  function celebrate(point) {
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    const canvas = $('#confetti');
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = window.innerWidth * dpr;
+    canvas.height = window.innerHeight * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const origin = point || { x: window.innerWidth / 2, y: window.innerHeight / 3 };
+    const colors = ['#5b5bd6', '#22a06b', '#f5a524', '#e5484d', '#3e8ef7', '#d6409f'];
+    const pieces = Array.from({ length: 90 }, () => {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 3 + Math.random() * 7;
+      return {
+        x: origin.x,
+        y: origin.y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 5,
+        w: 5 + Math.random() * 5,
+        h: 3 + Math.random() * 4,
+        rot: Math.random() * Math.PI,
+        vr: (Math.random() - 0.5) * 0.4,
+        color: colors[Math.floor(Math.random() * colors.length)],
+        life: 1,
+      };
+    });
+
+    let last = performance.now();
+    const frame = (t) => {
+      const dt = Math.min(48, t - last) / 16.7;
+      last = t;
+      ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+      let alive = false;
+      for (const p of pieces) {
+        p.vy += 0.32 * dt;
+        p.vx *= 0.985;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.rot += p.vr * dt;
+        p.life -= 0.011 * dt;
+        if (p.life <= 0 || p.y > window.innerHeight + 20) continue;
+        alive = true;
+        ctx.save();
+        ctx.globalAlpha = Math.min(1, p.life * 2);
+        ctx.translate(p.x, p.y);
+        ctx.rotate(p.rot);
+        ctx.fillStyle = p.color;
+        ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+        ctx.restore();
+      }
+      if (alive) requestAnimationFrame(frame);
+      else ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    };
+    requestAnimationFrame(frame);
+  }
+
+  /* --------------------------------------------------------------- theme */
+
+  function applyTheme() {
+    const root = document.documentElement;
+    if (state.prefs.theme) root.dataset.theme = state.prefs.theme;
+    else delete root.dataset.theme;
+  }
+
+  function toggleTheme() {
+    const dark = state.prefs.theme
+      ? state.prefs.theme === 'dark'
+      : window.matchMedia('(prefers-color-scheme: dark)').matches;
+    state.prefs.theme = dark ? 'light' : 'dark';
+    savePrefs();
+    applyTheme();
+  }
+
+  /* ------------------------------------------------------- menu & import */
+
+  function exportPlans() {
+    const blob = new Blob([JSON.stringify(C.exportData(state.plans), null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = Object.assign(document.createElement('a'), {
+      href: url,
+      download: `dayplan-backup-${C.toISODate(new Date())}.json`,
+    });
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast(`Exported ${state.plans.length} ${state.plans.length === 1 ? 'plan' : 'plans'}`);
+  }
+
+  async function importPlans(file) {
+    try {
+      const incoming = C.importData(await file.text());
+      const before = state.plans;
+      const byId = new Map(before.map((p) => [p.id, p]));
+      let added = 0;
+      for (const plan of incoming) {
+        if (!byId.has(plan.id)) added += 1;
+        byId.set(plan.id, plan);
+      }
+      setPlans([...byId.values()]);
+      const updated = incoming.length - added;
+      toast(`Imported ${added} new ${added === 1 ? 'plan' : 'plans'}${updated ? `, updated ${updated}` : ''}`, {
+        action: 'Undo',
+        onAction: () => setPlans(before),
+      });
+    } catch (err) {
+      toast(`Import failed: ${err.message}`);
+    }
+  }
+
+  function addSamples() {
+    setPlans([...C.samplePlans(), ...state.plans]);
+    toast('Added sample plans. Edit or delete them any time.');
+  }
+
+  function clearCompleted() {
+    const done = state.plans.filter((p) => p.status === 'done');
+    if (!done.length) {
+      toast('There are no completed plans to clear.');
+      return;
+    }
+    setPlans(state.plans.filter((p) => p.status !== 'done'));
+    toast(`Cleared ${done.length} completed ${done.length === 1 ? 'plan' : 'plans'}`, {
+      action: 'Undo',
+      onAction: () => setPlans([...state.plans, ...done.filter((d) => !findPlan(d.id))]),
+    });
+  }
+
+  function setupMenu() {
+    const menu = $('#menu');
+    menu.addEventListener('click', (e) => {
+      const item = e.target.closest('[data-menu]');
+      if (!item) return;
+      menu.open = false;
+      switch (item.dataset.menu) {
+        case 'export':
+          exportPlans();
+          break;
+        case 'import':
+          $('#import-file').click();
+          break;
+        case 'samples':
+          addSamples();
+          break;
+        case 'clear-done':
+          clearCompleted();
+          break;
+        case 'shortcuts':
+          $('#shortcuts').showModal();
+          break;
+        default:
+      }
+    });
+    document.addEventListener('click', (e) => {
+      if (menu.open && !menu.contains(e.target)) menu.open = false;
+    });
+    menu.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && menu.open) {
+        menu.open = false;
+        $('summary', menu).focus();
+      }
+    });
+    $('#import-file').addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      e.target.value = '';
+      if (file) importPlans(file);
+    });
+    for (const btn of $$('#shortcuts [data-close]')) btn.addEventListener('click', () => $('#shortcuts').close());
+  }
+
+  /* --------------------------------------------------------------- events */
+
+  function setupViewEvents() {
+    const view = $('#view');
+
+    view.addEventListener('click', (e) => {
+      const el = e.target.closest('[data-action]');
+      if (!el || !view.contains(el)) return;
+      const id = el.closest('[data-id]')?.dataset.id;
+      switch (el.dataset.action) {
+        case 'edit': {
+          const plan = findPlan(id);
+          if (plan) openEditor(plan);
+          break;
+        }
+        case 'cycle': {
+          const plan = findPlan(id);
+          if (plan) changeStatus(id, C.nextStatus(plan.status), el);
+          break;
+        }
+        case 'set-status':
+          changeStatus(id, el.dataset.status, el);
+          break;
+        case 'filter-tag':
+          setTagFilter(el.dataset.tag);
+          break;
+        case 'new':
+          openEditor(null, { status: el.dataset.status || 'todo', dueDate: el.dataset.date || '' });
+          break;
+        case 'samples':
+          addSamples();
+          break;
+        case 'go':
+          setView(el.dataset.view);
+          break;
+        case 'clear-filters':
+          clearFilters();
+          break;
+        case 'select-day':
+          selectDay(el.dataset.date);
+          break;
+        case 'cal-prev':
+          shiftMonth(-1);
+          break;
+        case 'cal-next':
+          shiftMonth(1);
+          break;
+        case 'cal-today': {
+          const now = new Date();
+          state.calendarMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+          state.selectedDay = C.toISODate(now);
+          render();
+          break;
+        }
+        default:
+      }
+    });
+
+    view.addEventListener('dblclick', (e) => {
+      const day = e.target.closest('.cal-day');
+      if (day && !e.target.closest('.cal-chip')) openEditor(null, { dueDate: day.dataset.date });
+    });
+
+    view.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && e.target.matches('.card')) {
+        e.preventDefault();
+        const plan = findPlan(e.target.dataset.id);
+        if (plan) openEditor(plan);
+      }
+    });
+  }
+
+  function clearFilters() {
+    state.filters = { query: '', tag: '', priority: '' };
+    $('#search').value = '';
+    render();
+  }
+
+  function setupFilters() {
+    const box = $('#filters');
+    box.addEventListener('click', (e) => {
+      const el = e.target.closest('[data-action]');
+      if (!el) return;
+      if (el.dataset.action === 'filter-tag') setTagFilter(el.dataset.tag);
+      if (el.dataset.action === 'clear-filters') clearFilters();
+    });
+    box.addEventListener('change', (e) => {
+      const which = e.target.dataset.filter;
+      if (which === 'priority') state.filters.priority = e.target.value;
+      if (which === 'sort') {
+        state.prefs.sort = e.target.value;
+        savePrefs();
+      }
+      render();
+    });
+
+    const search = $('#search');
+    search.addEventListener('input', () => {
+      state.filters.query = search.value;
+      render();
+    });
+    search.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        search.value = '';
+        state.filters.query = '';
+        render();
+        search.blur();
+      }
+    });
+  }
+
+  function setupGlobalKeys() {
+    document.addEventListener('keydown', (e) => {
+      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (document.querySelector('dialog[open]')) return;
+      if (e.target.closest('input, textarea, select, [contenteditable="true"]')) return;
+      switch (e.key) {
+        case 'n':
+        case 'N':
+          e.preventDefault();
+          $('#qa-input').focus();
+          break;
+        case '/':
+          e.preventDefault();
+          $('#search').focus();
+          break;
+        case '1':
+        case '2':
+        case '3':
+          setView(VIEWS[Number(e.key) - 1]);
+          break;
+        case '[':
+        case ']':
+          if (state.prefs.view === 'calendar') shiftMonth(e.key === ']' ? 1 : -1);
+          break;
+        case 'd':
+        case 'D':
+          toggleTheme();
+          break;
+        case '?':
+          $('#shortcuts').showModal();
+          break;
+        default:
+      }
+    });
+  }
+
+  function init() {
+    applyTheme();
+    const narrow = window.matchMedia('(max-width: 640px)');
+    const setPlaceholder = () => {
+      $('#qa-input').placeholder = narrow.matches
+        ? 'Add a plan, e.g. “Gym tomorrow 7am”'
+        : 'Add a plan… try “Finish report fri 3pm #work !high”';
+    };
+    setPlaceholder();
+    narrow.addEventListener('change', setPlaceholder);
+    for (const tab of $$('.view-tab')) tab.addEventListener('click', () => setView(tab.dataset.view));
+    $('.brand').addEventListener('click', (e) => {
+      e.preventDefault();
+      setView('today');
+    });
+    $('#theme-toggle').addEventListener('click', toggleTheme);
+    $('#toast').addEventListener('mouseenter', () => clearTimeout(toastTimer));
+    $('#toast').addEventListener('mouseleave', () => {
+      toastTimer = setTimeout(hideToast, toastDuration);
+    });
+
+    setupQuickAdd();
+    setupEditor();
+    setupMenu();
+    setupFilters();
+    setupViewEvents();
+    setupDragAndDrop();
+    setupGlobalKeys();
+
+    // Keep other tabs in sync and refresh relative deadlines over time.
+    window.addEventListener('storage', (e) => {
+      if (e.key === STORAGE_KEY) {
+        state.plans = loadPlans();
+        render();
+      }
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) render();
+    });
+    setInterval(() => {
+      if (!document.hidden && !state.dragId) render();
+    }, 60 * 1000);
+
+    render();
+    if (loadProblem) toast(loadProblem);
+  }
+
+  init();
+})();
