@@ -402,7 +402,6 @@
           <button type="button" class="btn primary" data-action="new">${icon('plus')} Create a plan</button>
           <button type="button" class="btn ghost" data-action="samples">${icon('sparkle')} Show me with sample plans</button>
         </div>
-        ${accountPromptHTML()}
       </section>`;
   }
 
@@ -1460,6 +1459,9 @@
   const sync = {
     available: false, // the server supports accounts
     connected: false, // /api/me has answered since the page loaded
+    // What we know about the server: unknown (still asking), none (no accounts
+    // here, e.g. index.html opened as a file), ok, or unreachable.
+    server: location.protocol === 'file:' ? 'none' : 'unknown',
     signupOpen: false,
     first: false, // no account exists yet: the next one becomes the admin
     user: '', // email of the signed-in account
@@ -1815,7 +1817,6 @@
 
   function updateAccountUI() {
     const signedIn = Boolean(sync.user);
-    $('#sign-in').hidden = !sync.available || signedIn;
     $('#account').hidden = !signedIn;
     if (signedIn) {
       $('#account-email').textContent = sync.user;
@@ -1825,6 +1826,43 @@
     }
     setSyncStatus(sync.status);
     updateAdminBadge();
+    updateGate();
+  }
+
+  // On a site with accounts the planner is only for signed-in people: anyone
+  // else sees a sign-in screen. Opened as a plain file, there's no gate.
+  let gateHTML = '';
+
+  function updateGate() {
+    const show = !sync.user && sync.server !== 'none';
+    $('#gate').hidden = !show;
+    document.body.classList.toggle('gated', show);
+    $('.topbar').inert = show;
+    $('.page').inert = show;
+    if (!show) return;
+
+    let text = 'Connecting…';
+    let actions = '';
+    let note = '';
+    const button = (kind, action, label) => `<button type="button" class="btn ${kind}" data-gate="${action}">${label}</button>`;
+    if (sync.server === 'unreachable') {
+      text = "Can't reach the server right now. Check your connection.";
+      actions = button('primary', 'retry', 'Try again');
+    } else if (sync.server === 'ok' && sync.first) {
+      text = 'Welcome! Nobody has an account here yet.';
+      actions = button('primary', 'signup', 'Create the first account');
+      note = 'The first account becomes the admin, who approves everyone else.';
+    } else if (sync.server === 'ok') {
+      text = 'Sign in to see your plans.';
+      actions = button('primary', 'signin', 'Sign in') + (sync.signupOpen ? button('ghost', 'signup', 'Create an account') : '');
+      note = sync.signupOpen ? 'New accounts can be used once the admin approves them.' : '';
+    }
+    const html = `${text}|${actions}|${note}`;
+    if (html === gateHTML) return; // don't rebuild (and lose focus) for nothing
+    gateHTML = html;
+    $('#gate-text').textContent = text;
+    $('#gate-actions').innerHTML = actions;
+    $('#gate-note').textContent = note;
   }
 
   // The admin sees how many people are waiting, on the avatar and in the menu.
@@ -1850,21 +1888,6 @@
       });
     }
     sync.notifiedPending = count;
-  }
-
-  function accountPromptHTML() {
-    if (!sync.available || sync.user) return '';
-    const signIn = '<button type="button" class="link" data-action="sign-in">sign in</button>';
-    if (sync.first) {
-      return `<p class="account-prompt">Want your plans in every browser?
-        <button type="button" class="link" data-action="sign-up">Create the first account</button>
-        (you'll be the admin).</p>`;
-    }
-    return sync.signupOpen
-      ? `<p class="account-prompt">Want your plans in every browser?
-           <button type="button" class="link" data-action="sign-up">Create an account</button> or ${signIn}.</p>`
-      : `<p class="account-prompt">Already have an account?
-           <button type="button" class="link" data-action="sign-in">Sign in to see your plans</button></p>`;
   }
 
   // Passwords must never travel over plain http.
@@ -2007,7 +2030,6 @@
       authField('email').focus();
     });
     for (const btn of $$('#auth [data-close]')) btn.addEventListener('click', () => auth.dialog.close());
-    $('#sign-in').addEventListener('click', () => openAuth(sync.first ? 'signup' : 'signin'));
 
     const menu = $('#account');
     menu.addEventListener('click', async (e) => {
@@ -2033,6 +2055,18 @@
       if (e.key === 'Escape' && menu.open) {
         menu.open = false;
         $('summary', menu).focus();
+      }
+    });
+
+    $('#gate').addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-gate]');
+      if (!btn) return;
+      if (btn.dataset.gate === 'retry') {
+        sync.server = 'unknown';
+        updateGate();
+        connectToServer();
+      } else {
+        openAuth(btn.dataset.gate);
       }
     });
 
@@ -2233,8 +2267,14 @@
     try {
       me = await api('api/me');
     } catch (err) {
-      if (err.status === 404) return; // no accounts on this server (e.g. static hosting)
+      if (err.status === 404) {
+        sync.server = 'none'; // no accounts on this server (e.g. static hosting)
+        updateGate();
+        return;
+      }
       // Offline or a server hiccup: keep working, say so, and try again.
+      if (sync.server !== 'ok') sync.server = 'unreachable';
+      updateGate();
       if (sync.user) {
         sync.available = true;
         updateAccountUI();
@@ -2248,6 +2288,7 @@
     connectDelay = 0;
     sync.connected = true;
     sync.available = true;
+    sync.server = 'ok';
     sync.signupOpen = Boolean(me && me.signup);
     sync.first = Boolean(me && me.first);
     if (!ensureHttps()) return;
@@ -2301,12 +2342,6 @@
           break;
         case 'samples':
           addSamples();
-          break;
-        case 'sign-in':
-          openAuth('signin');
-          break;
-        case 'sign-up':
-          openAuth('signup');
           break;
         case 'go':
           setView(el.dataset.view);
@@ -2390,7 +2425,7 @@
   function setupGlobalKeys() {
     document.addEventListener('keydown', (e) => {
       if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
-      if (document.querySelector('dialog[open]')) return;
+      if (document.querySelector('dialog[open]') || document.body.classList.contains('gated')) return;
       if (e.target.closest('input, textarea, select, [contenteditable="true"]')) return;
       switch (e.key) {
         case 'n':

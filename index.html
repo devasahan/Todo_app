@@ -52,10 +52,6 @@
             <input id="search" type="search" placeholder="Search plans" aria-label="Search plans" autocomplete="off" />
             <kbd>/</kbd>
           </label>
-          <button type="button" class="btn ghost small sign-in-btn" id="sign-in" hidden>
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4" /><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7" /></svg>
-            <span>Sign in</span>
-          </button>
           <details class="menu account" id="account" hidden>
             <summary class="avatar-btn" aria-label="Account">
               <span class="avatar" id="account-initial" aria-hidden="true"></span>
@@ -125,6 +121,19 @@
       <div id="filters" class="filters"></div>
       <div id="view" class="view" tabindex="-1"></div>
     </main>
+
+    <!-- On a site with accounts, only signed-in people can use the planner. -->
+    <section id="gate" class="gate" aria-labelledby="gate-title" hidden>
+      <div class="gate-card">
+        <span class="brand-mark gate-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M6 12.5l3.5 3.5L18 7.5" /></svg>
+        </span>
+        <h1 id="gate-title">Dayplan</h1>
+        <p class="gate-text" id="gate-text" role="status">Connecting…</p>
+        <div class="gate-actions" id="gate-actions"></div>
+        <p class="gate-note" id="gate-note"></p>
+      </div>
+    </section>
 
     <dialog id="editor" class="modal" aria-labelledby="editor-heading">
       <form id="editor-form" novalidate>

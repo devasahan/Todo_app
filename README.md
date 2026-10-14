@@ -4,8 +4,9 @@ A simple planner for daily work. Each **plan** has a title, a description, a dea
 (**To do → In progress → Done**). You can also add steps, tags and a priority.
 
 It needs no install and no server: open the page and start planning, and your plans are saved in
-your browser. Put it online (for example on PythonAnywhere, below) and you can also **sign in with
-an email and password** to see the same plans in every browser.
+your browser. Put it online (for example on PythonAnywhere, below) and it becomes a members-only
+site: people **sign in with an email and password**, see the same plans in every browser, and new
+accounts need the admin's approval.
 
 ## Getting started
 
@@ -70,10 +71,10 @@ Click **Save**.
 
 **6. Go live.** Scroll up on the **Web** tab and click the green **Reload** button.
 
-**7. Create your Dayplan account right away.** Open `https://yourname.pythonanywhere.com`, click
-**Sign in** (top right) and create an account with your email and a new password that you don't
-use anywhere else. **The first account on the site becomes its admin**, so do this before you
-share the address with anyone.
+**7. Create your Dayplan account right away.** Open `https://yourname.pythonanywhere.com`. You'll
+see a sign-in screen: click **Create the first account** and use your email and a new password that
+you don't use anywhere else. **The first account on the site becomes its admin**, so do this
+before you share the address with anyone.
 
 (If someone else got there first, you'll see *"Request sent"* or *"isn't accepting new accounts"*
 instead of being signed in. Fix it from a Bash console with
@@ -84,10 +85,13 @@ the other account.)
 On any other browser or phone, open the same address, click **Sign in** and use the same email and
 password. Your plans appear and stay in sync.
 
+Nobody can use the planner on your site without signing in: visitors only see the sign-in screen.
+
 ### Letting other people use your site
 
-Like most websites, anyone can click **Sign in → Create an account**. Their account then waits for
-you: they see *"Request sent"*, and they can't sign in until you approve them. (Sign-up gives the
+Like most websites, anyone can click **Create an account** on the sign-in screen. Their account then
+waits for you: they see *"Request sent"*, and they can't sign in or use the planner until you
+approve them. (Sign-up gives the
 same answer whether or not an email already has an account, so strangers can't use it to find out
 who uses your site.)
 
@@ -226,11 +230,12 @@ Press <kbd>Shift</kbd>+<kbd>Enter</kbd> to open the full editor with the parsed 
 
 ## Where your data lives
 
-**Not signed in:** plans are stored in your browser's `localStorage`, on your device only.
+**Opened as a file** (`index.html` on your computer, no server): there are no accounts. Plans are
+stored in your browser's `localStorage`, on your device only.
 Nothing is sent anywhere. Each browser keeps its own copy, so use **Export backup** to move plans
 between them or to keep a safe copy. Clearing your browser's site data deletes them.
 
-**Signed in:** plans are also saved to your account on the server, in a SQLite database at
+**On your site (signed in):** plans are also saved to your account on the server, in a SQLite database at
 `../dayplan-data/dayplan.sqlite3` (next to the code, never inside it, and never on GitHub). Every
 change is sent within a second. Other browsers pick up changes when you open or switch back to
 them, and every minute while they're open. If you're offline, changes wait and are sent when
