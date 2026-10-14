@@ -49,8 +49,9 @@ class ServesTheApp(unittest.TestCase):
         self.assertNotEqual(headers['Content-Length'], '0')
 
     def test_other_methods_rejected(self):
-        status, _, _ = request('/', method='POST')
-        self.assertTrue(status.startswith('405'))
+        for path in ('/', '/js/' + 'a' * 300 + '.js'):
+            status, _, _ = request(path, method='POST')
+            self.assertTrue(status.startswith('405'), path)
 
 
 class KeepsEverythingElsePrivate(unittest.TestCase):
@@ -70,6 +71,10 @@ class KeepsEverythingElsePrivate(unittest.TestCase):
             '/css//styles.css',
             '/js/core.js\x00.png',
             '/nope.html',
+            # Over-long names must be a clean 404, not an OSError.
+            '/js/' + 'a' * 300 + '.js',
+            '/css/' + 'a' * 300 + '/x.css',
+            '/js/' + 'abcdefgh/' * 600 + 'x.js',
         ]:
             status, _, body = request(path)
             self.assertEqual(status, '404 Not Found', path)

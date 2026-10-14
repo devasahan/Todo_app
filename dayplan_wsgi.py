@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 PUBLIC_DIRS = ('css', 'js')
+MAX_PATH_LENGTH = 200  # real asset paths are far shorter
 CONTENT_TYPES = {
     '.html': 'text/html; charset=utf-8',
     '.css': 'text/css; charset=utf-8',
@@ -29,28 +30,31 @@ def find_file(url_path):
     """Maps a URL path to a public file, or returns None."""
     if url_path in ('', '/', '/index.html'):
         return ROOT / 'index.html'
+    if len(url_path) > MAX_PATH_LENGTH:
+        return None
     parts = url_path.lstrip('/').split('/')
     if len(parts) < 2 or parts[0] not in PUBLIC_DIRS:
         return None
     if any(part in ('', '.', '..') or part.startswith('.') for part in parts):
         return None
+    folder = ROOT / parts[0]
+    # Any filesystem error (name too long, symlink loop, NUL byte, ...)
+    # simply means "not found".
     try:
-        file = ROOT.joinpath(*parts).resolve()
-    except (OSError, ValueError):
+        file = folder.joinpath(*parts[1:]).resolve()
+        ok = folder in file.parents and file.suffix in CONTENT_TYPES and file.is_file()
+    except (OSError, ValueError, RuntimeError):
         return None
-    inside = file.is_relative_to(ROOT / parts[0])
-    if not inside or file.suffix not in CONTENT_TYPES or not file.is_file():
-        return None
-    return file
+    return file if ok else None
 
 
 def application(environ, start_response):
     method = environ.get('REQUEST_METHOD', 'GET')
-    file = find_file(environ.get('PATH_INFO', '/'))
-
     if method not in ('GET', 'HEAD'):
         start_response('405 Method Not Allowed', [('Allow', 'GET, HEAD'), ('Content-Type', 'text/plain')])
         return [b'Method not allowed']
+
+    file = find_file(environ.get('PATH_INFO', '/'))
     if file is None:
         start_response('404 Not Found', [('Content-Type', 'text/plain')])
         return [b'Not found']

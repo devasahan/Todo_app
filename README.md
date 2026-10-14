@@ -25,11 +25,19 @@ This gives Dayplan its own address, like `https://yourname.pythonanywhere.com`, 
 from any browser. You can use the same email address as another PythonAnywhere account. Each
 account just needs its own username, and you sign in with the username.
 
-**1. Create the account.** On [pythonanywhere.com](https://www.pythonanywhere.com), choose
+**1. Create the account.** If you're signed in to another PythonAnywhere account, log out first
+(or use a private browser window). On [pythonanywhere.com](https://www.pythonanywhere.com), choose
 *Pricing & signup*, then *Create a Beginner account*. The username you pick becomes your web
-address, so `dayplan` gives you `dayplan.pythonanywhere.com`.
+address, so `dayplan` gives you `dayplan.pythonanywhere.com`. Lowercase letters are the safest
+choice.
 
-**2. Copy Dayplan into your account.** Open the **Consoles** tab, start a **Bash** console and run:
+Then:
+- Open the confirmation email PythonAnywhere sends you and click the link. Without it you won't
+  get the warning email before your site is switched off, and you can't reset your password.
+- Write down your new username. You sign in with it, not with your email.
+
+**2. Copy Dayplan into your account.** Check that the top right of the page shows your *new*
+username. Open the **Consoles** tab, start a **Bash** console and run:
 
 ```bash
 git clone https://github.com/devasahan/Todo_app.git
@@ -50,13 +58,22 @@ sys.path.insert(0, '/home/yourname/Todo_app')
 from dayplan_wsgi import application
 ```
 
+Type the username exactly as you created it. Capital letters matter here, even though the web
+address shows it in lowercase. If you're not sure, run `echo $HOME` in a Bash console. It prints
+the exact folder, for example `/home/yourname`.
+
 Click **Save**.
 
 **5. Go live.** Back on the **Web** tab, click the green **Reload** button and open
 `https://yourname.pythonanywhere.com`.
 
+**If you see "Something went wrong".** On the **Web** tab, open the **error log** link in the
+**Log files** section. The last lines say what failed. A misspelled username in step 4 is the most
+common cause (`No module named 'dayplan_wsgi'`).
+
 **Keep it running.** Free web apps are switched off if they aren't extended. About once a month,
-log in and click the button on the **Web** tab that extends the app for another month.
+sign in with your Dayplan username and click the button on the **Web** tab that extends the app
+for another month.
 
 **Get updates later.** When the code on GitHub changes, run this in a Bash console, then press
 **Reload** on the **Web** tab:
@@ -161,7 +178,7 @@ overdue, streaks and so on) are covered by fast unit tests:
 
 ```bash
 npm test               # app logic, with Node's built-in test runner (Node 18+)
-npm run test:server    # dayplan_wsgi.py, with Python's unittest (Python 3.9+)
+npm run test:server    # dayplan_wsgi.py, with Python's unittest (Python 3.8+)
 ```
 
 No dependencies need to be installed.
