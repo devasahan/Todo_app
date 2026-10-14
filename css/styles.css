@@ -710,6 +710,8 @@ select {
 /* ----------------------------------------------------------- quick add */
 
 .quick-add {
+  position: relative;
+  z-index: 15; /* its hint/preview card floats over the content below */
   margin-bottom: 14px;
   padding: 8px;
   border: 1px solid var(--border);
@@ -749,8 +751,24 @@ select {
   color: var(--muted);
 }
 
+/* The hint and the parsed-preview float below the box instead of pushing the
+   page down, so leaving the box never shifts what you're about to tap. */
 .qa-footer {
-  padding: 0 10px;
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  display: none;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+.quick-add:focus-within:not(.has-text) .qa-footer,
+.quick-add:focus-within .qa-footer:has(.qa-preview:not(:empty)) {
+  display: block;
 }
 
 .qa-preview {
@@ -760,9 +778,6 @@ select {
   gap: 6px;
 }
 
-.qa-preview:not(:empty) {
-  padding: 8px 0 4px;
-}
 
 .qa-title {
   margin-right: 4px;
@@ -772,14 +787,12 @@ select {
 }
 
 .qa-hint {
-  display: none;
-  padding: 6px 0 4px;
   color: var(--muted);
   font-size: 12.5px;
 }
 
-.quick-add:focus-within:not(.has-text) .qa-hint {
-  display: block;
+.quick-add.has-text .qa-hint {
+  display: none;
 }
 
 .qa-hint em {
@@ -2508,10 +2521,6 @@ select {
 
   .sign-in-btn {
     padding: 0 10px;
-  }
-
-  .sign-in-btn span {
-    display: none;
   }
 
   .search kbd {

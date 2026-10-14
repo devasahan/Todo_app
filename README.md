@@ -104,8 +104,9 @@ how many plans each has, never what's in them.
 common cause (`No module named 'dayplan_wsgi'`).
 
 **Keep it running.** Free web apps are switched off if they aren't extended. About once a month,
-sign in with your Dayplan username and click the button on the **Web** tab that extends the app
-for another month.
+log in to **pythonanywhere.com** (with your PythonAnywhere username, not your Dayplan email) and
+click **Run until 1 month from today** on the **Web** tab. PythonAnywhere emails you a week before
+the deadline.
 
 **Get updates later.** When the code on GitHub changes, run this in a Bash console, then press
 **Reload** on the **Web** tab:
@@ -125,13 +126,26 @@ forgot theirs). This also signs that account out on every other device.
 python3 ~/Todo_app/dayplan_api.py set-password you@example.com
 ```
 
-Other console commands, handy if you can't get into the app:
+`set-password` only changes existing accounts, so a typo in the email can't create a new one by
+mistake; it tells you if there's no such account. Other console commands, handy if you can't get
+into the app:
 
 ```bash
 python3 ~/Todo_app/dayplan_api.py list-users                 # everyone, with their status
+python3 ~/Todo_app/dayplan_api.py add-user friend@example.com     # a new, approved account
 python3 ~/Todo_app/dayplan_api.py approve friend@example.com
 python3 ~/Todo_app/dayplan_api.py make-admin friend@example.com
 ```
+
+### Moving plans you already have onto the site
+
+Plans you made before (for example by opening `index.html` on your computer) live only in that
+browser. To bring them over:
+
+1. Open that copy of Dayplan, click **⋯ → Export backup**. A `.json` file downloads.
+2. Open your site, sign in, then click **⋯ → Import backup…** and pick that file.
+
+They're added to your account and appear on every device you sign in on.
 
 ## What you can do
 
@@ -216,17 +230,23 @@ them, and every minute while they're open. If you're offline, changes wait and a
 you're back. The dot on your account button shows this: green is saved, amber is saving, grey is
 offline.
 
-When you sign in on a browser that already has plans, those plans are added to your account.
-Signing out removes the plans from that browser (they stay safe in your account), so nothing is
-left behind on a shared computer.
+If the same plan is changed in two places, the most recent change wins, per plan. An older copy
+can never overwrite a newer one, so a laptop that was signed out for weeks, a second tab, or an
+undo can't bring back old versions or deleted plans. Moving a card or editing one field only
+changes that plan.
+
+When you sign in on a browser that already has plans, plans the account doesn't have yet are
+added to it. Signing out removes the plans from that browser (they stay safe in your account), so
+nothing is left behind on a shared computer.
 
 How it's protected:
 - Passwords are never stored, only a salted PBKDF2-SHA256 hash (600,000 rounds).
 - You stay signed in with a random session token in an `HttpOnly`, `SameSite=Lax` cookie (and
   `Secure` over HTTPS). Only a hash of the token is stored on the server.
-- Ten wrong passwords in 15 minutes lock that email for the rest of the 15 minutes, and the whole
-  site checks at most 30 passwords a minute, so a flood of guesses can't slow it down. People who
-  are already signed in aren't affected.
+- Ten wrong passwords in 15 minutes from one place lock that email there for the rest of the 15
+  minutes (so a stranger can't lock you out of your own account), and the whole site checks at
+  most 30 passwords a minute, so a flood of guesses can't slow it down. People who are already
+  signed in aren't affected.
 - Each account only ever sees its own plans. The admin manages accounts, not their contents.
 - New accounts can't sign in until the admin approves them, and at most 50 requests can wait at
   once, so strangers can't fill up the database.

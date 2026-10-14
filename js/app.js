@@ -125,15 +125,14 @@
   const visiblePlans = () => state.plans.filter((p) => C.matchesFilters(p, state.filters));
   const filtersActive = () => Boolean(state.filters.query || state.filters.tag || state.filters.priority);
 
+  const nowStamp = () => new Date().toISOString();
+  const restored = (plan) => ({ ...plan, updatedAt: nowStamp() });
+
   function setPlans(plans) {
     const before = state.plans;
     state.plans = plans;
     savePlans();
-    if (sync.user) {
-      for (const id of C.changedPlanIds(before, plans)) sync.pending.add(id);
-      saveSyncState();
-      scheduleSync();
-    }
+    if (sync.user) trackChanges(before, plans);
     render();
   }
 
@@ -177,7 +176,7 @@
       onAction: () => {
         if (findPlan(id)) return;
         const plans = [...state.plans];
-        plans.splice(Math.min(index, plans.length), 0, plan);
+        plans.splice(Math.min(index, plans.length), 0, restored(plan));
         setPlans(plans);
       },
     });
@@ -251,7 +250,13 @@
       else tab.removeAttribute('aria-current');
     }
     renderFilters();
-    $('#view').innerHTML = view === 'board' ? boardHTML() : view === 'calendar' ? calendarHTML() : todayHTML();
+    const html = view === 'board' ? boardHTML() : view === 'calendar' ? calendarHTML() : todayHTML();
+    // Replace the page only when something changed: the once-a-minute refresh
+    // and syncs with no news then never swallow a tap or move the focus.
+    if (html !== state.viewHTML) {
+      $('#view').innerHTML = html;
+      state.viewHTML = html;
+    }
     updateBadges();
     restore();
   }
@@ -650,6 +655,7 @@
     const d = C.parseISODate(date);
     if (!d) return;
     state.selectedDay = date;
+    state.viewHTML = null; // the calendar is updated in place below
     const month = state.calendarMonth;
     if (d.getMonth() !== month.getMonth() || d.getFullYear() !== month.getFullYear()) {
       state.calendarMonth = new Date(d.getFullYear(), d.getMonth(), 1);
@@ -690,6 +696,11 @@
     clearDropTargets();
     for (const el of $$('.dragging')) el.classList.remove('dragging');
     document.body.classList.remove('is-dragging');
+    if (state.renderAfterDrag) {
+      // Changes from another device arrived mid-drag; show them now.
+      state.renderAfterDrag = false;
+      render();
+    }
   }
 
   function setupDragAndDrop() {
@@ -826,6 +837,7 @@
     $('#editor-meta').textContent = plan ? metaLine(plan) : '';
     $('#title-error').hidden = true;
     editor.snapshot = editorSnapshot();
+    editor.original = editorValues(); // to save only what the user changes
     editor.dialog.showModal();
     const title = field('title');
     title.focus();
@@ -842,6 +854,23 @@
       if (took > 0) parts.push(`took ${duration(took)}`);
     }
     return parts.join(' · ');
+  }
+
+  // The plan's fields as the editor shows them, in the same shape at open and at save.
+  function editorValues() {
+    let dueDate = field('dueDate').value;
+    const dueTime = field('dueTime').value;
+    if (dueTime && !dueDate) dueDate = C.toISODate(new Date());
+    return {
+      title: field('title').value.trim(),
+      description: field('description').value.trim(),
+      dueDate,
+      dueTime: dueDate ? dueTime : '',
+      status: field('status').value,
+      priority: field('priority').value,
+      tags: [...editor.tags],
+      checklist: editor.checklist.filter((item) => item.text.trim()).map((item) => ({ ...item })),
+    };
   }
 
   function editorSnapshot() {
@@ -906,8 +935,7 @@
   }
 
   function saveEditor() {
-    const title = field('title').value.trim();
-    if (!title) {
+    if (!field('title').value.trim()) {
       $('#title-error').hidden = false;
       field('title').focus();
       return;
@@ -917,25 +945,13 @@
       editor.checklist.push({ id: C.uid(), text: $('#step-input').value.trim(), done: false });
     }
 
-    let dueDate = field('dueDate').value;
-    const dueTime = field('dueTime').value;
-    if (dueTime && !dueDate) dueDate = C.toISODate(new Date());
-    const fields = {
-      title,
-      description: field('description').value.trim(),
-      dueDate,
-      dueTime: dueDate ? dueTime : '',
-      priority: field('priority').value,
-      tags: editor.tags,
-      checklist: editor.checklist.filter((item) => item.text.trim()),
-    };
-    const status = field('status').value;
+    const values = editorValues();
     const point = centerOf(editor.form.querySelector('[type="submit"]'));
     editor.dialog.close();
 
     if (!editor.id) {
-      const plan = addPlan({ ...fields, status });
-      if (status === 'done') celebrate(point);
+      const plan = addPlan(values);
+      if (values.status === 'done') celebrate(point);
       toast(`Added “${truncate(plan.title)}”`);
       return;
     }
@@ -945,13 +961,27 @@
       toast('This plan was deleted in the meantime.');
       return;
     }
+    // Only fields changed in the editor are saved, onto the plan as it is now,
+    // so an update from another device while the editor was open isn't undone.
+    const changes = {};
+    for (const key of Object.keys(values)) {
+      if (key !== 'status' && JSON.stringify(values[key]) !== JSON.stringify(editor.original[key])) {
+        changes[key] = values[key];
+      }
+    }
+    const newStatus = values.status !== editor.original.status && values.status !== before.status ? values.status : '';
+    if (!Object.keys(changes).length && !newStatus) return;
+
     const now = new Date();
-    let plans = state.plans.map((p) =>
-      p.id === editor.id ? C.normalizePlan({ ...p, ...fields, updatedAt: now.toISOString() }, now) : p
-    );
-    if (status !== before.status) plans = placeAtTop(plans, editor.id, status);
+    let plans = state.plans;
+    if (Object.keys(changes).length) {
+      plans = plans.map((p) =>
+        p.id === editor.id ? C.normalizePlan({ ...p, ...changes, updatedAt: now.toISOString() }, now) : p
+      );
+    }
+    if (newStatus) plans = placeAtTop(plans, editor.id, newStatus);
     setPlans(plans);
-    if (status === 'done' && before.status !== 'done') celebrate(point);
+    if (newStatus === 'done') celebrate(point);
   }
 
   function setupEditor() {
@@ -1302,18 +1332,33 @@
   async function importPlans(file) {
     try {
       const incoming = C.importData(await file.text());
-      const before = state.plans;
-      const byId = new Map(before.map((p) => [p.id, p]));
-      let added = 0;
+      const byId = new Map(state.plans.map((p) => [p.id, p]));
+      const sameContent = (a, b) => JSON.stringify({ ...a, updatedAt: '' }) === JSON.stringify({ ...b, updatedAt: '' });
+      const touched = []; // what the import changed, to undo exactly that
       for (const plan of incoming) {
-        if (!byId.has(plan.id)) added += 1;
-        byId.set(plan.id, plan);
+        const previous = byId.get(plan.id) || null;
+        if (previous && sameContent(previous, plan)) continue;
+        touched.push({ id: plan.id, previous });
+        byId.set(plan.id, restored(plan));
       }
       setPlans([...byId.values()]);
-      const updated = incoming.length - added;
-      toast(`Imported ${added} new ${added === 1 ? 'plan' : 'plans'}${updated ? `, updated ${updated}` : ''}`, {
-        action: 'Undo',
-        onAction: () => setPlans(before),
+      const added = touched.filter((t) => !t.previous).length;
+      const updated = touched.length - added;
+      const summary = touched.length
+        ? `Imported ${added} new ${added === 1 ? 'plan' : 'plans'}${updated ? `, updated ${updated}` : ''}`
+        : 'Nothing to import: these plans are already here.';
+      toast(summary, {
+        action: touched.length ? 'Undo' : '',
+        onAction: () => {
+          // Applied to the plans as they are now, so changes that arrived from
+          // other devices in the meantime are kept.
+          const current = new Map(state.plans.map((p) => [p.id, p]));
+          for (const { id, previous } of touched) {
+            if (previous) current.set(id, restored(previous));
+            else current.delete(id);
+          }
+          setPlans([...current.values()]);
+        },
       });
     } catch (err) {
       toast(`Import failed: ${err.message}`);
@@ -1334,7 +1379,7 @@
     setPlans(state.plans.filter((p) => p.status !== 'done'));
     toast(`Cleared ${done.length} completed ${done.length === 1 ? 'plan' : 'plans'}`, {
       action: 'Undo',
-      onAction: () => setPlans([...state.plans, ...done.filter((d) => !findPlan(d.id))]),
+      onAction: () => setPlans([...state.plans, ...done.filter((d) => !findPlan(d.id)).map(restored)]),
     });
   }
 
@@ -1398,14 +1443,18 @@
 
   const sync = {
     available: false, // the server supports accounts
+    connected: false, // /api/me has answered since the page loaded
     signupOpen: false,
     first: false, // no account exists yet: the next one becomes the admin
     user: '', // email of the signed-in account
     admin: false,
     pendingUsers: 0, // sign-up requests waiting for the admin
     notifiedPending: 0,
+    epoch: '', // id of the server database this browser synced with
     cursor: 0, // last server revision this browser has seen
-    pending: new Set(), // plan ids changed here and not yet saved to the account
+    pending: new Set(), // plan ids changed here and not yet sent
+    inflight: new Set(), // ids in the request running now; kept until the server confirms
+    deletedAt: new Map(), // when each unsent deletion happened
     running: null,
     again: false,
     timer: null,
@@ -1419,22 +1468,30 @@
       if (typeof saved.user !== 'string' || !saved.user) return;
       sync.user = saved.user;
       sync.admin = saved.admin === true;
+      sync.epoch = typeof saved.epoch === 'string' ? saved.epoch : '';
       sync.cursor = Number.isInteger(saved.cursor) && saved.cursor >= 0 ? saved.cursor : 0;
       const pending = Array.isArray(saved.pending) ? saved.pending : [];
       sync.pending = new Set(pending.filter((id) => typeof id === 'string'));
+      const deleted = saved.deletedAt && typeof saved.deletedAt === 'object' ? saved.deletedAt : {};
+      sync.deletedAt = new Map(Object.entries(deleted).filter(([, at]) => typeof at === 'string'));
     } catch {
       /* start without an account */
     }
   }
 
+  // In-flight ids are stored as pending too, so an edit that was being sent
+  // when the tab closed is sent again next time.
   function saveSyncState() {
     if (!sync.user) {
       removeStorage(SYNC_KEY);
       return;
     }
+    const ids = [...new Set([...sync.pending, ...sync.inflight])];
+    const deletedAt = {};
+    for (const id of ids) if (sync.deletedAt.has(id)) deletedAt[id] = sync.deletedAt.get(id);
     writeStorage(
       SYNC_KEY,
-      JSON.stringify({ user: sync.user, admin: sync.admin, cursor: sync.cursor, pending: [...sync.pending] })
+      JSON.stringify({ user: sync.user, admin: sync.admin, epoch: sync.epoch, cursor: sync.cursor, pending: ids, deletedAt })
     );
   }
 
@@ -1444,22 +1501,41 @@
     sync.admin = false;
     sync.pendingUsers = 0;
     sync.notifiedPending = 0;
+    sync.epoch = '';
     sync.cursor = 0;
     sync.pending.clear();
+    sync.inflight.clear();
+    sync.deletedAt.clear();
     sync.retryDelay = 0;
     sync.status = 'saved';
     saveSyncState();
   }
 
+  // Remembers which plans changed (or were deleted, and when) so they get sent.
+  function trackChanges(before, after) {
+    const now = new Date().toISOString();
+    const present = new Set(after.map((p) => p.id));
+    for (const id of C.changedPlanIds(before, after)) {
+      sync.pending.add(id);
+      if (present.has(id)) sync.deletedAt.delete(id);
+      else sync.deletedAt.set(id, now);
+    }
+    saveSyncState();
+    scheduleSync();
+  }
+
   // Another tab signed in, signed out or synced.
   function adoptSyncStateFromOtherTab() {
-    const mine = new Set(sync.pending);
+    const mine = new Set([...sync.pending, ...sync.inflight]);
+    const myDeletes = new Map(sync.deletedAt);
     const wasUser = sync.user;
     sync.user = '';
     sync.admin = false;
     loadSyncState();
     if (sync.user && sync.user === wasUser) {
+      // Keep this tab's own unsent edits too (older copies are refused by the server).
       for (const id of mine) sync.pending.add(id);
+      for (const [id, at] of myDeletes) if (!sync.deletedAt.has(id)) sync.deletedAt.set(id, at);
     } else {
       sync.pendingUsers = 0;
       sync.notifiedPending = 0;
@@ -1469,22 +1545,40 @@
     if (sync.user) syncNow(); // also refreshes the admin's waiting count
   }
 
+  const REQUEST_TIMEOUT_MS = 30000;
+
   async function api(path, body) {
-    const response = await fetch(path, {
-      method: body === undefined ? 'GET' : 'POST',
-      headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      credentials: 'same-origin',
-      cache: 'no-store',
-    });
+    // A request that hangs (weak mobile signal) becomes a retryable error.
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS) : null;
+    let response;
+    try {
+      response = await fetch(path, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        credentials: 'same-origin',
+        cache: 'no-store',
+        signal: controller ? controller.signal : undefined,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
     let data = null;
     try {
       data = await response.json();
     } catch {
-      /* not JSON */
+      /* not JSON, e.g. an error page from a proxy */
     }
     if (!response.ok) {
-      const err = new Error((data && data.error) || `The server answered ${response.status}.`);
+      let message = data && data.error;
+      if (!message) {
+        message =
+          response.status >= 500
+            ? 'The server is having a problem. Please try again in a minute.'
+            : `Something went wrong (error ${response.status}). Please reload the page.`;
+      }
+      const err = new Error(message);
       err.status = response.status;
       throw err;
     }
@@ -1520,13 +1614,21 @@
     const user = sync.user;
     const ids = [...sync.pending];
     sync.pending.clear();
-    const changes = ids.map((id) => ({ id, data: findPlan(id) || null }));
+    for (const id of ids) sync.inflight.add(id);
+    const changes = ids.map((id) => {
+      const plan = findPlan(id);
+      if (plan) return { id, data: plan };
+      return { id, data: null, deletedAt: sync.deletedAt.get(id) || new Date().toISOString() };
+    });
     if (ids.length) setSyncStatus('saving');
     try {
-      const result = await api('api/sync', { cursor: sync.cursor, changes });
+      const result = await api('api/sync', { epoch: sync.epoch || undefined, cursor: sync.cursor, changes });
       if (sync.user !== user) return; // signed out while this was running
+      sync.inflight.clear();
       if (result.reset) {
-        // The server has an older copy than this browser remembers: resend everything.
+        // A different database (e.g. restored from a copy): pull everything and
+        // offer every local plan again. The server keeps whichever copy is newer.
+        sync.epoch = result.epoch || '';
         sync.cursor = 0;
         for (const id of ids) sync.pending.add(id);
         for (const plan of state.plans) sync.pending.add(plan.id);
@@ -1534,7 +1636,9 @@
         sync.again = true;
         return;
       }
+      sync.epoch = result.epoch || sync.epoch;
       sync.cursor = result.cursor;
+      for (const id of ids) if (!sync.pending.has(id)) sync.deletedAt.delete(id);
       // Only admins get a waiting count, so its presence is the source of truth.
       const isAdmin = typeof result.pending === 'number';
       if (isAdmin !== sync.admin) {
@@ -1543,18 +1647,21 @@
         updateAccountUI();
       }
       if (isAdmin) setPendingUsers(result.pending);
+      // The server also returns its own copy of anything it refused as out of date.
       const next = C.applyRemoteChanges(state.plans, result.changes || [], sync.pending);
       if (next !== state.plans) {
         state.plans = next;
         savePlans();
-        render();
+        if (state.dragId) state.renderAfterDrag = true; // don't pull the card out from under the pointer
+        else render();
       }
       sync.retryDelay = 0;
       saveSyncState();
       setSyncStatus(sync.pending.size ? 'saving' : 'saved');
     } catch (err) {
       if (sync.user !== user) return;
-      for (const id of ids) sync.pending.add(id);
+      for (const id of sync.inflight) sync.pending.add(id);
+      sync.inflight.clear();
       saveSyncState();
       if (err.status === 401) {
         signedOutElsewhere();
@@ -1566,13 +1673,18 @@
     }
   }
 
-  // Signs this browser in to `email`. Plans already here are added to the account.
+  // Signs this browser in to `email`. Plans already here are offered to the
+  // account; the server keeps whichever copy of each plan is newer.
   function startSession(email, admin = false) {
     sync.user = email;
     sync.admin = Boolean(admin);
+    sync.epoch = '';
     sync.cursor = 0;
     sync.pending = new Set(state.plans.map((p) => p.id));
+    sync.inflight.clear();
+    sync.deletedAt.clear();
     sync.retryDelay = 0;
+    removeStorage(LOGOUT_KEY); // this sign-in replaces any unfinished sign-out
     saveSyncState();
     updateAccountUI();
     render();
@@ -1593,7 +1705,9 @@
   }
 
   async function signOut() {
-    await syncNow();
+    // Send everything first, including edits made while a sync was running.
+    for (let i = 0; i < 3 && sync.user && (sync.pending.size || sync.running); i += 1) await syncNow();
+    if (!sync.user) return; // the server had already signed this browser out
     if (
       sync.pending.size &&
       !window.confirm(
@@ -1843,8 +1957,10 @@
       }
       const waitingBefore = sync.notifiedPending;
       await syncNow();
+      if (!sync.user) return; // signed out meanwhile: keep that notice visible
+      if (sync.status !== 'saved') toast(SYNC_TEXT[sync.status]);
       // Don't cover a "people are waiting for approval" notice.
-      if (sync.status === 'saved' && sync.notifiedPending <= waitingBefore) toast('Everything is up to date.');
+      else if (sync.notifiedPending <= waitingBefore) toast('Everything is up to date.');
     });
     menu.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && menu.open) {
@@ -2033,6 +2149,9 @@
     });
   }
 
+  let connectDelay = 0;
+  let connectTimer = null;
+
   async function connectToServer() {
     if (location.protocol === 'file:') return;
     if (readStorage(LOGOUT_KEY)) {
@@ -2047,15 +2166,20 @@
     try {
       me = await api('api/me');
     } catch (err) {
-      if (sync.user && !err.status) {
-        // Offline with a saved sign-in: keep working and catch up later.
+      if (err.status === 404) return; // no accounts on this server (e.g. static hosting)
+      // Offline or a server hiccup: keep working, say so, and try again.
+      if (sync.user) {
         sync.available = true;
         updateAccountUI();
-        setSyncStatus('offline');
-        scheduleSync(15000);
+        setSyncStatus(err.status ? 'error' : 'offline');
       }
-      return; // no accounts on this server (e.g. static hosting)
+      connectDelay = Math.min(connectDelay ? connectDelay * 2 : 10000, 5 * 60 * 1000);
+      clearTimeout(connectTimer);
+      connectTimer = setTimeout(connectToServer, connectDelay);
+      return;
     }
+    connectDelay = 0;
+    sync.connected = true;
     sync.available = true;
     sync.signupOpen = Boolean(me && me.signup);
     sync.first = Boolean(me && me.first);
@@ -2274,7 +2398,10 @@
       render();
       syncNow();
     });
-    window.addEventListener('online', () => syncNow());
+    window.addEventListener('online', () => {
+      if (sync.connected) syncNow();
+      else connectToServer();
+    });
     setInterval(() => {
       if (document.hidden || state.dragId) return;
       render();

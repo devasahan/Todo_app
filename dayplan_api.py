@@ -57,6 +57,8 @@ REQUEST_SENT = (
 )
 STATUSES = ('active', 'pending', 'disabled')
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+# Plan versions are compared by their ISO-8601 UTC time, e.g. 2026-10-14T09:30:00.000Z.
+STAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$')
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -78,12 +80,14 @@ CREATE TABLE IF NOT EXISTS plans (
     id TEXT NOT NULL,
     data TEXT,
     rev INTEGER NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (user_id, id)
 );
 CREATE INDEX IF NOT EXISTS plans_by_rev ON plans (user_id, rev);
 CREATE TABLE IF NOT EXISTS login_failures (
     email TEXT NOT NULL,
-    at INTEGER NOT NULL
+    at INTEGER NOT NULL,
+    ip TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS password_checks (
     at INTEGER NOT NULL
@@ -119,20 +123,47 @@ def connect():
     return conn
 
 
+def columns_of(conn, table):
+    return {row['name'] for row in conn.execute('PRAGMA table_info({})'.format(table))}
+
+
 def migrate(conn):
-    """Upgrades databases created before approvals existed."""
-    columns = {row['name'] for row in conn.execute('PRAGMA table_info(users)')}
-    if 'is_admin' in columns:
-        return
+    """Upgrades databases created by earlier versions."""
     try:
-        with conn:
-            if 'status' not in columns:
-                conn.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
-            conn.execute('ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0')
-            # Whoever created the site's first account is its admin.
-            conn.execute('UPDATE users SET is_admin = 1 WHERE id = (SELECT MIN(id) FROM users)')
+        users = columns_of(conn, 'users')
+        if 'is_admin' not in users:
+            with conn:
+                if 'status' not in users:
+                    conn.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+                conn.execute('ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0')
+                # Whoever created the site's first account is its admin.
+                conn.execute('UPDATE users SET is_admin = 1 WHERE id = (SELECT MIN(id) FROM users)')
+        if 'updated_at' not in columns_of(conn, 'plans'):
+            with conn:
+                conn.execute("ALTER TABLE plans ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+                for row in conn.execute('SELECT user_id, id, data FROM plans WHERE data IS NOT NULL').fetchall():
+                    try:
+                        stamp = json.loads(row['data']).get('updatedAt', '')
+                    except (ValueError, AttributeError):
+                        stamp = ''
+                    if isinstance(stamp, str) and STAMP_RE.match(stamp):
+                        conn.execute(
+                            'UPDATE plans SET updated_at = ? WHERE user_id = ? AND id = ?',
+                            (stamp, row['user_id'], row['id']),
+                        )
+        if 'ip' not in columns_of(conn, 'login_failures'):
+            with conn:
+                conn.execute("ALTER TABLE login_failures ADD COLUMN ip TEXT NOT NULL DEFAULT ''")
     except sqlite3.OperationalError:
         pass  # another process upgraded the database at the same moment
+
+
+def database_epoch(conn):
+    """A random id for this database. If it changes (restored from a copy),
+    browsers start their sync over instead of trusting their old position."""
+    with conn:
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('epoch', ?)", (secrets.token_hex(8),))
+    return get_setting(conn, 'epoch', '')
 
 
 # ---------------------------------------------------------------- passwords
@@ -233,11 +264,15 @@ def set_password(conn, email, password, status='active', admin=False):
             conn.execute('UPDATE users SET password_hash = ? WHERE id = ?', (hashed, row['id']))
             conn.execute('DELETE FROM sessions WHERE user_id = ?', (row['id'],))
             return row['id']
-        cur = conn.execute(
-            'INSERT INTO users (email, password_hash, created_at, status, is_admin) VALUES (?, ?, ?, ?, ?)',
-            (email, hashed, int(time.time()), status, 1 if admin else 0),
-        )
-        return cur.lastrowid
+        return insert_user(conn, email, hashed, status, admin)
+
+
+def insert_user(conn, email, hashed, status, admin):
+    cur = conn.execute(
+        'INSERT INTO users (email, password_hash, created_at, status, is_admin) VALUES (?, ?, ?, ?, ?)',
+        (email, hashed, int(time.time()), status, 1 if admin else 0),
+    )
+    return cur.lastrowid
 
 
 def create_session(conn, user_id):
@@ -280,6 +315,12 @@ def public_user(user):
     return {'email': user['email'], 'admin': bool(user['is_admin'])}
 
 
+def client_ip(environ):
+    # PythonAnywhere's front end puts the visitor's address in X-Real-IP;
+    # REMOTE_ADDR is the proxy there (but the visitor when run directly).
+    return (environ.get('HTTP_X_REAL_IP') or environ.get('REMOTE_ADDR') or '')[:64]
+
+
 def is_https(environ):
     return environ.get('HTTP_X_FORWARDED_PROTO', environ.get('wsgi.url_scheme', '')).lower() == 'https'
 
@@ -320,25 +361,38 @@ def api_register(conn, environ, body):
     if not first and count_pending(conn) >= MAX_PENDING:
         raise ApiError(429, 'Too many people are waiting for approval right now. Please try again later.')
     reserve_password_check(conn)
+    hashed = hash_password(password)  # slow, so done before taking the database lock
 
-    if first:
-        user_id = set_password(conn, email, password, status='active', admin=True)
+    with conn:
+        # Decide "first account" and create it in one locked step, so two
+        # simultaneous sign-ups can't both become the admin.
+        conn.execute('BEGIN IMMEDIATE')
+        first = count_users(conn) == 0
+        exists = conn.execute('SELECT 1 FROM users WHERE email = ?', (email,)).fetchone()
+        user_id = None
+        if first:
+            user_id = insert_user(conn, email, hashed, 'active', True)
+        elif not exists:
+            insert_user(conn, email, hashed, 'pending', False)
+        # An existing email changes nothing, and gets the same answer as a new one.
+
+    if user_id is not None:
         token = create_session(conn, user_id)
         return 201, {'user': {'email': email, 'admin': True}}, [session_cookie(environ, token, SESSION_SECONDS)]
-
-    if conn.execute('SELECT 1 FROM users WHERE email = ?', (email,)).fetchone():
-        burn_password_check(password)  # same time as creating an account; nothing changes
-    else:
-        set_password(conn, email, password, status='pending')
     return 202, {'pending': True, 'message': REQUEST_SENT}, []
 
 
 def api_login(conn, environ, body):
     email, password = read_credentials(body, creating=False)
     now = int(time.time())
+    ip = client_ip(environ)
     with conn:
         conn.execute('DELETE FROM login_failures WHERE at < ?', (now - LOGIN_WINDOW_SECONDS,))
-    failures = conn.execute('SELECT COUNT(*) FROM login_failures WHERE email = ?', (email,)).fetchone()[0]
+    # Counted per email and visitor address: guessing from one place is
+    # stopped, but nobody else can lock the owner out of their own account.
+    failures = conn.execute(
+        'SELECT COUNT(*) FROM login_failures WHERE email = ? AND ip = ?', (email, ip)
+    ).fetchone()[0]
     if failures >= LOGIN_MAX_FAILURES:
         raise ApiError(429, 'Too many attempts. Wait 15 minutes and try again.')
     reserve_password_check(conn)
@@ -350,11 +404,11 @@ def api_login(conn, environ, body):
         burn_password_check(password)
     if user is None or not verify_password(password, user['password_hash']):
         with conn:
-            conn.execute('INSERT INTO login_failures (email, at) VALUES (?, ?)', (email, now))
+            conn.execute('INSERT INTO login_failures (email, at, ip) VALUES (?, ?, ?)', (email, now, ip))
         raise ApiError(401, 'Wrong email or password.')
 
     with conn:
-        conn.execute('DELETE FROM login_failures WHERE email = ?', (email,))
+        conn.execute('DELETE FROM login_failures WHERE email = ? AND ip = ?', (email, ip))
     # Only reveal the account's state to someone who knows its password.
     if user['status'] == 'pending':
         raise ApiError(403, "Your account is waiting for the admin's approval. Please try again later.")
@@ -372,13 +426,24 @@ def api_logout(conn, environ, body):
     return 200, {'ok': True}, [session_cookie(environ, '', 0)]
 
 
+def change_stamp(change, data):
+    """The time a change was made: the plan's updatedAt, or deletedAt for a deletion."""
+    stamp = data.get('updatedAt') if data is not None else change.get('deletedAt')
+    return stamp if isinstance(stamp, str) and STAMP_RE.match(stamp) else ''
+
+
 def api_sync(conn, environ, body):
     """Saves the client's changed plans and returns everything changed elsewhere.
 
-    Request:  {"cursor": <last rev seen>, "changes": [{"id": "...", "data": {...} or null}]}
-    Response: {"cursor": <new rev>, "changes": [...]}  or  {"reset": true}
-    A null `data` means the plan was deleted. The last change to reach the
-    server wins.
+    Request:  {"epoch": "...", "cursor": <last rev seen>,
+               "changes": [{"id": "...", "data": {...}} or {"id": "...", "data": null, "deletedAt": "..."}]}
+    Response: {"epoch": "...", "cursor": <new rev>, "changes": [...]}  or  {"epoch": "...", "reset": true}
+
+    Each plan keeps the time of its latest change. A change is saved only if
+    it is newer than what the server has; otherwise the server's version is
+    sent back. So an old copy (from a browser that was signed out for a
+    while, a second tab, an undo...) can never overwrite newer work or bring
+    back a deleted plan.
     """
     user = current_user(conn, environ)
     if user is None:
@@ -386,66 +451,80 @@ def api_sync(conn, environ, body):
 
     cursor = body.get('cursor')
     changes = body.get('changes', [])
+    client_epoch = body.get('epoch')
     if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
         raise ApiError(400, 'Invalid cursor.')
     if not isinstance(changes, list) or len(changes) > MAX_PLANS:
         raise ApiError(400, 'Invalid changes.')
+    if client_epoch is not None and not isinstance(client_epoch, str):
+        raise ApiError(400, 'Invalid epoch.')
 
     cleaned = []
     for change in changes:
         if not isinstance(change, dict) or not is_text(change.get('id'), 100):
             raise ApiError(400, 'Invalid change.')
         data = change.get('data')
-        if data is None:
-            cleaned.append((change['id'], None))
-            continue
-        if not isinstance(data, dict):
+        if data is not None and not isinstance(data, dict):
             raise ApiError(400, 'Invalid plan.')
-        encoded = json.dumps(data, separators=(',', ':'))
-        if len(encoded) > MAX_PLAN_BYTES:
-            raise ApiError(413, 'A plan is too large to save.')
-        cleaned.append((change['id'], encoded))
+        encoded = None
+        if data is not None:
+            encoded = json.dumps(data, separators=(',', ':'))
+            if len(encoded) > MAX_PLAN_BYTES:
+                raise ApiError(413, 'A plan is too large to save.')
+        cleaned.append((change['id'], encoded, change_stamp(change, data)))
 
+    epoch = database_epoch(conn)
     with conn:
         conn.execute('BEGIN IMMEDIATE')
         rev = conn.execute('SELECT rev FROM users WHERE id = ?', (user['id'],)).fetchone()[0]
-        if cursor > rev:
-            # The client remembers a newer state than the server has (e.g. the
-            # database was restored from an older copy): start over.
-            return 200, {'reset': True}, []
+        if (client_epoch and client_epoch != epoch) or cursor > rev:
+            # This database isn't the one the browser synced with (e.g. it was
+            # restored from a copy): the browser starts over.
+            return 200, {'epoch': epoch, 'reset': True}, []
 
-        sent = set()
-        for plan_id, data in cleaned:
-            sent.add(plan_id)
-            exists = conn.execute(
-                'SELECT data IS NOT NULL AS live FROM plans WHERE user_id = ? AND id = ?', (user['id'], plan_id)
+        saved, stale = set(), set()
+        for plan_id, data, stamp in cleaned:
+            row = conn.execute(
+                'SELECT data IS NOT NULL AS live, updated_at FROM plans WHERE user_id = ? AND id = ?',
+                (user['id'], plan_id),
             ).fetchone()
-            if data is None and not exists:
+            if row is None and data is None:
                 continue  # deleting something the server never had
-            if data is not None and not (exists and exists['live']):
+            if row is not None and not stamp > row['updated_at']:
+                stale.add(plan_id)  # the server has the same or a newer version
+                continue
+            if data is not None and not (row and row['live']):
                 live = conn.execute(
                     'SELECT COUNT(*) FROM plans WHERE user_id = ? AND data IS NOT NULL', (user['id'],)
                 ).fetchone()[0]
                 if live >= MAX_PLANS:
                     raise ApiError(413, 'This account has too many plans.')
             rev += 1
+            saved.add(plan_id)
             conn.execute(
-                'INSERT INTO plans (user_id, id, data, rev) VALUES (?, ?, ?, ?) '
-                'ON CONFLICT (user_id, id) DO UPDATE SET data = excluded.data, rev = excluded.rev',
-                (user['id'], plan_id, data, rev),
+                'INSERT INTO plans (user_id, id, data, rev, updated_at) VALUES (?, ?, ?, ?, ?) '
+                'ON CONFLICT (user_id, id) DO UPDATE SET '
+                'data = excluded.data, rev = excluded.rev, updated_at = excluded.updated_at',
+                (user['id'], plan_id, data, rev, stamp),
             )
         conn.execute('UPDATE users SET rev = ? WHERE id = ?', (rev, user['id']))
 
         rows = conn.execute(
             'SELECT id, data FROM plans WHERE user_id = ? AND rev > ? ORDER BY rev', (user['id'], cursor)
         ).fetchall()
+        seen = {row['id'] for row in rows}
+        for plan_id in stale - seen:  # the client's copy lost: send the current one
+            row = conn.execute(
+                'SELECT id, data FROM plans WHERE user_id = ? AND id = ?', (user['id'], plan_id)
+            ).fetchone()
+            rows.append(row)
 
     remote = [
         {'id': row['id'], 'data': json.loads(row['data']) if row['data'] is not None else None}
         for row in rows
-        if row['id'] not in sent  # the client already has what it just sent
+        if row['id'] not in saved  # the client already has what it just saved
     ]
-    payload = {'cursor': rev, 'changes': remote}
+    payload = {'epoch': epoch, 'cursor': rev, 'changes': remote}
     if user['is_admin']:
         payload['pending'] = count_pending(conn)  # keeps the admin's badge current
     return 200, payload, []
@@ -616,7 +695,8 @@ def main(argv):
         'Usage:\n'
         '  python3 dayplan_api.py list-users\n'
         '  python3 dayplan_api.py approve EMAIL\n'
-        '  python3 dayplan_api.py set-password EMAIL\n'
+        '  python3 dayplan_api.py set-password EMAIL     (existing account)\n'
+        '  python3 dayplan_api.py add-user EMAIL         (new, active account)\n'
         '  python3 dayplan_api.py make-admin EMAIL'
     )
     if len(argv) == 2 and argv[1] == 'list-users':
@@ -640,10 +720,19 @@ def main(argv):
             return 1
         print('{} is now {}.'.format(email, 'active' if argv[1] == 'approve' else 'an admin'))
         return 0
-    if len(argv) == 3 and argv[1] == 'set-password':
+    if len(argv) == 3 and argv[1] in ('set-password', 'add-user'):
         email = argv[2].strip().lower()
         if not EMAIL_RE.match(email):
             print('That does not look like an email address.')
+            return 1
+        conn = connect()
+        exists = conn.execute('SELECT 1 FROM users WHERE email = ?', (email,)).fetchone()
+        if argv[1] == 'set-password' and not exists:
+            print('No account with that email (check for typos). Run list-users to see all accounts,')
+            print('or add-user to create a new one.')
+            return 1
+        if argv[1] == 'add-user' and exists:
+            print('That account already exists. Use set-password to change its password.')
             return 1
         password = getpass.getpass('New password for {}: '.format(email))
         if len(password) < MIN_PASSWORD:
@@ -652,9 +741,11 @@ def main(argv):
         if getpass.getpass('Type it again: ') != password:
             print('The passwords did not match. Nothing was changed.')
             return 1
-        conn = connect()
         set_password(conn, email, password, status='active', admin=count_users(conn) == 0)
-        print('Password set for {}. Any old sign-ins for this account were ended.'.format(email))
+        if exists:
+            print('Password changed for {}. Any old sign-ins for this account were ended.'.format(email))
+        else:
+            print('Account created for {}. They can sign in now.'.format(email))
         return 0
     print(usage)
     return 1

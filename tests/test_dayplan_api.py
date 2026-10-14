@@ -4,7 +4,9 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 from wsgiref.util import setup_testing_defaults
@@ -15,6 +17,16 @@ from dayplan_wsgi import application  # noqa: E402
 
 EMAIL = 'me@example.com'
 PASSWORD = 'correct horse battery'
+_clock = [0]
+
+
+def stamp(offset=None):
+    """Increasing ISO times, like a plan's updatedAt (or a given offset in seconds)."""
+    if offset is None:
+        _clock[0] += 1
+        offset = _clock[0]
+    base = datetime(2026, 10, 14, 9, 0, tzinfo=timezone.utc) + timedelta(seconds=offset)
+    return base.strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
 
 def sync_part(res):
@@ -29,6 +41,7 @@ class Client:
         self.cookie = ''
         self.host = host
         self.https = https
+        self.ip = ''
 
     def request(self, method, path, body=None, content_type='application/json', origin='same'):
         data = b'' if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
@@ -50,6 +63,8 @@ class Client:
                 environ['HTTP_ORIGIN'] = origin
         if self.cookie:
             environ['HTTP_COOKIE'] = self.cookie
+        if self.ip:
+            environ['HTTP_X_REAL_IP'] = self.ip
         captured = {}
 
         def start_response(status, headers):
@@ -99,8 +114,11 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(client.post('/api/login', {'email': email, 'password': password})['status'], 200)
         return client
 
-    def plan(self, plan_id, title='Plan', **fields):
-        return {'id': plan_id, 'data': {'id': plan_id, 'title': title, **fields}}
+    def plan(self, plan_id, title='Plan', at=None, **fields):
+        return {'id': plan_id, 'data': {'id': plan_id, 'title': title, 'updatedAt': at or stamp(), **fields}}
+
+    def deleted(self, plan_id, at=None):
+        return {'id': plan_id, 'data': None, 'deletedAt': at or stamp()}
 
 
 class Accounts(ApiTestCase):
@@ -236,6 +254,32 @@ class Accounts(ApiTestCase):
             self.assertEqual(client.post('/api/login', {'email': EMAIL, 'password': 'wrong guess'})['status'], 401)
         self.assertEqual(client.post('/api/login', {'email': EMAIL, 'password': PASSWORD})['status'], 429)
 
+    def test_a_stranger_cannot_lock_the_owner_out(self):
+        self.signed_in()
+        attacker = Client()
+        attacker.ip = '203.0.113.9'
+        for _ in range(dayplan_api.LOGIN_MAX_FAILURES + 2):
+            attacker.post('/api/login', {'email': EMAIL, 'password': 'wrong guess'})
+        self.assertEqual(attacker.post('/api/login', {'email': EMAIL, 'password': PASSWORD})['status'], 429)
+        owner = Client()
+        owner.ip = '198.51.100.7'
+        self.assertEqual(owner.post('/api/login', {'email': EMAIL, 'password': PASSWORD})['status'], 200)
+
+    def test_simultaneous_first_sign_ups_make_one_admin(self):
+        results = []
+
+        def sign_up(i):
+            results.append(Client().post('/api/register', {'email': f'racer{i}@example.com', 'password': PASSWORD}))
+
+        threads = [threading.Thread(target=sign_up, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(r['status'] for r in results), [201, 202, 202, 202, 202, 202])
+        conn = dayplan_api.connect()
+        self.assertEqual(conn.execute('SELECT COUNT(*) FROM users WHERE is_admin = 1').fetchone()[0], 1)
+
     def test_set_password_resets_and_signs_out_everywhere(self):
         client = self.signed_in()
         conn = dayplan_api.connect()
@@ -284,7 +328,7 @@ class Sync(ApiTestCase):
         self.assertEqual(res['json']['changes'][0]['data']['title'], 'Write report')
 
         # The phone edits one plan and deletes the other.
-        res = phone.post('/api/sync', {'cursor': 2, 'changes': [self.plan('a', 'Report v2'), {'id': 'b', 'data': None}]})
+        res = phone.post('/api/sync', {'cursor': 2, 'changes': [self.plan('a', 'Report v2'), self.deleted('b')]})
         self.assertEqual(sync_part(res), {'cursor': 4, 'changes': []})
 
         res = laptop.post('/api/sync', {'cursor': 2, 'changes': []})
@@ -307,10 +351,63 @@ class Sync(ApiTestCase):
         res = mine.post('/api/sync', {'cursor': 0, 'changes': []})
         self.assertEqual(res['json']['changes'][0]['data']['title'], 'My diary')
 
+    def test_old_copies_never_overwrite_newer_changes(self):
+        laptop = self.signed_in()
+        t1, t2, t3 = stamp(), stamp(), stamp()
+        laptop.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a', 'Original', at=t1), self.plan('b', at=t1)]})
+        phone = Client()
+        phone.post('/api/login', {'email': EMAIL, 'password': PASSWORD})
+        # The phone edits a and deletes b later on.
+        phone.post('/api/sync', {'cursor': 2, 'changes': [self.plan('a', 'Phone edit', at=t3), self.deleted('b', at=t3)]})
+
+        # The laptop, out of date, re-sends its old copies (e.g. after signing in again).
+        res = laptop.post('/api/sync', {'cursor': 2, 'changes': [self.plan('a', 'Original', at=t1), self.plan('b', at=t2)]})
+        changes = {c['id']: c['data'] for c in res['json']['changes']}
+        self.assertEqual(changes['a']['title'], 'Phone edit')  # server's newer copy comes back
+        self.assertIsNone(changes['b'])  # and b stays deleted
+        res = phone.post('/api/sync', {'cursor': 0, 'changes': []})
+        final = {c['id']: c['data'] for c in res['json']['changes']}
+        self.assertEqual(final['a']['title'], 'Phone edit')
+        self.assertIsNone(final['b'])
+
+    def test_same_version_is_not_written_again(self):
+        client = self.signed_in()
+        t = stamp()
+        first = client.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a', at=t)]})['json']
+        again = client.post('/api/sync', {'cursor': first['cursor'], 'changes': [self.plan('a', 'Other', at=t)]})['json']
+        self.assertEqual(again['cursor'], first['cursor'])  # nothing saved
+        self.assertEqual(again['changes'][0]['data']['title'], 'Plan')  # the server's copy is returned
+
+    def test_newer_change_brings_back_a_deleted_plan(self):
+        client = self.signed_in()
+        client.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a')]})
+        client.post('/api/sync', {'cursor': 1, 'changes': [self.deleted('a')]})
+        res = client.post('/api/sync', {'cursor': 2, 'changes': [self.plan('a', 'Undone delete')]})  # e.g. Undo
+        self.assertEqual(sync_part(res), {'cursor': 3, 'changes': []})
+
+    def test_changes_without_a_valid_time_lose(self):
+        client = self.signed_in()
+        client.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a')]})
+        res = client.post('/api/sync', {'cursor': 1, 'changes': [{'id': 'a', 'data': None}]})
+        self.assertEqual(res['json']['changes'][0]['data']['title'], 'Plan')
+        res = client.post('/api/sync', {'cursor': 1, 'changes': [self.plan('a', 'x', at='yesterday')]})
+        self.assertEqual(res['json']['changes'][0]['data']['title'], 'Plan')
+
+    def test_restored_database_makes_browsers_start_over(self):
+        client = self.signed_in()
+        res = client.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a')]})
+        epoch = res['json']['epoch']
+        self.assertTrue(epoch)
+        same = client.post('/api/sync', {'epoch': epoch, 'cursor': 1, 'changes': []})
+        self.assertNotIn('reset', same['json'])
+        other = client.post('/api/sync', {'epoch': 'from-another-copy', 'cursor': 1, 'changes': [self.plan('b')]})
+        self.assertEqual(other['json'], {'epoch': epoch, 'reset': True})
+        self.assertEqual(sync_part(client.post('/api/sync', {'cursor': 0, 'changes': []}))['cursor'], 1)  # b not saved
+
     def test_cursor_ahead_of_server_asks_for_reset(self):
         client = self.signed_in()
         res = client.post('/api/sync', {'cursor': 99, 'changes': [self.plan('a')]})
-        self.assertEqual(res['json'], {'reset': True})
+        self.assertEqual(sync_part(res), {'reset': True})
         # Nothing was saved from the rejected request.
         self.assertEqual(client.post('/api/sync', {'cursor': 0, 'changes': []})['json']['cursor'], 0)
 
@@ -340,7 +437,9 @@ class Sync(ApiTestCase):
             ok = client.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a'), self.plan('b')]})
             self.assertEqual(ok['status'], 200)
             # Editing an existing plan is fine; adding a third is not.
-            self.assertEqual(client.post('/api/sync', {'cursor': 2, 'changes': [self.plan('a', 'x')]})['status'], 200)
+            res = client.post('/api/sync', {'cursor': 2, 'changes': [self.plan('a', 'x')]})
+            self.assertEqual(res['status'], 200)
+            self.assertEqual(res['json']['cursor'], 3)
             self.assertEqual(client.post('/api/sync', {'cursor': 3, 'changes': [self.plan('c')]})['status'], 413)
 
     def test_server_errors_do_not_leak_details(self):
@@ -444,7 +543,12 @@ class Upgrade(ApiTestCase):
             CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
                                 rev INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
             CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+            CREATE TABLE plans (user_id INTEGER NOT NULL, id TEXT NOT NULL, data TEXT, rev INTEGER NOT NULL,
+                                PRIMARY KEY (user_id, id));
+            CREATE TABLE login_failures (email TEXT NOT NULL, at INTEGER NOT NULL);
         ''')
+        old.execute('INSERT INTO plans VALUES (1, ?, ?, 1)',
+                    ('p1', json.dumps({'id': 'p1', 'title': 'Old plan', 'updatedAt': '2026-10-01T08:00:00.000Z'})))
         old.execute('INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, 1)',
                     (EMAIL, dayplan_api.hash_password(PASSWORD)))
         old.execute('INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, 2)',
@@ -460,18 +564,31 @@ class Upgrade(ApiTestCase):
         self.assertEqual(res['json']['user'], {'email': 'second@example.com', 'admin': False})
         dayplan_api.connect()  # running the upgrade again changes nothing
         self.assertEqual(owner.get('/api/admin/users')['status'], 200)
+        # Old plans got their times, so an older copy can't overwrite them.
+        res = owner.post('/api/sync', {'cursor': 0, 'changes': [self.plan('p1', 'Stale', at='2026-09-01T00:00:00.000Z')]})
+        self.assertEqual(res['json']['changes'][0]['data']['title'], 'Old plan')
 
 
 class CommandLine(ApiTestCase):
     def test_set_password_and_list_users(self):
+        with mock.patch('sys.stdout', new=io.StringIO()) as out:
+            # A typo must not quietly create an account.
+            self.assertEqual(dayplan_api.main(['x', 'set-password', 'New@Example.com']), 1)
+        self.assertIn('No account', out.getvalue())
         with mock.patch('getpass.getpass', side_effect=[PASSWORD, PASSWORD]), mock.patch('sys.stdout', new=io.StringIO()):
-            self.assertEqual(dayplan_api.main(['x', 'set-password', 'New@Example.com']), 0)
+            self.assertEqual(dayplan_api.main(['x', 'add-user', 'New@Example.com']), 0)
+        with mock.patch('sys.stdout', new=io.StringIO()):
+            self.assertEqual(dayplan_api.main(['x', 'add-user', 'new@example.com']), 1)  # already exists
         with mock.patch('sys.stdout', new=io.StringIO()) as out:
             dayplan_api.main(['x', 'list-users'])
         self.assertIn('new@example.com', out.getvalue())
         self.assertIn('(admin)', out.getvalue())  # first account made from the console is the admin
         with mock.patch('getpass.getpass', side_effect=[PASSWORD, 'different']), mock.patch('sys.stdout', new=io.StringIO()):
             self.assertEqual(dayplan_api.main(['x', 'set-password', 'new@example.com']), 1)
+        with mock.patch('getpass.getpass', side_effect=['another password', 'another password']), mock.patch('sys.stdout', new=io.StringIO()):
+            self.assertEqual(dayplan_api.main(['x', 'set-password', 'new@example.com']), 0)
+        self.assertEqual(Client().post('/api/login', {'email': 'new@example.com', 'password': 'another password'})['status'], 200)
+        dayplan_api.set_password(dayplan_api.connect(), 'new@example.com', PASSWORD)
         self.assertEqual(Client().post('/api/login', {'email': 'new@example.com', 'password': PASSWORD})['status'], 200)
 
 

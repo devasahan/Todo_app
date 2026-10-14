@@ -166,6 +166,37 @@ test('movePlan changes status and reorders the target column', () => {
   assert.equal(C.movePlan(plans, 'missing', 'done'), plans);
 });
 
+test('movePlan changes only the moved plan and marks it as changed', () => {
+  const later = new Date(2026, 9, 14, 11, 0);
+  const plans = [
+    plan({ id: 'a', status: 'todo', order: -5 }),
+    plan({ id: 'b', status: 'todo', order: -2 }),
+    plan({ id: 'c', status: 'todo', order: 7 }),
+    plan({ id: 'x', status: 'done', order: 0 }),
+  ];
+  const cases = [
+    ['b', 'a', ['b', 'a', 'c']], // to the top
+    ['a', 'c', ['b', 'a', 'c']], // between two
+    ['a', null, ['b', 'c', 'a']], // to the end
+  ];
+  for (const [id, before, expected] of cases) {
+    const moved = C.movePlan(plans, id, 'todo', before, later);
+    assert.deepEqual(C.sortPlans(moved.filter((p) => p.status === 'todo')).map((p) => p.id), expected);
+    const changed = [...C.changedPlanIds(plans, moved)];
+    assert.deepEqual(changed, [id], `only ${id} changes`);
+    assert.equal(moved.find((p) => p.id === id).updatedAt, later.toISOString());
+  }
+  // Into an empty column.
+  const done = C.movePlan(plans, 'x', 'in_progress', null, later);
+  assert.equal(done.find((p) => p.id === 'x').status, 'in_progress');
+});
+
+test('movePlan renumbers only when two orders leave no room in between', () => {
+  const plans = [plan({ id: 'a', order: 1 }), plan({ id: 'b', order: 1 + Number.EPSILON }), plan({ id: 'm', order: 50 })];
+  const moved = C.movePlan(plans, 'm', 'todo', 'b', NOW);
+  assert.deepEqual(C.sortPlans(moved).map((p) => p.id), ['a', 'm', 'b']);
+});
+
 test('filters match title, description, tags and steps', () => {
   const p = plan({ title: 'Write report', description: 'Q3 numbers', tags: ['work'], checklist: [{ text: 'charts' }] });
   assert.ok(C.matchesFilters(p, { query: 'report q3' }));

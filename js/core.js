@@ -370,8 +370,9 @@
   }
 
   /*
-   * Moves a plan into `toStatus`, placed before `beforeId` (or at the end),
-   * and renumbers that column so manual ordering stays stable.
+   * Moves a plan into `toStatus`, placed before `beforeId` (or at the end).
+   * Only the moved plan changes: it gets an order between its new
+   * neighbours, so moving one plan never rewrites (and re-syncs) the others.
    */
   function movePlan(plans, id, toStatus, beforeId = null, now = new Date()) {
     const plan = plans.find((p) => p.id === id);
@@ -383,16 +384,27 @@
     let index = beforeId ? column.findIndex((p) => p.id === beforeId) : -1;
     if (index < 0) index = column.length;
 
-    const moved = withStatus(plan, toStatus, now);
-    column.splice(index, 0, moved);
-    const orders = new Map(column.map((p, i) => [p.id, i]));
+    const above = column[index - 1];
+    const below = column[index];
+    let order;
+    if (above && below) order = (above.order + below.order) / 2;
+    else if (below) order = below.order - 1;
+    else if (above) order = above.order + 1;
+    else order = 0;
 
-    return plans.map((p) => {
-      const base = p.id === id ? moved : p;
-      return orders.has(p.id) && base.order !== orders.get(p.id)
-        ? { ...base, order: orders.get(p.id) }
-        : base;
-    });
+    const moved = { ...withStatus(plan, toStatus, now), order, updatedAt: now.toISOString() };
+    if (above && below && !(order > above.order && order < below.order)) {
+      // Ran out of room between two neighbours (very rare): renumber the column.
+      column.splice(index, 0, moved);
+      const orders = new Map(column.map((p, i) => [p.id, i]));
+      return plans.map((p) => {
+        if (p.id === id) return { ...moved, order: orders.get(id) };
+        return orders.has(p.id) && p.order !== orders.get(p.id)
+          ? { ...p, order: orders.get(p.id), updatedAt: now.toISOString() }
+          : p;
+      });
+    }
+    return plans.map((p) => (p.id === id ? moved : p));
   }
 
   function checklistProgress(plan) {
