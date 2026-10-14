@@ -1,7 +1,8 @@
 """WSGI entry point for hosting Dayplan on PythonAnywhere (or any WSGI host).
 
 It hands out the app's files (the page itself plus everything under css/
-and js/) and sends /api/ requests (accounts and plan sync) to dayplan_api.py.
+and js/, including the fonts in css/fonts/) and sends /api/ requests
+(accounts and plan sync) to dayplan_api.py.
 Nothing else in the repository (README, tests, .git, ...) is reachable.
 
 On PythonAnywhere, point the web app's WSGI configuration file here:
@@ -25,7 +26,10 @@ CONTENT_TYPES = {
     '.svg': 'image/svg+xml',
     '.png': 'image/png',
     '.ico': 'image/x-icon',
+    '.woff2': 'font/woff2',
 }
+# Font files never change under the same name, so browsers may keep them.
+LONG_CACHE = ('.woff2',)
 
 
 def find_file(url_path):
@@ -68,8 +72,8 @@ def application(environ, start_response):
     start_response('200 OK', [
         ('Content-Type', CONTENT_TYPES[file.suffix]),
         ('Content-Length', str(len(body))),
-        # Always check for a newer copy, so updates show up after a reload.
-        ('Cache-Control', 'no-cache'),
+        # Otherwise always check for a newer copy, so updates show up after a reload.
+        ('Cache-Control', 'public, max-age=31536000, immutable' if file.suffix in LONG_CACHE else 'no-cache'),
         ('X-Content-Type-Options', 'nosniff'),
     ])
     return [b''] if method == 'HEAD' else [body]

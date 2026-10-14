@@ -20,16 +20,23 @@
     chevronLeft: '<path d="M15 6l-6 6 6 6"/>',
     chevronRight: '<path d="M9 6l6 6-6 6"/>',
     clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
-    flag: '<path d="M5 21V4M5 4h11l-2 4 2 4H5"/>',
     flame: '<path d="M12 3c1 3 5 5 5 10a5 5 0 0 1-10 0c0-2 1-3.5 2-4.5 0 2 1 3 2 3 0-3-1-5 1-8.5z"/>',
+    halfCircle: '<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/>',
     play: '<path d="M8 5.5v13l10-6.5z"/>',
     plus: '<path d="M12 5v14M5 12h14"/>',
+    // Signal bars: one, two or three lit for low, medium and high priority.
+    priorityHigh: '<path d="M5 20v-5M12 20v-10M19 20V5"/>',
+    priorityMedium: '<path d="M5 20v-5M12 20v-10"/><path class="dim" d="M19 20V5"/>',
+    priorityLow: '<path d="M5 20v-5"/><path class="dim" d="M12 20v-10M19 20V5"/>',
     sparkle: '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/>',
     steps: '<path d="M10 6h10M10 12h10M10 18h10"/><path d="M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"/>',
     target: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
     x: '<path d="M6 6l12 12M18 6L6 18"/>',
   };
   const icon = (name) => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
+  const PRIORITY_ICONS = { high: 'priorityHigh', medium: 'priorityMedium', low: 'priorityLow' };
+  const priorityChip = (priority) =>
+    `<span class="chip prio-${priority}" title="${C.PRIORITY_LABELS[priority]} priority">${icon(PRIORITY_ICONS[priority])}${C.PRIORITY_LABELS[priority]}</span>`;
 
   /* -------------------------------------------------------------- storage */
 
@@ -253,6 +260,8 @@
       if (tab.dataset.view === view) tab.setAttribute('aria-current', 'page');
       else tab.removeAttribute('aria-current');
     }
+    renderHeading(view);
+    renderSidebarTags();
     renderFilters();
     const html = view === 'board' ? boardHTML() : view === 'calendar' ? calendarHTML() : todayHTML();
     // Replace the page only when something changed: the once-a-minute refresh
@@ -295,10 +304,70 @@
     document.title = urgent ? `(${urgent}) Dayplan` : 'Dayplan';
   }
 
+  // Replaces a box's content only when it changed, keeping keyboard focus on
+  // the same control (matched by its data attributes).
+  const shownHTML = new WeakMap();
+
+  function setHTML(box, html) {
+    if (shownHTML.get(box) === html) return;
+    const active = document.activeElement;
+    let key = null;
+    if (active && box.contains(active)) {
+      const attr = ['data-tag', 'data-filter', 'data-action'].find((a) => active.hasAttribute(a));
+      if (attr) key = `[${attr}="${CSS.escape(active.getAttribute(attr))}"]`;
+    }
+    box.innerHTML = html;
+    shownHTML.set(box, html);
+    if (key) box.querySelector(key)?.focus({ preventScroll: true });
+  }
+
+  function setText(el, text) {
+    if (el.textContent !== text) el.textContent = text;
+  }
+
+  const VIEW_TITLES = { today: 'Today', board: 'Board', calendar: 'Calendar' };
+
+  function renderHeading(view) {
+    const now = new Date();
+    let subtitle = '';
+    if (view === 'today') {
+      subtitle = now.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+    } else if (view === 'board') {
+      const stats = C.computeStats(state.plans, now);
+      subtitle = state.plans.length
+        ? `${stats.todo} to do · ${stats.in_progress} in progress · ${stats.done} done`
+        : 'Your plans by status';
+    } else {
+      const month = state.calendarMonth;
+      const prefix = C.toISODate(month).slice(0, 7);
+      const due = state.plans.filter((p) => p.dueDate.startsWith(prefix)).length;
+      const name = month.toLocaleDateString(undefined, { month: 'long' });
+      subtitle = due ? `${due} ${due === 1 ? 'plan' : 'plans'} due in ${name}` : `No plans due in ${name}`;
+    }
+    setText($('#page-title'), VIEW_TITLES[view]);
+    setText($('#page-subtitle'), subtitle);
+  }
+
+  function renderSidebarTags() {
+    const tags = C.allTags(state.plans);
+    $('#sidebar-tags-section').hidden = !tags.length;
+    setHTML(
+      $('#sidebar-tags'),
+      tags
+        .map((t) => {
+          const on = t.name === state.filters.tag;
+          return `<button type="button" class="sidebar-tag" data-tag="${esc(t.name)}" aria-pressed="${on}" title="Show only #${esc(t.name)}">
+            <span class="tag-hash" aria-hidden="true">#</span><span class="tag-name">${esc(t.name)}</span><span class="tag-count">${t.count}</span>
+          </button>`;
+        })
+        .join('')
+    );
+  }
+
   function renderFilters() {
     const box = $('#filters');
     if (!state.plans.length) {
-      box.innerHTML = '';
+      setHTML(box, '');
       return;
     }
     const { tag, priority } = state.filters;
@@ -310,10 +379,14 @@
     const option = (value, label, current) =>
       `<option value="${value}"${value === current ? ' selected' : ''}>${label}</option>`;
 
-    box.innerHTML = `
-      <div class="filter-chips" role="group" aria-label="Filter by tag">
-        ${tags.length ? pill('', 'All tags') + tags.map((t) => pill(t.name, `#${esc(t.name)}`, t.count)).join('') : ''}
-      </div>
+    setHTML(box, `
+      ${
+        tags.length
+          ? `<div class="filter-chips" role="group" aria-label="Filter by tag">
+              ${pill('', 'All tags') + tags.map((t) => pill(t.name, `#${esc(t.name)}`, t.count)).join('')}
+            </div>`
+          : ''
+      }
       <div class="filter-controls">
         <label class="select">
           <span class="sr-only">Filter by priority</span>
@@ -333,7 +406,7 @@
             : ''
         }
         ${filtersActive() ? `<button type="button" class="pill" data-action="clear-filters">${icon('x')} Clear filters</button>` : ''}
-      </div>`;
+      </div>`);
   }
 
   function statusButton(plan) {
@@ -351,7 +424,8 @@
         `<span class="chip due due-${due.state}" title="${esc(due.full)}">${icon(due.state === 'overdue' ? 'alert' : 'clock')}${esc(due.label)}</span>`
       );
     }
-    if (plan.priority === 'high') parts.push(`<span class="chip prio-high">${icon('flag')}High</span>`);
+    // Medium is the default, so only the exceptions are pointed out.
+    if (plan.priority !== 'medium') parts.push(priorityChip(plan.priority));
     if (progress.total) {
       const complete = progress.done === progress.total ? ' complete' : '';
       parts.push(`<span class="chip steps${complete}" title="Steps done">${icon('steps')}${progress.done}/${progress.total}</span>`);
@@ -433,17 +507,11 @@
 
     const circumference = 2 * Math.PI * 52;
     const ringOffset = circumference * (1 - stats.todayPct / 100);
-    const pills = [
-      `<span class="stat"><span><strong>${stats.dueToday}</strong> due today</span></span>`,
-      stats.overdue
-        ? `<span class="stat warn">${icon('alert')}<span><strong>${stats.overdue}</strong> overdue</span></span>`
-        : '',
-      `<span class="stat"><span><strong>${stats.in_progress}</strong> in progress</span></span>`,
-      `<span class="stat"><span><strong>${stats.doneThisWeek}</strong> done this week</span></span>`,
-      stats.streak
-        ? `<span class="stat streak" title="Days in a row with at least one plan finished">${icon('flame')}<span><strong>${stats.streak}</strong>-day streak</span></span>`
-        : '',
-    ].join('');
+    const kpi = (label, value, iconName, kind = '') => `
+      <div class="kpi${kind ? ` ${kind}` : ''}">
+        <span class="kpi-label">${icon(iconName)}${label}</span>
+        <strong class="kpi-value">${value}</strong>
+      </div>`;
 
     const section = (key, title, list) =>
       list.length
@@ -473,23 +541,35 @@
       : '';
 
     return `
-      <section class="hero">
-        <div class="hero-text">
-          <p class="eyebrow">${esc(now.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' }))}</p>
-          <h1>${greeting(now)}</h1>
-          <p class="hero-sub">${esc(summary)}</p>
-          <div class="stat-pills">${pills}</div>
-        </div>
-        <div class="ring" role="img" aria-label="${stats.doneToday} of ${stats.todayTotal} plans for today done">
-          <svg viewBox="0 0 120 120" aria-hidden="true">
-            <circle class="ring-track" cx="60" cy="60" r="52"/>
-            <circle class="ring-value${stats.todayTotal && !remaining ? ' complete' : ''}" cx="60" cy="60" r="52"
-              stroke-dasharray="${circumference.toFixed(1)}" stroke-dashoffset="${ringOffset.toFixed(1)}"/>
-          </svg>
-          <div class="ring-label">
-            <strong>${stats.todayTotal ? `${stats.doneToday}/${stats.todayTotal}` : icon('sparkle')}</strong>
-            <span>${stats.todayTotal ? 'done today' : 'clear day'}</span>
+      <section class="hero" aria-label="Today at a glance">
+        <div class="hero-card">
+          <div class="hero-text">
+            <p class="eyebrow hero-date">${esc(now.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' }))}</p>
+            <h2 class="hero-title">${greeting(now)}</h2>
+            <p class="hero-sub">${esc(summary)}</p>
+            ${
+              stats.streak
+                ? `<p class="streak" title="Days in a row with at least one plan finished">${icon('flame')}${stats.streak}-day streak</p>`
+                : ''
+            }
           </div>
+          <div class="ring" role="img" aria-label="${stats.doneToday} of ${stats.todayTotal} plans for today done">
+            <svg viewBox="0 0 120 120" aria-hidden="true">
+              <circle class="ring-track" cx="60" cy="60" r="52"/>
+              <circle class="ring-value${stats.todayTotal && !remaining ? ' complete' : ''}" cx="60" cy="60" r="52"
+                stroke-dasharray="${circumference.toFixed(1)}" stroke-dashoffset="${ringOffset.toFixed(1)}"/>
+            </svg>
+            <div class="ring-label">
+              <strong>${stats.todayTotal ? `${stats.doneToday}/${stats.todayTotal}` : icon('sparkle')}</strong>
+              <span>${stats.todayTotal ? 'done today' : 'clear day'}</span>
+            </div>
+          </div>
+        </div>
+        <div class="kpis">
+          ${kpi('Due today', stats.dueToday, 'clock')}
+          ${kpi('Overdue', stats.overdue, 'alert', stats.overdue ? 'warn' : '')}
+          ${kpi('In progress', stats.in_progress, 'halfCircle')}
+          ${kpi('Done this week', stats.doneThisWeek, 'check', 'good')}
         </div>
       </section>
       ${focus ? focusHTML(focus, now) : ''}
@@ -1194,7 +1274,7 @@
       const due = C.dueInfo({ ...parsed, status: 'todo' });
       chips.push(`<span class="chip due due-${due.state}">${icon('clock')}${esc(due.full)}</span>`);
     }
-    if (parsed.priority) chips.push(`<span class="chip prio-${parsed.priority}">${icon('flag')}${C.PRIORITY_LABELS[parsed.priority]}</span>`);
+    if (parsed.priority) chips.push(priorityChip(parsed.priority));
     for (const t of parsed.tags) chips.push(`<span class="chip tag">#${esc(t)}</span>`);
     box.innerHTML = chips.length
       ? `<span class="qa-title">${parsed.title ? `“${esc(truncate(parsed.title, 60))}”` : '<em>Needs a title</em>'}</span>${chips.join('')}`
@@ -1264,7 +1344,7 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     const origin = point || { x: window.innerWidth / 2, y: window.innerHeight / 3 };
-    const colors = ['#5b5bd6', '#22a06b', '#f5a524', '#e5484d', '#3e8ef7', '#d6409f'];
+    const colors = ['#4f46e5', '#10b981', '#f59e0b', '#ef4444', '#3b82f6', '#ec4899'];
     const pieces = Array.from({ length: 90 }, () => {
       const angle = Math.random() * Math.PI * 2;
       const speed = 3 + Math.random() * 7;
@@ -1325,7 +1405,12 @@
       : window.matchMedia('(prefers-color-scheme: dark)').matches;
     state.prefs.theme = dark ? 'light' : 'dark';
     savePrefs();
+    // Switch every color at once instead of letting each one fade.
+    const root = document.documentElement;
+    root.classList.add('theme-switching');
     applyTheme();
+    void window.getComputedStyle(root).color; // apply the new colors before transitions return
+    requestAnimationFrame(() => root.classList.remove('theme-switching'));
   }
 
   /* ------------------------------------------------------- menu & import */
@@ -1763,6 +1848,9 @@
     }
     keepUnsentDeletes(email, deleted);
     clearSyncState();
+    auth.mode = 'signin';
+    authField('email').value = email;
+    authField('password').value = '';
     updateAccountUI();
     render();
     toast('You were signed out. Sign in again to keep your plans in sync.', {
@@ -1792,6 +1880,8 @@
     }
     clearSyncState();
     removeStorage(UNSENT_DELETES_KEY);
+    auth.mode = 'signin';
+    auth.form.reset();
     // Plans are safe in the account; don't leave them on a shared computer.
     // (Set directly, not through setPlans: clearing this browser is not a deletion.)
     state.plans = [];
@@ -1830,39 +1920,45 @@
   }
 
   // On a site with accounts the planner is only for signed-in people: anyone
-  // else sees a sign-in screen. Opened as a plain file, there's no gate.
-  let gateHTML = '';
+  // else sees a sign-in page. Opened as a plain file, there's no gate.
+  let gateStatusHTML = '';
+  let gateFormShown = false;
 
   function updateGate() {
     const show = !sync.user && sync.server !== 'none';
     $('#gate').hidden = !show;
     document.body.classList.toggle('gated', show);
-    $('.topbar').inert = show;
-    $('.page').inert = show;
-    if (!show) return;
-
+    $('.shell').inert = show;
+    const ready = show && sync.server === 'ok';
+    $('#gate-status').hidden = ready;
+    $('#auth').hidden = !ready;
+    if (!show) {
+      gateFormShown = false;
+      return;
+    }
+    if (ready) {
+      renderAuthMode();
+      if (!gateFormShown) {
+        gateFormShown = true;
+        // Ready to type on computers; phones don't pop up the keyboard unasked.
+        const fine = window.matchMedia('(pointer: fine)').matches;
+        if (fine && !$('#gate').contains(document.activeElement)) {
+          (authField('email').value ? authField('password') : authField('email')).focus();
+        }
+      }
+      return;
+    }
+    gateFormShown = false;
     let text = 'Connecting…';
     let actions = '';
-    let note = '';
-    const button = (kind, action, label) => `<button type="button" class="btn ${kind}" data-gate="${action}">${label}</button>`;
     if (sync.server === 'unreachable') {
       text = "Can't reach the server right now. Check your connection.";
-      actions = button('primary', 'retry', 'Try again');
-    } else if (sync.server === 'ok' && sync.first) {
-      text = 'Welcome! Nobody has an account here yet.';
-      actions = button('primary', 'signup', 'Create the first account');
-      note = 'The first account becomes the admin, who approves everyone else.';
-    } else if (sync.server === 'ok') {
-      text = 'Sign in to see your plans.';
-      actions = button('primary', 'signin', 'Sign in') + (sync.signupOpen ? button('ghost', 'signup', 'Create an account') : '');
-      note = sync.signupOpen ? 'New accounts can be used once the admin approves them.' : '';
+      actions = '<button type="button" class="btn primary" data-gate="retry">Try again</button>';
     }
-    const html = `${text}|${actions}|${note}`;
-    if (html === gateHTML) return; // don't rebuild (and lose focus) for nothing
-    gateHTML = html;
+    if (`${text}|${actions}` === gateStatusHTML) return; // don't rebuild (and lose focus) for nothing
+    gateStatusHTML = `${text}|${actions}`;
     $('#gate-text').textContent = text;
     $('#gate-actions').innerHTML = actions;
-    $('#gate-note').textContent = note;
   }
 
   // The admin sees how many people are waiting, on the avatar and in the menu.
@@ -1900,42 +1996,57 @@
     return true;
   }
 
-  /* ---- sign-in dialog */
+  /* ---- sign-in form */
 
-  const auth = { dialog: $('#auth'), form: $('#auth-form'), mode: 'signin', busy: false };
+  const auth = { root: $('#auth'), form: $('#auth-form'), mode: 'signin', busy: false, requested: '' };
   const authField = (name) => auth.form.elements.namedItem(name);
 
+  // Shows the sign-in page in `mode` (signin or signup), e.g. from a
+  // "Sign in" button on a notice.
   function openAuth(mode = 'signin', email = '') {
-    if (!sync.available || !ensureHttps()) return;
-    auth.mode = mode === 'signup' && sync.signupOpen ? 'signup' : 'signin';
+    if (!ensureHttps()) return;
+    auth.mode = mode;
     auth.requested = '';
-    renderAuthMode();
     if (email) authField('email').value = email;
     authField('password').value = '';
     $('#auth-error').hidden = true;
-    auth.dialog.showModal();
-    (authField('email').value ? authField('password') : authField('email')).focus();
+    updateGate();
+    if (!auth.root.hidden) (authField('email').value ? authField('password') : authField('email')).focus();
+  }
+
+  function switchAuthMode(mode) {
+    if (mode === auth.mode) return;
+    auth.mode = mode;
+    $('#auth-error').hidden = true;
+    renderAuthMode();
   }
 
   function renderAuthMode() {
+    // Until an account exists, the only thing to do is create the first one.
+    if (sync.first && auth.mode === 'signin') auth.mode = 'signup';
+    if (auth.mode === 'signup' && !sync.signupOpen) auth.mode = 'signin';
     const signup = auth.mode === 'signup';
     const requested = auth.mode === 'requested';
-    $('#auth-heading').textContent = requested ? 'Request sent' : signup ? 'Create your account' : 'Sign in';
-    let intro = 'Sign in to see your plans in any browser.';
+    $('#auth-tabs').hidden = requested || sync.first || !sync.signupOpen;
+    for (const tab of $$('#auth-tabs [role="tab"]')) {
+      const selected = tab.dataset.gate === auth.mode;
+      tab.setAttribute('aria-selected', String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+    }
+    setText($('#auth-heading'), requested ? 'Request sent' : signup ? 'Create your account' : 'Sign in');
+    let intro = 'Welcome back. Sign in to see your plans.';
     if (requested) intro = auth.requested;
     else if (signup && sync.first) {
-      intro = "You're the first person here, so this account will be the admin. Your plans are saved to it, so you can open them in any browser.";
+      intro = "You're the first person here, so this account will be the admin, who approves everyone else.";
     } else if (signup) {
-      intro = 'Your plans will be saved to this account, so you can open them in any browser. The admin approves new accounts before you can sign in.';
+      intro = 'Your plans are saved to your account, so you can open them in any browser. The admin approves new accounts before you can sign in.';
     }
-    $('#auth-intro').textContent = intro;
+    setText($('#auth-intro'), intro);
     $('#auth-fields').hidden = requested;
-    $('#auth-submit').textContent = requested ? 'OK' : signup ? 'Create account' : 'Sign in';
+    setText($('#auth-submit'), requested ? 'Back to sign in' : signup ? 'Create account' : 'Sign in');
     authField('password').setAttribute('autocomplete', signup ? 'new-password' : 'current-password');
     $('#auth-hint').hidden = !signup;
-    const toggle = $('#auth-switch');
-    toggle.hidden = requested || !sync.signupOpen;
-    toggle.textContent = signup ? 'I already have an account' : 'Create an account';
+    setText($('#gate-note'), signup || requested ? '' : 'Forgot your password? Ask the site admin to reset it.');
   }
 
   function showAuthError(message) {
@@ -1947,7 +2058,8 @@
   async function submitAuth() {
     if (auth.busy) return;
     if (auth.mode === 'requested') {
-      auth.dialog.close();
+      switchAuthMode('signin');
+      authField('email').focus();
       return;
     }
     const signup = auth.mode === 'signup';
@@ -1969,8 +2081,8 @@
       authField('password').value = '';
       if (result.pending) {
         // Later sign-ups wait for the admin: say so instead of signing in.
-        if (!auth.dialog.open) {
-          toast(result.message); // closed while the request was running
+        if (auth.root.hidden) {
+          toast(result.message); // signed in elsewhere while the request was running
           return;
         }
         auth.mode = 'requested';
@@ -1980,7 +2092,6 @@
         $('#auth-submit').focus();
         return;
       }
-      auth.dialog.close();
       sync.first = false;
       const brought = state.plans.length;
       await startSession(result.user.email, result.user.admin);
@@ -1996,7 +2107,7 @@
       }
     } catch (err) {
       if (signup && err.status === 403) {
-        // Sign-ups were stopped while this dialog was open.
+        // Sign-ups were stopped while this page was open.
         sync.signupOpen = false;
         auth.mode = 'signin';
         renderAuthMode();
@@ -2005,7 +2116,7 @@
       } else {
         showAuthError(err.status ? err.message : "Couldn't reach the server. Check your connection and try again.");
       }
-      if (auth.dialog.open) {
+      if (!auth.root.hidden) {
         $('#auth-submit').disabled = false;
         authField(authField('email').value ? 'password' : 'email').focus();
       }
@@ -2023,13 +2134,15 @@
     auth.form.addEventListener('input', () => {
       $('#auth-error').hidden = true;
     });
-    $('#auth-switch').addEventListener('click', () => {
-      auth.mode = auth.mode === 'signup' ? 'signin' : 'signup';
-      renderAuthMode();
-      $('#auth-error').hidden = true;
-      authField('email').focus();
+    // Sign in / Create account tabs; arrow keys move between them.
+    const tabs = $('#auth-tabs');
+    tabs.addEventListener('keydown', (e) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+      e.preventDefault();
+      const mode = e.key === 'ArrowLeft' || e.key === 'Home' ? 'signin' : 'signup';
+      switchAuthMode(mode);
+      $(`[data-gate="${mode}"]`, tabs).focus();
     });
-    for (const btn of $$('#auth [data-close]')) btn.addEventListener('click', () => auth.dialog.close());
 
     const menu = $('#account');
     menu.addEventListener('click', async (e) => {
@@ -2066,7 +2179,7 @@
         updateGate();
         connectToServer();
       } else {
-        openAuth(btn.dataset.gate);
+        switchAuthMode(btn.dataset.gate);
       }
     });
 
@@ -2469,10 +2582,20 @@
     setPlaceholder();
     narrow.addEventListener('change', setPlaceholder);
     for (const tab of $$('.view-tab')) tab.addEventListener('click', () => setView(tab.dataset.view));
-    $('.brand').addEventListener('click', (e) => {
-      e.preventDefault();
-      setView('today');
+    for (const brand of $$('.shell .brand')) {
+      brand.addEventListener('click', (e) => {
+        e.preventDefault();
+        setView('today');
+      });
+    }
+    $('#new-plan').addEventListener('click', () =>
+      openEditor(null, state.prefs.view === 'calendar' ? { dueDate: state.selectedDay } : {})
+    );
+    $('#sidebar-tags').addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-tag]');
+      if (btn) setTagFilter(btn.dataset.tag);
     });
+    for (const btn of $$('[data-open="shortcuts"]')) btn.addEventListener('click', () => $('#shortcuts').showModal());
     $('#theme-toggle').addEventListener('click', toggleTheme);
     $('#toast').addEventListener('mouseenter', () => clearTimeout(toastTimer));
     $('#toast').addEventListener('mouseleave', () => {

@@ -42,6 +42,16 @@ class ServesTheApp(unittest.TestCase):
             self.assertEqual(headers['Content-Type'], content_type)
             self.assertEqual(headers['Content-Length'], str(len(body)))
 
+    def test_fonts(self):
+        status, headers, body = request('/css/fonts/inter-latin.woff2')
+        self.assertEqual(status, '200 OK')
+        self.assertEqual(headers['Content-Type'], 'font/woff2')
+        self.assertTrue(body.startswith(b'wOF2'))
+        self.assertIn('immutable', headers['Cache-Control'])
+        # Everything else is checked for updates on every load.
+        self.assertEqual(request('/css/styles.css')[1]['Cache-Control'], 'no-cache')
+        self.assertTrue(request('/css/fonts/OFL.txt')[0].startswith('404'))
+
     def test_head_has_no_body(self):
         status, headers, body = request('/', method='HEAD')
         self.assertEqual(status, '200 OK')

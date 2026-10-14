@@ -72,7 +72,7 @@ Click **Save**.
 **6. Go live.** Scroll up on the **Web** tab and click the green **Reload** button.
 
 **7. Create your Dayplan account right away.** Open `https://yourname.pythonanywhere.com`. You'll
-see a sign-in screen: click **Create the first account** and use your email and a new password that
+see a sign-in page that offers to **Create your account**: use your email and a new password that
 you don't use anywhere else. **The first account on the site becomes its admin**, so do this
 before you share the address with anyone.
 
@@ -82,14 +82,14 @@ instead of being signed in. Fix it from a Bash console with
 needed and asks you for a password. Then sign in and use **Manage users** to turn off and delete
 the other account.)
 
-On any other browser or phone, open the same address, click **Sign in** and use the same email and
-password. Your plans appear and stay in sync.
+On any other browser or phone, open the same address and sign in with the same email and password.
+Your plans appear and stay in sync.
 
 Nobody can use the planner on your site without signing in: visitors only see the sign-in screen.
 
 ### Letting other people use your site
 
-Like most websites, anyone can click **Create an account** on the sign-in screen. Their account then
+Like most websites, anyone can open the **Create account** tab on the sign-in screen. Their account then
 waits for you: they see *"Request sent"*, and they can't sign in or use the planner until you
 approve them. (Sign-up gives the
 same answer whether or not an email already has an account, so strangers can't use it to find out
@@ -164,7 +164,7 @@ They're added to your account and appear on every device you sign in on.
 
 | View         | What it's for                                                                                                                                                                                                  |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Today**    | Your daily dashboard: a greeting, a progress ring for what's due today, your streak, a **Focus now** card with the single most urgent plan, then *Overdue*, *Due today*, *In progress* and *Next 7 days*. |
+| **Today**    | Your daily dashboard: a greeting, a progress ring for what's due today, tiles for *due today*, *overdue*, *in progress* and *done this week*, your streak, a **Focus now** card with the single most urgent plan, then *Overdue*, *Due today*, *In progress* and *Next 7 days*. |
 | **Board**    | A Kanban board with **To do / In progress / Done** columns. Drag cards between columns or reorder them. Sort by your own order, deadline, priority or newest.                                                 |
 | **Calendar** | A month view of deadlines. Drag a plan onto another day to reschedule it, double-click a day to add a plan, or drop a plan into **No deadline** to clear its date.                                          |
 
@@ -178,8 +178,8 @@ They're added to your account and appear on every device you sign in on.
   means in progress, a check means done. Finishing a plan gets a small confetti burst.
 - **Steps**: break a plan into a checklist, with a progress bar on the card. When every step is
   checked, the app offers to mark the whole plan done.
-- **Priority** (low / medium / high), shown as a colored stripe on each card.
-- **Tags** like `#work` or `#home`. Click a tag anywhere to filter by it.
+- **Priority** (low / medium / high). High and low plans are marked on their cards with signal bars.
+- **Tags** like `#work` or `#home`. Click a tag in the sidebar (or on a card) to filter by it.
 - Start, finish and duration are recorded automatically ("took 2 days").
 
 ### Quick add with natural language
@@ -211,8 +211,9 @@ Press <kbd>Shift</kbd>+<kbd>Enter</kbd> to open the full editor with the parsed 
 - **Dark mode** that follows your system, with a manual toggle.
 - **Backups**: export all plans to a `.json` file and import them again from the **⋯** menu.
   Importing merges by plan, so re-importing the same backup never creates duplicates.
-- Works on phones: the board columns become swipeable panels, the calendar shows dots, and the
-  editor opens as a bottom sheet.
+- **New plan** button in the top bar opens the full editor (on the calendar, for the selected day).
+- Works on phones: the views move to a tab bar at the bottom, the board columns become swipeable
+  panels, the calendar shows dots, and the editor opens as a bottom sheet.
 - Stays in sync across open tabs, and deadline labels refresh every minute.
 
 ### Keyboard shortcuts
@@ -267,8 +268,9 @@ How it's protected:
 ## Project layout
 
 ```
-index.html          Page structure, editor dialog and shortcut sheet
-css/styles.css      All styling, light/dark themes and mobile layouts
+index.html          Page structure: sidebar, top bar, sign-in page, editor and dialogs
+css/styles.css      All styling, light/dark themes and phone layouts
+css/fonts/          The Inter font (SIL Open Font License), served with the app
 js/core.js          Pure logic: plan model, quick-add parser, deadlines, sorting, stats
 js/app.js           UI: rendering, drag & drop, editor, storage, sign-in and sync
 dayplan_wsgi.py     Serves the app on PythonAnywhere (only index.html, css/ and js/)
