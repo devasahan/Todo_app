@@ -16,7 +16,58 @@ If you'd rather serve it locally:
 npm start        # serves the app on http://localhost:5173
 ```
 
-Because it's static, you can host it anywhere you can put HTML files, such as GitHub Pages.
+Because it's static, you can host it anywhere you can put HTML files. Step-by-step instructions
+for PythonAnywhere are below.
+
+## Put it online with PythonAnywhere (free)
+
+This gives Dayplan its own address, like `https://yourname.pythonanywhere.com`, that you can open
+from any browser. You can use the same email address as another PythonAnywhere account. Each
+account just needs its own username, and you sign in with the username.
+
+**1. Create the account.** On [pythonanywhere.com](https://www.pythonanywhere.com), choose
+*Pricing & signup*, then *Create a Beginner account*. The username you pick becomes your web
+address, so `dayplan` gives you `dayplan.pythonanywhere.com`.
+
+**2. Copy Dayplan into your account.** Open the **Consoles** tab, start a **Bash** console and run:
+
+```bash
+git clone https://github.com/devasahan/Todo_app.git
+```
+
+**3. Create the web app.** Open the **Web** tab, click **Add a new web app**, then **Next**.
+Choose **Manual configuration** (not Flask or Django), pick the newest Python version and click
+**Next**.
+
+**4. Point the web app at Dayplan.** Still on the **Web** tab, find the **Code** section and click
+the link next to **WSGI configuration file** (it looks like
+`/var/www/yourname_pythonanywhere_com_wsgi.py`). Delete everything in that file and paste these
+three lines, replacing `yourname` with your username:
+
+```python
+import sys
+sys.path.insert(0, '/home/yourname/Todo_app')
+from dayplan_wsgi import application
+```
+
+Click **Save**.
+
+**5. Go live.** Back on the **Web** tab, click the green **Reload** button and open
+`https://yourname.pythonanywhere.com`.
+
+**Keep it running.** Free web apps are switched off if they aren't extended. About once a month,
+log in and click the button on the **Web** tab that extends the app for another month.
+
+**Get updates later.** When the code on GitHub changes, run this in a Bash console, then press
+**Reload** on the **Web** tab:
+
+```bash
+cd ~/Todo_app && git pull
+```
+
+Your plans live in your browser, not on PythonAnywhere, so updating or reloading never touches
+them. A new address starts out empty: use **Export backup** and **Import backup** in the **⋯** menu
+to bring plans over from another copy.
 
 ## What you can do
 
@@ -101,14 +152,16 @@ index.html          Page structure, editor dialog and shortcut sheet
 css/styles.css      All styling, light/dark themes and mobile layouts
 js/core.js          Pure logic: plan model, quick-add parser, deadlines, sorting, stats
 js/app.js           UI: rendering, drag & drop, editor, storage, shortcuts
-tests/core.test.js  Unit tests for js/core.js
+dayplan_wsgi.py     Serves the app on PythonAnywhere (only index.html, css/ and js/)
+tests/              Unit tests for js/core.js and dayplan_wsgi.py
 ```
 
 `js/core.js` doesn't touch the page at all, so all the rules (date parsing, what counts as
 overdue, streaks and so on) are covered by fast unit tests:
 
 ```bash
-npm test
+npm test               # app logic, with Node's built-in test runner (Node 18+)
+npm run test:server    # dayplan_wsgi.py, with Python's unittest (Python 3.9+)
 ```
 
-No dependencies are needed. The tests use Node's built-in test runner (Node 18+).
+No dependencies need to be installed.
