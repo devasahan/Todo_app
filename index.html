@@ -77,6 +77,10 @@
               <input id="search" type="search" placeholder="Search" aria-label="Search plans" autocomplete="off" />
               <kbd>/</kbd>
             </label>
+            <button type="button" class="btn ghost new-meeting" id="new-meeting" title="New meeting (M)" aria-label="New meeting">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="12" height="12" rx="2" /><path d="M15 10.5l6-3.5v10l-6-3.5z" /></svg>
+              <span>New meeting</span>
+            </button>
             <button type="button" class="btn primary new-plan" id="new-plan" title="New plan">
               <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
               <span>New plan</span>
@@ -90,6 +94,8 @@
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.2" /><circle cx="12" cy="12" r="1.2" /><circle cx="19" cy="12" r="1.2" /></svg>
               </summary>
               <div class="menu-list" role="menu">
+                <button type="button" role="menuitem" data-menu="new-meeting">New meeting <kbd>M</kbd></button>
+                <hr />
                 <button type="button" role="menuitem" data-menu="export">Export backup (.json)</button>
                 <button type="button" role="menuitem" data-menu="import">Import backup…</button>
                 <button type="button" role="menuitem" data-menu="samples">Add sample plans</button>
@@ -216,19 +222,26 @@
         </header>
 
         <div class="modal-body">
+          <fieldset class="field">
+            <legend class="sr-only">Type</legend>
+            <div class="segmented kind-switch" id="kind-options"></div>
+            <span class="field-hint" id="kind-hint" hidden>Saving this as a plan removes the company and links.</span>
+          </fieldset>
+
+          <label class="field meeting-only" hidden>
+            <span class="label">Company</span>
+            <input name="company" type="text" maxlength="120" autocomplete="off" list="company-suggestions" placeholder="e.g. Acme Inc." />
+          </label>
+          <datalist id="company-suggestions"></datalist>
+
           <label class="field">
-            <span class="label">Title</span>
+            <span class="label" id="title-label">Title</span>
             <input name="title" type="text" maxlength="200" placeholder="What's the plan?" required />
             <span class="field-error" id="title-error" hidden>Give your plan a title.</span>
           </label>
 
-          <label class="field">
-            <span class="label">Description</span>
-            <textarea name="description" rows="3" maxlength="5000" placeholder="Notes, links, context…"></textarea>
-          </label>
-
           <fieldset class="field">
-            <legend class="label">Deadline</legend>
+            <legend class="label" id="due-legend">Deadline</legend>
             <div class="deadline-inputs">
               <input name="dueDate" type="date" aria-label="Deadline date" />
               <input name="dueTime" type="time" aria-label="Deadline time (optional)" />
@@ -237,9 +250,51 @@
               <button type="button" class="pill" data-due="0">Today</button>
               <button type="button" class="pill" data-due="1">Tomorrow</button>
               <button type="button" class="pill" data-due="next-week">Next week</button>
-              <button type="button" class="pill" data-due="">No deadline</button>
+              <button type="button" class="pill plan-only" data-due="">No deadline</button>
             </div>
+            <span class="field-hint meeting-only" id="zone-hint" hidden></span>
           </fieldset>
+
+          <label class="field meeting-only" hidden>
+            <span class="label">Meeting link</span>
+            <input
+              name="meetingUrl"
+              type="url"
+              inputmode="url"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              placeholder="Paste the Zoom, Teams or Google Meet link"
+            />
+            <span class="field-error" id="meeting-url-error" hidden>This doesn't look like a web link. Paste the full link, starting with https://</span>
+          </label>
+
+          <label class="field meeting-only" hidden>
+            <span class="label">Job description link</span>
+            <input
+              name="jobUrl"
+              type="url"
+              inputmode="url"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              placeholder="Paste the link to the job posting"
+            />
+            <span class="field-error" id="job-url-error" hidden>This doesn't look like a web link. Paste the full link, starting with https://</span>
+          </label>
+
+          <div class="field ics-row" id="editor-ics-row" hidden>
+            <button type="button" class="btn ghost small" id="editor-ics">
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2" /><path d="M3 10h18M8 3v4M16 3v4M12 13v5M9.5 15.5h5" /></svg>
+              Add to my calendar
+            </button>
+            <span class="field-hint" id="ics-hint"></span>
+          </div>
+
+          <label class="field">
+            <span class="label" id="description-label">Description</span>
+            <textarea name="description" rows="3" maxlength="5000" placeholder="Notes, links, context…"></textarea>
+          </label>
 
           <div class="field-grid">
             <fieldset class="field">
@@ -282,7 +337,7 @@
           <button type="button" class="btn danger" id="editor-delete">Delete</button>
           <span class="spacer"></span>
           <button type="button" class="btn ghost" data-close>Cancel</button>
-          <button type="submit" class="btn primary">Save plan</button>
+          <button type="submit" class="btn primary" id="editor-save">Save plan</button>
         </footer>
       </form>
     </dialog>
@@ -318,6 +373,7 @@
       </header>
       <dl class="shortcut-list">
         <div><dt><kbd>N</kbd></dt><dd>New plan (quick add)</dd></div>
+        <div><dt><kbd>M</kbd></dt><dd>New meeting</dd></div>
         <div><dt><kbd>Shift</kbd> + <kbd>Enter</kbd></dt><dd>Quick add with full details</dd></div>
         <div><dt><kbd>/</kbd></dt><dd>Search</dd></div>
         <div><dt><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></dt><dd>Today, Board, Calendar</dd></div>

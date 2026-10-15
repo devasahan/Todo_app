@@ -121,6 +121,9 @@ the deadline.
 cd ~/Todo_app && git pull
 ```
 
+Then reload Dayplan on every phone and computer where it's open, so no tab keeps running the old
+version.
+
 Updating never touches your plans: they're stored outside the code, in
 `/home/yourname/dayplan-data/`.
 
@@ -166,7 +169,7 @@ They're added to your account and appear on every device you sign in on.
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Today**    | Your daily dashboard: a greeting, a progress ring for what's due today, tiles for *due today*, *overdue*, *in progress* and *done this week*, your streak, a **Focus now** card with the single most urgent plan, then *Overdue*, *Due today*, *In progress* and *Next 7 days*. |
 | **Board**    | A Kanban board with **To do / In progress / Done** columns. Drag cards between columns or reorder them. Sort by your own order, deadline, priority or newest.                                                 |
-| **Calendar** | A month view of deadlines. Drag a plan onto another day to reschedule it, double-click a day to add a plan, or drop a plan into **No deadline** to clear its date.                                          |
+| **Calendar** | A month view of deadlines and meetings. Drag a plan onto another day to reschedule it, double-click a day to add a plan, or drop a plan into **No deadline** to clear its date.                            |
 
 ### Plans
 
@@ -181,6 +184,25 @@ They're added to your account and appear on every device you sign in on.
 - **Priority** (low / medium / high). High and low plans are marked on their cards with signal bars.
 - **Tags** like `#work` or `#home`. Click a tag in the sidebar (or on a card) to filter by it.
 - Start, finish and duration are recorded automatically ("took 2 days").
+
+### Meetings and job interviews
+
+Press **New meeting** in the top bar (or <kbd>M</kbd>, or **Meeting** on a calendar day, or the
+**⋯** menu on a phone), or switch the editor from **Plan** to **Meeting**. A meeting has:
+
+- **Company**: the title fills itself in as *Interview with Acme* unless you type your own.
+- **Date and time** of the call, in your own time zone.
+- **Meeting link** (Zoom, Teams, Google Meet…): paste the link, or the whole invitation, and the
+  link is picked out of it.
+- **Job description link**: the job posting.
+- Notes, prep steps, tags and priority, just like a plan.
+
+Meetings show on the calendar with their time (*2:30 PM Acme*), on Today and on the board. Cards
+get a **Join** button (highlighted from an hour before the start) and a **Job description** button,
+both opening in a new tab. Meetings never count as overdue: once a meeting is over it moves to
+**Past meetings** on Today until you tick it off. **Add to my calendar** downloads a calendar file
+for your phone or computer calendar, with a reminder 15 minutes before. Only web links (`https://…`)
+are accepted, so a link can never run code.
 
 ### Quick add with natural language
 
@@ -206,11 +228,13 @@ Press <kbd>Shift</kbd>+<kbd>Enter</kbd> to open the full editor with the parsed 
 
 ### Everything else
 
-- **Search** across titles, descriptions, tags and steps. Filter by tag or priority.
+- **Search** across titles, descriptions, tags, steps and companies. Filter by tag, priority, or
+  plans versus meetings.
 - **Undo** for deleting or finishing a plan, rescheduling, clearing completed plans and imports.
 - **Dark mode** that follows your system, with a manual toggle.
 - **Backups**: export all plans to a `.json` file and import them again from the **⋯** menu.
-  Importing merges by plan, so re-importing the same backup never creates duplicates.
+  Importing merges by plan, so re-importing the same backup never creates duplicates. (An older
+  version of Dayplan can import these backups too, but ignores meeting details.)
 - **New plan** button in the top bar opens the full editor (on the calendar, for the selected day).
 - Works on phones: the views move to a tab bar at the bottom, the board columns become swipeable
   panels, the calendar shows dots, and the editor opens as a bottom sheet.
@@ -221,6 +245,7 @@ Press <kbd>Shift</kbd>+<kbd>Enter</kbd> to open the full editor with the parsed 
 | Key                                  | Action                         |
 | ------------------------------------ | ------------------------------ |
 | <kbd>N</kbd>                         | New plan (focus quick add)     |
+| <kbd>M</kbd>                         | New meeting                    |
 | <kbd>/</kbd>                         | Search                         |
 | <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> | Today / Board / Calendar     |
 | <kbd>[</kbd> <kbd>]</kbd>            | Previous / next month          |

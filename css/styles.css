@@ -58,6 +58,8 @@
   --high: #e5484d;
   --medium: #e0951b;
   --low: #a3aab8;
+  --meeting: #7c3aed;
+  --meeting-soft: #f3effd;
   --on-badge: #ffffff;
   --toast-bg: #111827;
   --toast-text: #f3f4f6;
@@ -107,6 +109,8 @@
   --high: #f87171;
   --medium: #fbbf24;
   --low: #4b5262;
+  --meeting: #c4b5fd;
+  --meeting-soft: #251d40;
   --on-badge: #0c0e13;
   --toast-bg: #e9ebf0;
   --toast-text: #14171e;
@@ -153,6 +157,8 @@
     --high: #f87171;
     --medium: #fbbf24;
     --low: #4b5262;
+    --meeting: #c4b5fd;
+    --meeting-soft: #251d40;
     --on-badge: #0c0e13;
     --toast-bg: #e9ebf0;
     --toast-text: #14171e;
@@ -367,6 +373,11 @@ kbd {
   height: 16px;
 }
 
+a.btn {
+  color: inherit;
+  text-decoration: none;
+}
+
 .icon-btn {
   display: inline-grid;
   place-items: center;
@@ -521,6 +532,26 @@ button.chip.tag:hover {
 
 .chip.prio-low {
   color: var(--muted);
+}
+
+.chip.due-now {
+  background: var(--meeting-soft);
+  color: var(--meeting);
+  font-weight: 600;
+}
+
+.chip.due-past {
+  color: var(--muted);
+}
+
+.chip.company {
+  max-width: 16em;
+}
+
+.chip .chip-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .chip.steps.complete {
@@ -917,6 +948,10 @@ select:hover {
   display: none;
 }
 
+.new-meeting {
+  margin-right: 2px;
+}
+
 .new-plan {
   margin-right: 4px;
 }
@@ -1253,6 +1288,17 @@ select:hover {
   margin-top: 10px;
 }
 
+.card-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.card.is-meeting .card-meta .chip.due .icon {
+  color: var(--meeting);
+}
+
 .card.is-done .card-title {
   color: var(--muted);
   text-decoration: line-through;
@@ -1312,6 +1358,19 @@ select:hover {
   justify-content: flex-end;
   max-width: 380px;
   margin-top: 0;
+}
+
+.card.row.is-meeting .card-main {
+  grid-template-areas:
+    'title meta'
+    'desc meta'
+    'links links'
+    'progress progress';
+}
+
+.card.row .card-links {
+  grid-area: links;
+  margin-top: 8px;
 }
 
 .card.row .progress {
@@ -1604,6 +1663,19 @@ select:hover {
   background: var(--accent-bg);
 }
 
+.focus.is-meeting {
+  border-color: color-mix(in srgb, var(--meeting) 35%, var(--border));
+  background: linear-gradient(90deg, var(--meeting-soft), var(--surface) 70%);
+}
+
+.focus.is-meeting::before {
+  background: var(--meeting);
+}
+
+.focus.is-meeting .eyebrow {
+  color: var(--meeting);
+}
+
 .focus-text {
   min-width: 0;
 }
@@ -1678,6 +1750,10 @@ select:hover {
 
 .done-today[open] summary::after {
   content: 'Hide';
+}
+
+.past-meetings .hint {
+  margin-bottom: 10px;
 }
 
 .later-note {
@@ -2070,6 +2146,32 @@ select:hover {
   vertical-align: 1px;
 }
 
+.cal-chip.is-meeting {
+  flex-wrap: wrap;
+  row-gap: 0;
+  border-left-color: var(--meeting);
+  background: var(--meeting-soft);
+}
+
+.cal-chip.is-meeting:hover {
+  background: color-mix(in srgb, var(--meeting) 16%, var(--surface));
+}
+
+.cal-chip.is-meeting.s-done {
+  background: var(--surface-2);
+}
+
+.cal-time {
+  flex: none;
+  color: var(--meeting);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.cal-chip.s-done .cal-time {
+  color: inherit;
+}
+
 .cal-title {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2114,10 +2216,16 @@ select:hover {
 
 .side-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
   margin-bottom: 12px;
+}
+
+.side-actions {
+  display: flex;
+  gap: 6px;
 }
 
 .side-head h3 {
@@ -2370,6 +2478,29 @@ select:hover {
   background: var(--raised);
   color: var(--text);
   box-shadow: var(--shadow-sm);
+}
+
+.kind-switch .seg span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.kind-switch .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.seg-meeting input:checked + span {
+  color: var(--meeting);
+}
+
+.ics-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
 }
 
 .seg-in_progress input:checked + span {
@@ -3172,6 +3303,15 @@ select:hover {
   .search {
     width: 200px;
   }
+
+  .new-meeting {
+    width: 36px;
+    padding: 0;
+  }
+
+  .new-meeting span {
+    display: none;
+  }
 }
 
 /* Tablets and phones: the sidebar becomes a tab bar at the bottom. */
@@ -3337,6 +3477,11 @@ select:hover {
   }
 
   .new-plan span {
+    display: none;
+  }
+
+  /* On phones, "New meeting" lives in the ⋯ menu and the calendar. */
+  .new-meeting {
     display: none;
   }
 
@@ -3519,6 +3664,10 @@ select:hover {
 
   .cal-dots i.s-done {
     background: var(--done);
+  }
+
+  .cal-dots i.is-meeting:not(.s-done) {
+    background: var(--meeting);
   }
 
   .cal-day.has-overdue::after {

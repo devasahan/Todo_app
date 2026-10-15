@@ -16,10 +16,14 @@
 
   const ICONS = {
     alert: '<circle cx="12" cy="12" r="9"/><path d="M12 7.5v5M12 16v.5"/>',
+    briefcase:
+      '<rect x="3" y="7" width="18" height="13" rx="2"/><path d="M9 7V5.5A1.5 1.5 0 0 1 10.5 4h3A1.5 1.5 0 0 1 15 5.5V7M3 13h18"/>',
+    calendarPlus: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4M12 13v5M9.5 15.5h5"/>',
     check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
     chevronLeft: '<path d="M15 6l-6 6 6 6"/>',
     chevronRight: '<path d="M9 6l6 6-6 6"/>',
     clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    external: '<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
     flame: '<path d="M12 3c1 3 5 5 5 10a5 5 0 0 1-10 0c0-2 1-3.5 2-4.5 0 2 1 3 2 3 0-3-1-5 1-8.5z"/>',
     halfCircle: '<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/>',
     play: '<path d="M8 5.5v13l10-6.5z"/>',
@@ -31,6 +35,7 @@
     sparkle: '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/>',
     steps: '<path d="M10 6h10M10 12h10M10 18h10"/><path d="M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"/>',
     target: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
+    video: '<rect x="3" y="6" width="12" height="12" rx="2"/><path d="M15 10.5l6-3.5v10l-6-3.5z"/>',
     x: '<path d="M6 6l12 12M18 6L6 18"/>',
   };
   const icon = (name) => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
@@ -66,12 +71,34 @@
   }
 
   let loadProblem = '';
+  // How often plans saved by an older version of Dayplan (which drops meeting
+  // details) were read from storage, and how many of those a full download
+  // from the account has since repaired. Kept outside `sync`, which doesn't
+  // exist yet when the plans are first loaded.
+  let olderDataLoads = 0;
+  let olderDataPulled = 0;
+  const olderIds = new Set(); // plans read from such a copy, until that download
+  let restoredOnLoad = false; // the last load put back details an older version dropped
 
-  function loadPlans() {
+  // `previous`: the plans already shown, whose meeting details are kept if
+  // the stored copy came from an older version.
+  function loadPlans(previous = []) {
+    restoredOnLoad = false;
     const raw = readStorage(STORAGE_KEY);
     if (!raw) return [];
     try {
-      return C.importData(raw);
+      const data = JSON.parse(raw);
+      const list = Array.isArray(data) ? data : data && Array.isArray(data.plans) ? data.plans : [];
+      const older = list.filter(C.fromOlderVersion);
+      if (older.length) {
+        olderDataLoads += 1;
+        const shown = new Map(previous.map((p) => [p.id, p]));
+        for (const item of older) {
+          if (typeof item.id === 'string') olderIds.add(item.id);
+          if (C.isMeeting(shown.get(item.id))) restoredOnLoad = true;
+        }
+      }
+      return C.importData(data, new Date(), previous);
     } catch (err) {
       // Never silently throw away someone's plans: keep the unreadable copy.
       console.error('Dayplan: stored plans could not be read.', err);
@@ -120,17 +147,19 @@
   const state = {
     plans: loadPlans(),
     prefs: loadPrefs(),
-    filters: { query: '', tag: '', priority: '' },
+    filters: { query: '', tag: '', priority: '', kind: '' },
     calendarMonth: new Date(today.getFullYear(), today.getMonth(), 1),
     selectedDay: C.toISODate(today),
     weekStart: detectWeekStart(),
     dragId: null,
     dropBeforeId: null,
+    openSections: new Set(), // Today's expanded lists, kept open across refreshes
   };
 
   const findPlan = (id) => state.plans.find((p) => p.id === id);
   const visiblePlans = () => state.plans.filter((p) => C.matchesFilters(p, state.filters));
-  const filtersActive = () => Boolean(state.filters.query || state.filters.tag || state.filters.priority);
+  const filtersActive = () =>
+    Boolean(state.filters.query || state.filters.tag || state.filters.priority || state.filters.kind);
 
   // A plan brought back (undo, import) is a new change, newer than `over`.
   const restored = (plan, over = plan) => ({ ...plan, updatedAt: C.nextStamp(over.updatedAt) });
@@ -267,29 +296,67 @@
     // Replace the page only when something changed: the once-a-minute refresh
     // and syncs with no news then never swallow a tap or move the focus.
     if (html !== state.viewHTML) {
-      $('#view').innerHTML = html;
+      if (state.viewHTML && withoutCountdowns(html) === withoutCountdowns(state.viewHTML)) {
+        // Only "Starts in 12 minutes" moved on: update those words in place.
+        const next = document.createElement('template');
+        next.innerHTML = html;
+        const fresh = next.content.querySelectorAll('[data-countdown]');
+        $$('#view [data-countdown]').forEach((el, i) => fresh[i] && setText(el, fresh[i].textContent));
+      } else {
+        $('#view').innerHTML = html;
+      }
       state.viewHTML = html;
     }
     updateBadges();
     restore();
   }
 
+  const withoutCountdowns = (html) => html.replace(/(<span data-countdown>)[^<]*/g, '$1');
+
+  // A selector for the same control after a re-render, e.g. the Join link of
+  // a given plan, or the "+" of the Done column.
+  function controlKey(el) {
+    const attrs = ['data-action', 'data-date', 'data-status', 'data-kind', 'data-view', 'data-tag']
+      .filter((a) => el.hasAttribute(a))
+      .map((a) => `[${a}="${CSS.escape(el.getAttribute(a))}"]`)
+      .join('');
+    const host = el.closest('[data-id]');
+    const id = host ? `[data-id="${CSS.escape(host.dataset.id)}"]` : '';
+    const tag = el.tagName.toLowerCase();
+    const section = el.parentElement && el.parentElement.dataset.section;
+    if (tag === 'summary' && section) return `[data-section="${CSS.escape(section)}"] > summary`;
+    if (!attrs && !id) return '';
+    return host === el ? `${tag}${id}${attrs}` : `${id ? `${id} ` : ''}${tag}${attrs}`;
+  }
+
   // Keeps keyboard focus on the same control after a re-render.
   function focusMemo() {
+    const view = $('#view');
     const active = document.activeElement;
-    if (!active || active === document.body || !$('#view').contains(active)) return () => {};
-    const id = active.closest('[data-id]')?.dataset.id;
-    const action = active.dataset.action;
+    if (!active || active === document.body || !view.contains(active)) return () => {};
+    const key = controlKey(active);
+    // The same plan can appear twice (e.g. "Focus now" and its section): keep the same one.
+    const index = key ? $$(key, view).indexOf(active) : -1;
+    const section = active.closest('[data-section]');
+    const sectionKey = section ? `[data-section="${CSS.escape(section.dataset.section)}"]` : '';
+    const row = section ? $$('.card', section).indexOf(active.closest('.card')) : -1;
     return () => {
-      if (!id) return;
-      // The same plan can appear twice (e.g. "Focus now" and its section).
-      for (const host of $$(`#view [data-id="${CSS.escape(id)}"]`)) {
-        const target = !action || host.dataset.action === action ? host : host.querySelector(`[data-action="${action}"]`);
-        if (target) {
-          target.focus({ preventScroll: true });
-          return;
-        }
+      if (active.isConnected) return; // nothing was replaced
+      const focused = (el) => {
+        if (!el) return false;
+        el.focus({ preventScroll: true });
+        return document.activeElement === el;
+      };
+      if (key) {
+        const matches = $$(key, view);
+        if (focused(matches[index]) || matches.some(focused)) return;
       }
+      // The plan left its list (e.g. ticked off under Past meetings): stay in that list.
+      const list = sectionKey && $(sectionKey, view);
+      if (!list) return;
+      const cards = $$('.card', list);
+      const next = cards[Math.min(Math.max(row, 0), cards.length - 1)];
+      if (!focused(next && next.querySelector('.status-btn'))) focused($('summary', list));
     };
   }
 
@@ -340,9 +407,16 @@
     } else {
       const month = state.calendarMonth;
       const prefix = C.toISODate(month).slice(0, 7);
-      const due = state.plans.filter((p) => p.dueDate.startsWith(prefix)).length;
+      const inMonth = state.plans.filter((p) => p.dueDate.startsWith(prefix));
+      const meetings = inMonth.filter(C.isMeeting).length;
+      const due = inMonth.length - meetings;
       const name = month.toLocaleDateString(undefined, { month: 'long' });
-      subtitle = due ? `${due} ${due === 1 ? 'plan' : 'plans'} due in ${name}` : `No plans due in ${name}`;
+      const plansText = `${due} ${due === 1 ? 'plan' : 'plans'} due`;
+      const meetingsText = `${meetings} ${meetings === 1 ? 'meeting' : 'meetings'}`;
+      if (due && meetings) subtitle = `${plansText} and ${meetingsText} in ${name}`;
+      else if (meetings) subtitle = `${meetingsText} in ${name}`;
+      else if (due) subtitle = `${plansText} in ${name}`;
+      else subtitle = `No plans due in ${name}`;
     }
     setText($('#page-title'), VIEW_TITLES[view]);
     setText($('#page-subtitle'), subtitle);
@@ -388,6 +462,18 @@
           : ''
       }
       <div class="filter-controls">
+        ${
+          state.plans.some(C.isMeeting) || state.filters.kind
+            ? `<label class="select">
+                <span class="sr-only">Show plans or meetings</span>
+                <select data-filter="kind">
+                  ${option('', 'Plans and meetings', state.filters.kind)}
+                  ${option('meeting', 'Meetings only', state.filters.kind)}
+                  ${option('plan', 'Plans only', state.filters.kind)}
+                </select>
+              </label>`
+            : ''
+        }
         <label class="select">
           <span class="sr-only">Filter by priority</span>
           <select data-filter="priority">
@@ -410,7 +496,7 @@
   }
 
   function statusButton(plan) {
-    const next = C.STATUS_LABELS[C.nextStatus(plan.status)].toLowerCase();
+    const next = C.STATUS_LABELS[C.nextStatus(plan.status, plan.kind)].toLowerCase();
     const label = `${C.STATUS_LABELS[plan.status]}. Mark as ${next}`;
     return `<button type="button" class="status-btn s-${plan.status}" data-action="cycle" aria-label="${esc(label)}" title="${esc(label)}">${icon('check')}</button>`;
   }
@@ -419,7 +505,17 @@
     const due = C.dueInfo(plan, now);
     const progress = C.checklistProgress(plan);
     const parts = [];
-    if (due.state !== 'none') {
+    if (C.isMeeting(plan)) {
+      // A meeting always says when it is, even if that's not set yet.
+      const title = due.full && !plan.dueTime ? `${due.full} (time not set)` : due.full;
+      const label = due.state === 'now' ? `<span data-countdown>${esc(due.label)}</span>` : esc(due.label);
+      parts.push(`<span class="chip due due-${due.state}" title="${esc(title)}">${icon('video')}${label}</span>`);
+      if (plan.company && !plan.title.toLowerCase().includes(plan.company.toLowerCase())) {
+        parts.push(
+          `<span class="chip company" title="${esc(plan.company)}">${icon('briefcase')}<span class="chip-text">${esc(plan.company)}</span></span>`
+        );
+      }
+    } else if (due.state !== 'none') {
       parts.push(
         `<span class="chip due due-${due.state}" title="${esc(due.full)}">${icon(due.state === 'overdue' ? 'alert' : 'clock')}${esc(due.label)}</span>`
       );
@@ -438,19 +534,62 @@
     return parts.length ? `<div class="card-meta">${parts.join('')}</div>` : '';
   }
 
+  // A link that opens in a new tab. Only ever an http(s) address: links are
+  // checked again here, whatever was stored.
+  function linkButton(url, { action, label, text, iconName, kind = 'ghost', size = 'small' }) {
+    const href = C.cleanUrl(url);
+    if (!href) return '';
+    return `<a class="btn ${size} ${kind}" href="${esc(href)}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer"
+      draggable="false" data-action="${action}" title="Opens ${esc(C.linkHost(href))} in a new tab" aria-label="${esc(label)}">${icon(iconName)}${text}</a>`;
+  }
+
+  function joinButton(plan, due, size = 'small') {
+    if (plan.status === 'done') return '';
+    const who = plan.company || plan.title;
+    return linkButton(plan.meetingUrl, {
+      action: 'open-meeting',
+      label: `Join the meeting with ${who} (opens in a new tab)`,
+      text: 'Join',
+      iconName: 'video',
+      kind: due.state === 'now' || size !== 'small' ? 'primary' : 'ghost',
+      size,
+    });
+  }
+
+  function jobButton(plan, size = 'small') {
+    return linkButton(plan.jobUrl, {
+      action: 'open-job',
+      label: `Job description for ${plan.company || plan.title} (opens in a new tab)`,
+      text: 'Job description',
+      iconName: 'external',
+      size,
+    });
+  }
+
+  function meetingLinksHTML(plan, due) {
+    const links = joinButton(plan, due) + jobButton(plan);
+    return links ? `<div class="card-links">${links}</div>` : '';
+  }
+
   function cardHTML(plan, { now = new Date(), draggable = false, row = false } = {}) {
     const progress = C.checklistProgress(plan);
+    const meeting = C.isMeeting(plan);
+    const due = meeting ? C.dueInfo(plan, now) : null;
     const status = row && plan.status !== 'todo'
       ? `<span class="status-tag s-${plan.status}">${C.STATUS_LABELS[plan.status]}</span>`
       : '';
+    const label = meeting
+      ? `${plan.title}, meeting, ${due.full || 'date not set'}, ${C.STATUS_LABELS[plan.status]}`
+      : `${plan.title}, ${C.STATUS_LABELS[plan.status]}`;
     return `
-      <article class="card${row ? ' row' : ''} p-${plan.priority} is-${plan.status}" data-id="${esc(plan.id)}" data-action="edit"
-        tabindex="0" ${draggable ? 'draggable="true"' : ''} aria-label="${esc(plan.title)}, ${C.STATUS_LABELS[plan.status]}">
+      <article class="card${row ? ' row' : ''}${meeting ? ' is-meeting' : ''} p-${plan.priority} is-${plan.status}" data-id="${esc(plan.id)}" data-action="edit"
+        tabindex="0" ${draggable ? 'draggable="true"' : ''} aria-label="${esc(label)}">
         ${statusButton(plan)}
         <div class="card-main">
           <h3 class="card-title">${esc(plan.title)}</h3>
           ${plan.description ? `<p class="card-desc">${esc(plan.description)}</p>` : ''}
           ${metaHTML(plan, now)}
+          ${meeting ? meetingLinksHTML(plan, due) : ''}
           ${progress.total ? `<div class="progress" aria-hidden="true"><span style="width:${progress.pct}%"></span></div>` : ''}
         </div>
         ${status}
@@ -474,6 +613,7 @@
            Give it a deadline, break it into steps and move it from <strong>To do</strong> to <strong>Done</strong>.</p>
         <div class="empty-actions">
           <button type="button" class="btn primary" data-action="new">${icon('plus')} Create a plan</button>
+          <button type="button" class="btn ghost" data-action="new" data-kind="meeting">${icon('video')} Add a meeting</button>
           <button type="button" class="btn ghost" data-action="samples">${icon('sparkle')} Show me with sample plans</button>
         </div>
       </section>`;
@@ -504,6 +644,23 @@
     else if (!remaining) summary = 'Everything due today is done. Nice work!';
     else summary = `${remaining} ${remaining === 1 ? 'plan' : 'plans'} left for today.`;
     if (stats.overdue && remaining) summary += ` ${stats.overdue} overdue ${stats.overdue === 1 ? 'needs' : 'need'} attention.`;
+    // The same meeting as the Focus card when one is about to start or running.
+    const nextMeeting =
+      focus && C.isMeeting(focus) && C.dueInfo(focus, now).state === 'now'
+        ? focus
+        : groups.today.find((p) => C.isMeeting(p) && p.dueTime && ['now', 'today'].includes(C.dueInfo(p, now).state));
+    let meetingSentence = '';
+    if (nextMeeting) {
+      const due = C.dueInfo(nextMeeting, now);
+      const name = truncate(nextMeeting.company || nextMeeting.title, 40);
+      if (due.state === 'now' && due.minutes > 0) {
+        meetingSentence = `Your meeting with ${name} starts in ${due.minutes} ${due.minutes === 1 ? 'minute' : 'minutes'}.`;
+      } else if (due.state === 'now') {
+        meetingSentence = `Your meeting with ${name} is happening now.`;
+      } else {
+        meetingSentence = `Next meeting: ${name} at ${C.formatTime(nextMeeting.dueTime)}.`;
+      }
+    }
 
     const circumference = 2 * Math.PI * 52;
     const ringOffset = circumference * (1 - stats.todayPct / 100);
@@ -523,13 +680,21 @@
 
     const sections = [
       section('overdue', 'Overdue', groups.overdue),
-      section('due-today', 'Due today', groups.today),
+      section('due-today', groups.today.some(C.isMeeting) ? 'Today' : 'Due today', groups.today),
       section('doing', 'In progress', groups.inProgress),
       section('upcoming', 'Next 7 days', groups.upcoming),
     ].join('');
 
+    const pastMeetings = groups.pastMeetings.length
+      ? `<details class="today-section done-today past-meetings" data-section="past"${state.openSections.has('past') ? ' open' : ''}>
+          <summary class="section-title">Past meetings<span class="count">${groups.pastMeetings.length}</span></summary>
+          <p class="hint">Tick off each meeting once you've followed up, for example after sending a thank-you note.</p>
+          <div class="row-list">${groups.pastMeetings.map((p) => cardHTML(p, { now, row: true })).join('')}</div>
+        </details>`
+      : '';
+
     const doneToday = groups.doneToday.length
-      ? `<details class="today-section done-today">
+      ? `<details class="today-section done-today" data-section="done"${state.openSections.has('done') ? ' open' : ''}>
           <summary class="section-title">Finished today<span class="count">${groups.doneToday.length}</span></summary>
           <div class="row-list">${groups.doneToday.map((p) => cardHTML(p, { now, row: true })).join('')}</div>
         </details>`
@@ -546,7 +711,7 @@
           <div class="hero-text">
             <p class="eyebrow hero-date">${esc(now.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' }))}</p>
             <h2 class="hero-title">${greeting(now)}</h2>
-            <p class="hero-sub">${esc(summary)}</p>
+            <p class="hero-sub">${esc(summary)}${meetingSentence ? ` <span data-countdown>${esc(meetingSentence)}</span>` : ''}</p>
             ${
               stats.streak
                 ? `<p class="streak" title="Days in a row with at least one plan finished">${icon('flame')}${stats.streak}-day streak</p>`
@@ -573,10 +738,17 @@
         </div>
       </section>
       ${focus ? focusHTML(focus, now) : ''}
-      ${sections || doneToday || later ? `${sections}${doneToday}${later}` : filtersActive() ? noMatchesHTML() : ''}`;
+      ${
+        sections || pastMeetings || doneToday || later
+          ? `${sections}${pastMeetings}${doneToday}${later}`
+          : filtersActive()
+            ? noMatchesHTML()
+            : ''
+      }`;
   }
 
   function focusHTML(plan, now) {
+    if (C.isMeeting(plan)) return meetingFocusHTML(plan, now);
     const start =
       plan.status === 'todo'
         ? `<button type="button" class="btn ghost" data-action="set-status" data-status="in_progress">${icon('play')} Start</button>`
@@ -591,6 +763,26 @@
         <div class="focus-actions">
           ${start}
           <button type="button" class="btn primary" data-action="set-status" data-status="done">${icon('check')} Mark done</button>
+          <button type="button" class="btn ghost" data-action="edit">Open</button>
+        </div>
+      </section>`;
+  }
+
+  function meetingFocusHTML(plan, now) {
+    const due = C.dueInfo(plan, now);
+    const join = joinButton(plan, due, '');
+    const happening = due.state === 'now' && due.minutes <= 0;
+    return `
+      <section class="focus is-meeting" data-id="${esc(plan.id)}" aria-label="${happening ? 'Happening now' : 'Next meeting'}">
+        <div class="focus-text">
+          <p class="eyebrow">${icon('video')} ${happening ? 'Happening now' : 'Next meeting'}</p>
+          <h2 class="focus-title">${esc(plan.title)}</h2>
+          ${metaHTML(plan, now)}
+        </div>
+        <div class="focus-actions">
+          ${join}
+          ${jobButton(plan, '')}
+          <button type="button" class="btn ${join ? 'ghost' : 'primary'}" data-action="set-status" data-status="done">${icon('check')} Mark done</button>
           <button type="button" class="btn ghost" data-action="edit">Open</button>
         </div>
       </section>`;
@@ -643,11 +835,32 @@
       byDate.get(p.dueDate).push(p);
     }
     const unscheduled = C.sortPlans(plans.filter((p) => !p.dueDate && p.status !== 'done'));
-    const chip = (p) => `
-      <button type="button" class="cal-chip s-${p.status} p-${p.priority}" data-action="edit" data-id="${esc(p.id)}" draggable="true"
-        title="${esc(p.title)}${p.dueTime ? ` at ${esc(C.formatTime(p.dueTime))}` : ''}">
-        <span class="cal-title">${esc(p.title)}</span>
-      </button>`;
+    const chip = (p) => {
+      const at = p.dueTime ? ` at ${C.formatTime(p.dueTime)}` : '';
+      if (!C.isMeeting(p)) {
+        return `
+          <button type="button" class="cal-chip s-${p.status} p-${p.priority}" data-action="edit" data-id="${esc(p.id)}" draggable="true"
+            title="${esc(p.title + at)}">
+            <span class="cal-title">${esc(p.title)}</span>
+          </button>`;
+      }
+      // Meetings read "2:30 PM Acme".
+      return `
+        <button type="button" class="cal-chip is-meeting s-${p.status} p-${p.priority}" data-action="edit" data-id="${esc(p.id)}" draggable="true"
+          title="${esc(`${p.title}${at}${p.company ? ` · ${p.company}` : ''}`)}">
+          <span class="sr-only">Meeting: </span>${p.dueTime ? `<span class="cal-time">${esc(C.formatShortTime(p.dueTime))}</span>` : ''}<span class="cal-title">${esc(p.company || p.title)}</span>
+        </button>`;
+    };
+    const countLabel = (items) => {
+      const meetings = items.filter(C.isMeeting).length;
+      const others = items.length - meetings;
+      return [
+        others ? `${others} ${others === 1 ? 'plan' : 'plans'}` : '',
+        meetings ? `${meetings} ${meetings === 1 ? 'meeting' : 'meetings'}` : '',
+      ]
+        .filter(Boolean)
+        .join(', ');
+    };
 
     const headers = days
       .slice(0, 7)
@@ -671,7 +884,7 @@
         if (key === state.selectedDay) classes.push('selected');
         if (key < todayKey) classes.push('past');
         if (open.some((p) => C.dueInfo(p, now).state === 'overdue')) classes.push('has-overdue');
-        const label = `${d.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}${items.length ? `, ${items.length} ${items.length === 1 ? 'plan' : 'plans'}` : ''}`;
+        const label = `${d.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}${items.length ? `, ${countLabel(items)}` : ''}`;
         return `
           <div class="${classes.join(' ')}" role="gridcell" data-action="select-day" data-date="${key}" data-drop-date="${key}">
             <button type="button" class="cal-num" data-action="select-day" data-date="${key}" aria-label="${esc(label)}"
@@ -680,7 +893,14 @@
               ${items.slice(0, 3).map(chip).join('')}
               ${items.length > 3 ? `<span class="cal-more">+${items.length - 3} more</span>` : ''}
             </div>
-            ${items.length ? `<span class="cal-dots" aria-hidden="true">${items.slice(0, 4).map((p) => `<i class="s-${p.status}"></i>`).join('')}</span>` : ''}
+            ${
+              items.length
+                ? `<span class="cal-dots" aria-hidden="true">${items
+                    .slice(0, 4)
+                    .map((p) => `<i class="s-${p.status}${C.isMeeting(p) ? ' is-meeting' : ''}"></i>`)
+                    .join('')}</span>`
+                : ''
+            }
           </div>`;
       });
       weeks.push(`<div class="cal-week" role="row">${cells.join('')}</div>`);
@@ -724,11 +944,16 @@
       <section class="day-panel" aria-label="Plans on ${esc(label)}">
         <header class="side-head">
           <h3>${esc(label)}</h3>
-          <button type="button" class="btn primary small" data-action="new" data-date="${state.selectedDay}">${icon('plus')} Add</button>
+          <div class="side-actions">
+            <button type="button" class="btn primary small" data-action="new" data-date="${state.selectedDay}" aria-label="Add a plan on ${esc(label)}">${icon('plus')} Plan</button>
+            <button type="button" class="btn ghost small" data-action="new" data-kind="meeting" data-date="${state.selectedDay}" aria-label="Add a meeting on ${esc(label)}">${icon('video')} Meeting</button>
+          </div>
         </header>
-        <div class="row-list">
-          ${plans.map((p) => cardHTML(p, { now, row: true })).join('') || '<p class="muted">Nothing planned for this day yet.</p>'}
-        </div>
+        ${
+          plans.length
+            ? `<div class="row-list">${plans.map((p) => cardHTML(p, { now, row: true })).join('')}</div>`
+            : '<p class="muted">Nothing planned for this day yet.</p>'
+        }
       </section>`;
   }
 
@@ -875,6 +1100,13 @@
     snapshot: '',
   };
   const field = (name) => editor.form.elements.namedItem(name);
+  const isMeetingForm = () => field('kind').value === 'meeting';
+  const KIND_SWITCH_LABELS = { plan: `${icon('check')}Plan`, meeting: `${icon('video')}Meeting` };
+  const LINK_FIELDS = [
+    ['meetingUrl', 'meeting-url-error'],
+    ['jobUrl', 'job-url-error'],
+  ];
+  const oneLine = (value) => value.replace(/\s+/g, ' ').trim();
 
   function renderSegmented(containerId, name, values, labels, current) {
     $(`#${containerId}`).innerHTML = values
@@ -898,10 +1130,31 @@
       priority: 'medium',
       tags: [],
       checklist: [],
+      kind: 'plan',
+      company: '',
+      meetingUrl: '',
+      jobUrl: '',
       ...defaults,
     };
+    const meeting = source.kind === 'meeting';
 
-    field('title').value = source.title;
+    // A meeting titled after its company keeps following the company.
+    const autoTitle = meeting && source.company && source.title === C.meetingTitle(source.company);
+    field('title').value = autoTitle ? '' : source.title;
+    renderSegmented('kind-options', 'kind', C.KINDS, KIND_SWITCH_LABELS, meeting ? 'meeting' : 'plan');
+    field('company').value = source.company || '';
+    field('meetingUrl').value = source.meetingUrl || '';
+    field('jobUrl').value = source.jobUrl || '';
+    for (const [name, errorId] of LINK_FIELDS) {
+      $(`#${errorId}`).hidden = true;
+      field(name).removeAttribute('aria-invalid');
+    }
+    setNameError(false);
+    const companies = C.sortPlans(state.plans.filter(C.isMeeting), 'newest').map((p) => p.company);
+    $('#company-suggestions').innerHTML = [...new Set(companies.filter(Boolean))]
+      .slice(0, 50)
+      .map((c) => `<option value="${esc(c)}"></option>`)
+      .join('');
     field('description').value = source.description || '';
     field('dueDate').value = source.dueDate || '';
     field('dueTime').value = source.dueTime || '';
@@ -917,16 +1170,67 @@
       .map((t) => `<option value="${esc(t.name)}"></option>`)
       .join('');
 
-    $('#editor-heading').textContent = plan ? 'Edit plan' : 'New plan';
     $('#editor-delete').hidden = !plan;
     $('#editor-meta').textContent = plan ? metaLine(plan) : '';
     $('#title-error').hidden = true;
     editor.snapshot = editorSnapshot();
     editor.original = editorValues(); // to save only what the user changes
+    applyKind();
     editor.dialog.showModal();
+    if (!plan && meeting) {
+      field('company').focus();
+      return;
+    }
     const title = field('title');
     title.focus();
     title.setSelectionRange(title.value.length, title.value.length);
+  }
+
+  // Shows the fields and wording for a plan or a meeting.
+  function applyKind() {
+    const meeting = isMeetingForm();
+    for (const el of $$('.meeting-only', editor.form)) el.hidden = !meeting;
+    for (const el of $$('.plan-only', editor.form)) el.hidden = meeting;
+    const noun = meeting ? 'meeting' : 'plan';
+    $('#editor-heading').textContent = `${editor.id ? 'Edit' : 'New'} ${noun}`;
+    $('#editor-save').textContent = `Save ${noun}`;
+    $('#title-label').textContent = meeting ? 'Title (optional)' : 'Title';
+    $('#title-error').textContent = meeting ? 'Add the company name or a title.' : 'Give your plan a title.';
+    $('#due-legend').textContent = meeting ? 'Date and time' : 'Deadline';
+    field('dueDate').setAttribute('aria-label', meeting ? 'Meeting date' : 'Deadline date');
+    field('dueTime').setAttribute('aria-label', meeting ? 'Meeting time' : 'Deadline time (optional)');
+    $('#description-label').textContent = meeting ? 'Notes' : 'Description';
+    field('description').placeholder = meeting
+      ? "Who you're meeting, questions to ask, phone number…"
+      : 'Notes, links, context…';
+    $('#step-input').placeholder = meeting
+      ? 'Add a prep step and press Enter'
+      : 'Break it down: add a step and press Enter';
+    const warn = Boolean(editor.id && editor.original?.kind === 'meeting' && !meeting);
+    $('#kind-hint').hidden = !warn;
+    // Read out with the selected type, but only while it's shown.
+    for (const radio of $$('input[name="kind"]', editor.form)) {
+      if (warn) radio.setAttribute('aria-describedby', 'kind-hint');
+      else radio.removeAttribute('aria-describedby');
+    }
+    updateTitlePlaceholder();
+    updateIcsButton();
+  }
+
+  function updateTitlePlaceholder() {
+    const company = oneLine(field('company').value);
+    if (!isMeetingForm()) field('title').placeholder = "What's the plan?";
+    else field('title').placeholder = company ? C.meetingTitle(company) : 'e.g. Phone screen with Acme';
+  }
+
+  // "Add to my calendar" is offered for saved meetings that have a date.
+  function updateIcsButton() {
+    $('#editor-ics-row').hidden = !(isMeetingForm() && editor.id);
+    const dated = Boolean(field('dueDate').value);
+    $('#editor-ics').disabled = !dated;
+    $('#ics-hint').textContent = dated
+      ? 'Downloads a file your calendar app can open, with a reminder 15 minutes before.'
+      : 'Add a date first.';
   }
 
   function metaLine(plan) {
@@ -946,8 +1250,16 @@
     let dueDate = field('dueDate').value;
     const dueTime = field('dueTime').value;
     if (dueTime && !dueDate) dueDate = C.toISODate(new Date());
+    const meeting = isMeetingForm();
+    const company = meeting ? oneLine(field('company').value) : '';
+    // A pasted invitation is fine: the link is picked out of it.
+    const link = (name) => (meeting ? C.cleanUrl(C.extractUrl(field(name).value)) : '');
     return {
-      title: field('title').value.trim(),
+      kind: meeting ? 'meeting' : 'plan',
+      company,
+      meetingUrl: link('meetingUrl'),
+      jobUrl: link('jobUrl'),
+      title: field('title').value.trim() || (meeting ? C.meetingTitle(company) : ''),
       description: field('description').value.trim(),
       dueDate,
       dueTime: dueDate ? dueTime : '',
@@ -960,6 +1272,10 @@
 
   function editorSnapshot() {
     return JSON.stringify([
+      field('kind').value,
+      field('company').value,
+      field('meetingUrl').value,
+      field('jobUrl').value,
       field('title').value,
       field('description').value,
       field('dueDate').value,
@@ -974,7 +1290,8 @@
   }
 
   function requestCloseEditor() {
-    if (editorSnapshot() !== editor.snapshot && !window.confirm('Discard your changes to this plan?')) return false;
+    const noun = isMeetingForm() ? 'meeting' : 'plan';
+    if (editorSnapshot() !== editor.snapshot && !window.confirm(`Discard your changes to this ${noun}?`)) return false;
     editor.dialog.close();
     return true;
   }
@@ -1019,12 +1336,40 @@
     $('#finish-hint').hidden = !(total && done === total && field('status').value !== 'done');
   }
 
-  function saveEditor() {
-    if (!field('title').value.trim()) {
-      $('#title-error').hidden = false;
-      field('title').focus();
-      return;
+  // Checks the form before saving. A link that isn't a web address is never
+  // dropped silently: the editor stays open and says what's wrong.
+  function validateEditor() {
+    const meeting = isMeetingForm();
+    const problems = [];
+    const named = Boolean(field('title').value.trim() || (meeting && field('company').value.trim()));
+    $('#title-error').hidden = named;
+    // For a meeting the cursor goes to Company, so the message is read out there.
+    setNameError(meeting && !named);
+    if (!named) problems.push(field(meeting ? 'company' : 'title'));
+    for (const [name, errorId] of LINK_FIELDS) {
+      const value = field(name).value.trim();
+      const bad = meeting && Boolean(value) && !C.cleanUrl(C.extractUrl(value));
+      $(`#${errorId}`).hidden = !bad;
+      field(name).setAttribute('aria-invalid', String(bad));
+      if (bad) problems.push(field(name));
     }
+    if (problems.length) problems[0].focus();
+    return !problems.length;
+  }
+
+  function setNameError(on) {
+    const company = field('company');
+    if (on) {
+      company.setAttribute('aria-invalid', 'true');
+      company.setAttribute('aria-describedby', 'title-error');
+    } else {
+      company.removeAttribute('aria-invalid');
+      company.removeAttribute('aria-describedby');
+    }
+  }
+
+  function saveEditor() {
+    if (!validateEditor()) return;
     if ($('#tag-input').value.trim()) addTag($('#tag-input').value);
     if ($('#step-input').value.trim()) {
       editor.checklist.push({ id: C.uid(), text: $('#step-input').value.trim(), done: false });
@@ -1037,7 +1382,14 @@
     if (!editor.id) {
       const plan = addPlan(values);
       if (values.status === 'done') celebrate(point);
-      toast(`Added “${truncate(plan.title)}”`);
+      if (C.isMeeting(plan) && plan.dueDate) {
+        toast(`Added “${truncate(plan.title)}” for ${C.dueInfo(plan).full}`, {
+          action: 'Add to my calendar',
+          onAction: () => downloadICS(findPlan(plan.id) || plan),
+        });
+      } else {
+        toast(`Added “${truncate(plan.title)}”`);
+      }
       return;
     }
 
@@ -1103,6 +1455,7 @@
 
     field('title').addEventListener('input', () => {
       $('#title-error').hidden = true;
+      setNameError(false);
     });
 
     $('#editor-delete').addEventListener('click', () => {
@@ -1124,11 +1477,50 @@
       } else {
         field('dueDate').value = C.toISODate(C.addDays(now, Number(value)));
       }
+      updateIcsButton();
     });
 
     form.addEventListener('change', (e) => {
       if (e.target.name === 'status') updateStepsSummary();
+      if (e.target.name === 'kind') {
+        // A plan needs a real title: keep the automatic one when leaving
+        // meetings, and let it follow the company again when coming back.
+        const title = field('title');
+        const auto = C.meetingTitle(oneLine(field('company').value));
+        if (!isMeetingForm() && !title.value.trim() && auto) title.value = auto;
+        else if (isMeetingForm() && auto && title.value.trim() === auto) title.value = '';
+        applyKind();
+      }
     });
+
+    // Meetings
+    field('company').addEventListener('input', () => {
+      updateTitlePlaceholder();
+      $('#title-error').hidden = true;
+      setNameError(false);
+    });
+    for (const [name, errorId] of LINK_FIELDS) {
+      const input = field(name);
+      input.addEventListener('input', () => {
+        $(`#${errorId}`).hidden = true;
+        input.setAttribute('aria-invalid', 'false');
+      });
+      // Tidy a pasted link when leaving the field, e.g. "zoom.us/j/1" → "https://zoom.us/j/1".
+      input.addEventListener('change', () => {
+        const cleaned = C.cleanUrl(C.extractUrl(input.value));
+        if (cleaned) input.value = cleaned;
+      });
+    }
+    for (const type of ['input', 'change']) field('dueDate').addEventListener(type, updateIcsButton);
+    $('#editor-ics').addEventListener('click', () => downloadICS({ ...editorValues(), id: editor.id }));
+    let zone = '';
+    try {
+      const parts = new Intl.DateTimeFormat(undefined, { timeZoneName: 'long' }).formatToParts(new Date());
+      zone = parts.find((part) => part.type === 'timeZoneName')?.value || '';
+    } catch {
+      /* no time zone name available */
+    }
+    $('#zone-hint').textContent = zone ? `Times are in your time zone (${zone}).` : 'Times are in your time zone.';
 
     // Tags
     const tagInput = $('#tag-input');
@@ -1415,23 +1807,44 @@
 
   /* ------------------------------------------------------- menu & import */
 
-  function exportPlans() {
-    const blob = new Blob([JSON.stringify(C.exportData(state.plans), null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const link = Object.assign(document.createElement('a'), {
-      href: url,
-      download: `dayplan-backup-${C.toISODate(new Date())}.json`,
-    });
+  function downloadFile(content, type, name) {
+    const url = URL.createObjectURL(new Blob([content], { type }));
+    const link = Object.assign(document.createElement('a'), { href: url, download: name });
     document.body.appendChild(link);
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function exportPlans() {
+    downloadFile(
+      JSON.stringify(C.exportData(state.plans), null, 2),
+      'application/json',
+      `dayplan-backup-${C.toISODate(new Date())}.json`
+    );
     toast(`Exported ${state.plans.length} ${state.plans.length === 1 ? 'plan' : 'plans'}`);
+  }
+
+  // A calendar file (.ics) the phone or computer calendar can open, with a
+  // reminder 15 minutes before the meeting.
+  function downloadICS(plan) {
+    const text = C.meetingICS(plan);
+    if (!text) {
+      toast('Add a date to the meeting first.');
+      return;
+    }
+    downloadFile(text, 'text/calendar;charset=utf-8', C.icsFileName(plan));
+    toast('Calendar file downloaded. Open it to add the meeting to your calendar.');
+  }
+
+  function openNewMeeting() {
+    openEditor(null, { kind: 'meeting', dueDate: state.prefs.view === 'calendar' ? state.selectedDay : '' });
   }
 
   async function importPlans(file) {
     try {
-      const incoming = C.importData(await file.text());
+      // An older backup has no meeting details: keep the ones already here.
+      const incoming = C.importData(await file.text(), new Date(), state.plans);
       const byId = new Map(state.plans.map((p) => [p.id, p]));
       const sameContent = (a, b) => JSON.stringify({ ...a, updatedAt: '' }) === JSON.stringify({ ...b, updatedAt: '' });
       const touched = []; // what the import changed, to undo exactly that
@@ -1501,6 +1914,9 @@
           break;
         case 'clear-done':
           clearCompleted();
+          break;
+        case 'new-meeting':
+          openNewMeeting();
           break;
         case 'shortcuts':
           $('#shortcuts').showModal();
@@ -1750,9 +2166,19 @@
 
   async function runSync() {
     const user = sync.user;
-    const ids = [...sync.pending];
-    sync.pending.clear();
-    for (const id of ids) sync.inflight.add(id);
+    // After reading plans saved by an older version, download the whole
+    // account once: the server kept the meeting details those copies lack.
+    const pullTo = olderDataLoads;
+    const fullPull = pullTo > olderDataPulled;
+    // Edits to plans read from such a copy wait for that download: the
+    // account may hold meeting details the copy lacks, which sending it as is
+    // would erase.
+    const held = fullPull ? [...sync.pending].filter((id) => olderIds.has(id) && findPlan(id)) : [];
+    const ids = [...sync.pending].filter((id) => !held.includes(id));
+    for (const id of ids) {
+      sync.pending.delete(id);
+      sync.inflight.add(id);
+    }
     const changes = ids.map((id) => {
       const plan = findPlan(id);
       if (plan) return { id, data: plan };
@@ -1760,7 +2186,12 @@
     });
     if (ids.length) setSyncStatus('saving');
     try {
-      const result = await api('api/sync', { epoch: sync.epoch || undefined, cursor: sync.cursor, changes });
+      const result = await api('api/sync', {
+        epoch: sync.epoch || undefined,
+        cursor: sync.cursor,
+        full: fullPull || undefined,
+        changes,
+      });
       if (sync.user !== user) return; // signed out while this was running
       sync.inflight.clear();
       if (result.reset) {
@@ -1792,6 +2223,23 @@
         savePlans();
         if (state.dragId) state.renderAfterDrag = true; // don't pull the card out from under the pointer
         else render();
+      }
+      if (fullPull) {
+        // Put the account's meeting details back onto the held edits.
+        const server = new Map((result.changes || []).map((c) => [c.id, c.data]));
+        let repaired = false;
+        state.plans = state.plans.map((p) => {
+          const copy = server.get(p.id);
+          if (!held.includes(p.id) || C.isMeeting(p) || !C.isMeeting(copy)) return p;
+          repaired = true;
+          const { company, meetingUrl, jobUrl } = copy;
+          return C.normalizePlan({ ...p, kind: 'meeting', company, meetingUrl, jobUrl });
+        });
+        if (repaired) render();
+        if (pullTo === olderDataLoads) olderIds.clear(); // unless another old copy was read meanwhile
+        if (held.length) sync.again = true;
+        olderDataPulled = pullTo;
+        savePlans(); // stored in the current format now, so this isn't repeated
       }
       sync.retryDelay = 0;
       saveSyncState();
@@ -2441,7 +2889,7 @@
         }
         case 'cycle': {
           const plan = findPlan(id);
-          if (plan) changeStatus(id, C.nextStatus(plan.status), el);
+          if (plan) changeStatus(id, C.nextStatus(plan.status, plan.kind), el);
           break;
         }
         case 'set-status':
@@ -2451,7 +2899,11 @@
           setTagFilter(el.dataset.tag);
           break;
         case 'new':
-          openEditor(null, { status: el.dataset.status || 'todo', dueDate: el.dataset.date || '' });
+          openEditor(null, {
+            status: el.dataset.status || 'todo',
+            dueDate: el.dataset.date || '',
+            kind: el.dataset.kind || 'plan',
+          });
           break;
         case 'samples':
           addSamples();
@@ -2482,6 +2934,17 @@
       }
     });
 
+    view.addEventListener(
+      'toggle',
+      (e) => {
+        const section = e.target.dataset && e.target.dataset.section;
+        if (!section) return;
+        if (e.target.open) state.openSections.add(section);
+        else state.openSections.delete(section);
+      },
+      true
+    );
+
     view.addEventListener('dblclick', (e) => {
       const day = e.target.closest('.cal-day');
       if (day && !e.target.closest('.cal-chip')) openEditor(null, { dueDate: day.dataset.date });
@@ -2497,7 +2960,7 @@
   }
 
   function clearFilters() {
-    state.filters = { query: '', tag: '', priority: '' };
+    state.filters = { query: '', tag: '', priority: '', kind: '' };
     $('#search').value = '';
     render();
   }
@@ -2513,6 +2976,7 @@
     box.addEventListener('change', (e) => {
       const which = e.target.dataset.filter;
       if (which === 'priority') state.filters.priority = e.target.value;
+      if (which === 'kind') state.filters.kind = e.target.value;
       if (which === 'sort') {
         state.prefs.sort = e.target.value;
         savePrefs();
@@ -2545,6 +3009,11 @@
         case 'N':
           e.preventDefault();
           $('#qa-input').focus();
+          break;
+        case 'm':
+        case 'M':
+          e.preventDefault();
+          openNewMeeting();
           break;
         case '/':
           e.preventDefault();
@@ -2588,6 +3057,7 @@
         setView('today');
       });
     }
+    $('#new-meeting').addEventListener('click', openNewMeeting);
     $('#new-plan').addEventListener('click', () =>
       openEditor(null, state.prefs.view === 'calendar' ? { dueDate: state.selectedDay } : {})
     );
@@ -2613,9 +3083,13 @@
     // Keep other tabs in sync and refresh relative deadlines over time.
     window.addEventListener('storage', (e) => {
       if (e.key === STORAGE_KEY) {
-        state.plans = loadPlans();
+        state.plans = loadPlans(state.plans);
+        // A tab still running an older version saved over the meeting details:
+        // store them again (this tab still had them), then check the account.
+        if (restoredOnLoad) savePlans();
         if (state.dragId) state.renderAfterDrag = true;
         else render();
+        if (olderDataLoads > olderDataPulled) syncNow();
       }
       if (e.key === SYNC_KEY) adoptSyncStateFromOtherTab();
     });

@@ -15,6 +15,12 @@
   const PRIORITIES = ['low', 'medium', 'high'];
   const PRIORITY_LABELS = { low: 'Low', medium: 'Medium', high: 'High' };
   const PRIORITY_RANK = { high: 0, medium: 1, low: 2 };
+  const KINDS = ['plan', 'meeting'];
+  const KIND_LABELS = { plan: 'Plan', meeting: 'Meeting' };
+  const COMPANY_MAX = 120;
+  const URL_MAX = 2000;
+  // How long a meeting is assumed to last, and how early it counts as "now".
+  const MEETING_WINDOW_MIN = 60;
   const DAY_MS = 24 * 60 * 60 * 1000;
 
   /* ------------------------------------------------------------------ ids */
@@ -83,6 +89,16 @@
     });
   }
 
+  // Like formatTime, but leaves out ":00" on the hour ("2 PM", "2:30 PM").
+  function formatShortTime(time) {
+    const [h, m] = time.split(':').map(Number);
+    // Only a 12-hour clock can drop ":00" ("2 PM"); on a 24-hour clock a bare
+    // "14" would read like a day of the month.
+    const cycle = new Intl.DateTimeFormat(undefined, { hour: 'numeric' }).resolvedOptions().hourCycle;
+    if (m || (cycle !== 'h11' && cycle !== 'h12')) return formatTime(time);
+    return new Date(2000, 0, 1, h, m).toLocaleTimeString(undefined, { hour: 'numeric' });
+  }
+
   function formatDate(date, now = new Date()) {
     const opts = { weekday: 'short', month: 'short', day: 'numeric' };
     if (date.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
@@ -93,11 +109,19 @@
     return `${n} ${word}${n === 1 ? '' : 's'}`;
   }
 
+  // Local start time of a plan with a valid date and time.
+  function startTime(due, time) {
+    const [h, m] = time.split(':').map(Number);
+    return new Date(due.getFullYear(), due.getMonth(), due.getDate(), h, m);
+  }
+
   /*
    * Describes how close a plan's deadline is.
    * state: none | overdue | today | soon | later | done
+   * Meetings use meetingInfo instead and are never overdue.
    */
   function dueInfo(plan, now = new Date()) {
+    if (plan.kind === 'meeting') return meetingInfo(plan, now);
     const due = parseISODate(plan.dueDate);
     if (!due) return { state: 'none', label: 'No deadline', full: '', days: null };
 
@@ -121,6 +145,45 @@
       return info(days <= 3 ? 'soon' : 'later', `Due ${weekday}${at}`);
     }
     return info('later', `Due ${formatDate(due, now)}`);
+  }
+
+  /*
+   * Describes when a meeting starts. A meeting is "now" from 60 minutes
+   * before its start until 60 minutes after, then "past".
+   * state: none | now | past | today | soon | later | done
+   * `minutes` is the time until the start (negative once it has begun),
+   * or null when no time is set.
+   */
+  function meetingInfo(plan, now) {
+    const due = parseISODate(plan.dueDate);
+    if (!due) return { state: 'none', label: 'Date not set', full: '', days: null, minutes: null };
+
+    const days = daysBetween(now, due);
+    const hasTime = isValidTime(plan.dueTime);
+    const at = hasTime ? ` at ${formatTime(plan.dueTime)}` : '';
+    const full = `${formatDate(due, now)}${at}`;
+    // `|| 0` turns -0 into 0, so the last half-minute still reads "Starting now".
+    const minutes = hasTime ? Math.ceil((startTime(due, plan.dueTime) - now) / 60000) || 0 : null;
+    const info = (state, label) => ({ state, label, full, days, minutes });
+
+    if (plan.status === 'done') return info('done', full);
+    if (minutes !== null && minutes > -MEETING_WINDOW_MIN && minutes <= MEETING_WINDOW_MIN) {
+      if (minutes > 0) return info('now', `Starts in ${plural(minutes, 'minute')}`);
+      return info('now', minutes === 0 ? 'Starting now' : 'Happening now');
+    }
+    if (days < 0 || (minutes !== null && minutes <= -MEETING_WINDOW_MIN)) {
+      if (days === 0) return info('past', `Earlier today${at}`);
+      if (days === -1) return info('past', `Yesterday${at}`);
+      return info('past', full);
+    }
+    if (days === 0) return info('today', `Today${at}`);
+    if (days === 1) return info('soon', `Tomorrow${at}`);
+    if (days < 7) {
+      const weekday = due.toLocaleDateString(undefined, { weekday: 'long' });
+      return info(days <= 3 ? 'soon' : 'later', `${weekday}${at}`);
+    }
+    // Unlike plans, the time is kept: it matters for a meeting.
+    return info('later', full);
   }
 
   /* ------------------------------------------------------------ quick add */
@@ -279,7 +342,61 @@
     };
   }
 
+  /* ---------------------------------------------------------------- links */
+
+  /*
+   * The only gate a link passes through: returns a clean http(s) address,
+   * or '' for anything else (javascript:, data:, local hosts, user names...).
+   * "zoom.us/j/1" becomes "https://zoom.us/j/1". cleanUrl(cleanUrl(x)) is
+   * always cleanUrl(x).
+   */
+  function cleanUrl(value) {
+    if (typeof value !== 'string') return '';
+    let s = value.trim();
+    if (!s || s.length > URL_MAX || /[\s\u0000-\u001f\u007f-\u009f]/.test(s)) return '';
+    if (!/^[a-z][a-z\d+.-]*:/i.test(s)) s = `https://${s.replace(/^\/+/, '')}`;
+    let url;
+    try {
+      url = new URL(s);
+    } catch {
+      return '';
+    }
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return '';
+    if (!url.hostname.includes('.') || url.username !== '' || url.password !== '') return '';
+    // The parser escapes a double quote everywhere except in the host name.
+    if (url.href.length > URL_MAX || url.href.includes('"')) return '';
+    return url.href;
+  }
+
+  // Finds the link in pasted invitation text ("Join Zoom Meeting https://…").
+  // A single word is returned as it is, so cleanUrl can still fix "zoom.us/j/1".
+  function extractUrl(value) {
+    const t = String(value || '').trim();
+    if (!/\s/.test(t)) return t;
+    // Bounded, and trailing punctuation is trimmed with a loop: a regex over
+    // a huge pasted text would freeze the page.
+    const match = /https?:\/\/[^\s<>"'`]{1,2000}/i.exec(t);
+    if (!match) return t;
+    let url = match[0];
+    while (url && '.,;:!?)]}>\'"'.includes(url[url.length - 1])) url = url.slice(0, -1);
+    return url;
+  }
+
+  // "https://www.linkedin.com/jobs/1" gives "linkedin.com".
+  function linkHost(url) {
+    const u = cleanUrl(url);
+    return u ? new URL(u).hostname.replace(/^www\./, '') : '';
+  }
+
   /* ---------------------------------------------------------------- plans */
+
+  function isMeeting(plan) {
+    return Boolean(plan) && plan.kind === 'meeting';
+  }
+
+  function meetingTitle(company) {
+    return company ? `Interview with ${company}` : '';
+  }
 
   function normalizeTag(value) {
     return String(value || '')
@@ -301,6 +418,10 @@
     const status = STATUSES.includes(r.status) ? r.status : 'todo';
     const dueDate = parseISODate(r.dueDate) ? r.dueDate : '';
     const updatedAt = isStamp(r.updatedAt) ? r.updatedAt : stamp;
+    const kind = r.kind === 'meeting' ? 'meeting' : 'plan';
+    const meeting = kind === 'meeting';
+    // Only meetings keep a company and links; saving one as a plan clears them.
+    const company = meeting ? text(r.company, COMPANY_MAX).replace(/\s+/g, ' ').trim() : '';
 
     const tags = Array.isArray(r.tags) ? r.tags.map(normalizeTag).filter(Boolean) : [];
     const checklist = Array.isArray(r.checklist)
@@ -316,12 +437,18 @@
 
     return {
       id: text(r.id, 100) || uid(),
-      title: text(r.title, 200).trim() || 'Untitled plan',
+      title: text(r.title, 200).trim() || (meeting ? meetingTitle(company) || 'Untitled meeting' : 'Untitled plan'),
       description: text(r.description, 5000),
       dueDate,
       dueTime: dueDate && isValidTime(r.dueTime) ? r.dueTime : '',
       status,
       priority: PRIORITIES.includes(r.priority) ? r.priority : 'medium',
+      // Always written. A stored plan without `kind` was saved by an older
+      // version of Dayplan (see fromOlderVersion). Never stop writing it.
+      kind,
+      company,
+      meetingUrl: meeting ? cleanUrl(r.meetingUrl) : '',
+      jobUrl: meeting ? cleanUrl(r.jobUrl) : '',
       tags: [...new Set(tags)].slice(0, 20),
       checklist,
       order: Number.isFinite(r.order) ? r.order : 0,
@@ -374,7 +501,9 @@
     };
   }
 
-  function nextStatus(status) {
+  // Plans cycle To do → In progress → Done; meetings toggle To do ↔ Done.
+  function nextStatus(status, kind) {
+    if (kind === 'meeting') return status === 'done' ? 'todo' : 'done';
     return STATUSES[(STATUSES.indexOf(status) + 1) % STATUSES.length];
   }
 
@@ -436,13 +565,15 @@
   /* ---------------------------------------------------- filtering/sorting */
 
   function matchesFilters(plan, filters = {}) {
-    const { query = '', tag = '', priority = '' } = filters;
+    const { query = '', tag = '', priority = '', kind = '' } = filters;
+    if (kind && plan.kind !== kind) return false;
     if (tag && !plan.tags.includes(tag)) return false;
     if (priority && plan.priority !== priority) return false;
     const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
     if (!words.length) return true;
     const haystack = [
       plan.title,
+      plan.company,
       plan.description,
       ...plan.tags.map((t) => `#${t}`),
       ...plan.checklist.map((item) => item.text),
@@ -500,10 +631,19 @@
   }
 
   // Splits plans into the sections of the Today view. Each open plan lands
-  // in the first section it qualifies for.
+  // in the first section it qualifies for. Meetings from earlier days go to
+  // pastMeetings; this morning's meetings stay in today.
   function groupForToday(plans, now = new Date()) {
     const todayKey = toISODate(now);
-    const groups = { overdue: [], today: [], inProgress: [], upcoming: [], doneToday: [], later: [] };
+    const groups = {
+      overdue: [],
+      today: [],
+      inProgress: [],
+      upcoming: [],
+      pastMeetings: [],
+      doneToday: [],
+      later: [],
+    };
 
     for (const plan of plans) {
       if (plan.status === 'done') {
@@ -511,24 +651,40 @@
         continue;
       }
       const due = dueInfo(plan, now);
-      if (due.state === 'overdue') groups.overdue.push(plan);
-      else if (due.state === 'today') groups.today.push(plan);
+      if (due.state === 'past' && due.days < 0) groups.pastMeetings.push(plan);
+      else if (due.state === 'overdue') groups.overdue.push(plan);
+      else if (due.state === 'today' || due.state === 'now' || due.state === 'past') groups.today.push(plan);
       else if (plan.status === 'in_progress') groups.inProgress.push(plan);
       else if (due.days !== null && due.days <= 7) groups.upcoming.push(plan);
       else groups.later.push(plan);
     }
 
-    for (const key of ['overdue', 'today', 'inProgress', 'upcoming', 'later']) {
+    for (const key of ['overdue', 'today', 'inProgress', 'upcoming', 'pastMeetings', 'later']) {
       groups[key].sort((a, b) => byDeadline(a, b) || byOrder(a, b));
     }
+    groups.pastMeetings.reverse(); // newest first
     groups.doneToday.sort((a, b) => b.completedAt.localeCompare(a.completedAt));
     return groups;
   }
 
-  // The single plan that deserves attention right now.
+  // The single plan that deserves attention right now: a meeting that is
+  // about to start (or has just started) comes before everything else.
   function nextUp(plans, now = new Date()) {
+    // With back-to-back interviews, the one closest to its start time wins:
+    // the next one about to begin rather than the previous one still running.
+    const away = (p) => Math.abs(dueInfo(p, now).minutes);
+    const meetingNow = plans
+      .filter((p) => isMeeting(p) && dueInfo(p, now).state === 'now')
+      .sort((a, b) => away(a) - away(b) || byDeadline(a, b) || byOrder(a, b))[0];
+    if (meetingNow) return meetingNow;
     const g = groupForToday(plans, now);
-    return g.overdue[0] || g.today[0] || g.inProgress[0] || g.upcoming[0] || null;
+    return (
+      g.overdue[0] ||
+      g.today.find((p) => dueInfo(p, now).state !== 'past') ||
+      g.inProgress[0] ||
+      g.upcoming[0] ||
+      null
+    );
   }
 
   function computeStats(plans, now = new Date()) {
@@ -570,7 +726,14 @@
     }
 
     // Today's progress: finished today vs. still due (or overdue) today.
-    const remaining = plans.filter((p) => p.status !== 'done' && p.dueDate && p.dueDate <= todayKey).length;
+    // Meetings from earlier days are over, so they don't count as remaining.
+    const remaining = plans.filter(
+      (p) =>
+        p.status !== 'done' &&
+        p.dueDate &&
+        p.dueDate <= todayKey &&
+        !(p.kind === 'meeting' && p.dueDate < todayKey)
+    ).length;
     stats.todayTotal = stats.doneToday + remaining;
     stats.todayPct = stats.todayTotal ? Math.round((stats.doneToday / stats.todayTotal) * 100) : 0;
     return stats;
@@ -584,6 +747,105 @@
     const offset = (first.getDay() - weekStart + 7) % 7;
     const start = addDays(first, -offset);
     return Array.from({ length: 42 }, (_, i) => addDays(start, i));
+  }
+
+  /* -------------------------------------------------------- calendar file */
+
+  // Escapes a TEXT value for a calendar file (RFC 5545). The backslash goes first.
+  function icsText(value) {
+    return String(value ?? '')
+      .replace(/\\/g, '\\\\')
+      .replace(/;/g, '\\;')
+      .replace(/,/g, '\\,')
+      .replace(/\r\n|\r|\n/g, '\\n')
+      .replace(/[\u0000-\u001f\u007f-\u009f]/g, '');
+  }
+
+  // "2026-10-20T12:30:00.000Z" becomes "20261020T123000Z".
+  const icsStamp = (date) => date.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+  const icsDate = (date) => toISODate(date).replace(/-/g, '');
+
+  // Splits a line longer than 75 bytes (UTF-8) into continuation lines that
+  // start with a space. Goes one character at a time, so none is ever split.
+  function foldLine(line, encoder) {
+    const parts = [];
+    let current = '';
+    let size = 0;
+    for (const ch of line) {
+      const bytes = encoder.encode(ch).length;
+      if (size + bytes > 75) {
+        parts.push(current);
+        current = ' ';
+        size = 1;
+      }
+      current += ch;
+      size += bytes;
+    }
+    parts.push(current);
+    return parts.join('\r\n');
+  }
+
+  /*
+   * A calendar file (.ics) for a meeting, with a reminder 15 minutes before
+   * when it has a time. Times are written in UTC, so calendar apps show the
+   * same moment the planner does. Returns '' for plans and undated meetings.
+   */
+  function meetingICS(plan, now = new Date()) {
+    const due = parseISODate(plan.dueDate);
+    if (!isMeeting(plan) || !due) return '';
+    const hasTime = isValidTime(plan.dueTime);
+    const meetingUrl = cleanUrl(plan.meetingUrl);
+    const jobUrl = cleanUrl(plan.jobUrl);
+
+    const details = [
+      plan.company ? `Company: ${plan.company}` : '',
+      meetingUrl ? `Meeting link: ${meetingUrl}` : '',
+      jobUrl ? `Job description: ${jobUrl}` : '',
+    ].filter(Boolean);
+    const notes = String(plan.description || '').trim();
+    const description = [details.join('\n'), notes].filter(Boolean).join('\n\n');
+
+    const lines = [
+      'BEGIN:VCALENDAR',
+      'VERSION:2.0',
+      'PRODID:-//Dayplan//EN',
+      'CALSCALE:GREGORIAN',
+      'METHOD:PUBLISH',
+      'BEGIN:VEVENT',
+      `UID:${icsText(plan.id)}@dayplan`,
+      `DTSTAMP:${icsStamp(now)}`,
+    ];
+    if (hasTime) {
+      const start = startTime(due, plan.dueTime);
+      const end = new Date(start.getTime() + MEETING_WINDOW_MIN * 60000);
+      lines.push(`DTSTART:${icsStamp(start)}`, `DTEND:${icsStamp(end)}`);
+    } else {
+      lines.push(`DTSTART;VALUE=DATE:${icsDate(due)}`, `DTEND;VALUE=DATE:${icsDate(addDays(due, 1))}`);
+    }
+    lines.push(`SUMMARY:${icsText(plan.title)}`);
+    // URL is a URI value, so it isn't escaped; cleanUrl leaves no spaces or control characters.
+    if (meetingUrl) lines.push(`LOCATION:${icsText(meetingUrl)}`, `URL:${meetingUrl}`);
+    lines.push(`DESCRIPTION:${icsText(description)}`);
+    if (hasTime) {
+      // RFC 5545 requires a DESCRIPTION in a DISPLAY alarm.
+      lines.push('BEGIN:VALARM', 'ACTION:DISPLAY', `DESCRIPTION:${icsText(plan.title)}`, 'TRIGGER:-PT15M', 'END:VALARM');
+    }
+    lines.push('END:VEVENT', 'END:VCALENDAR');
+
+    const encoder = new TextEncoder();
+    return `${lines.map((line) => foldLine(line, encoder)).join('\r\n')}\r\n`;
+  }
+
+  // "interview-with-acme-inc-2026-10-20.ics"
+  function icsFileName(plan) {
+    const slug =
+      String(plan.title || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 40)
+        .replace(/-+$/, '') || 'meeting';
+    return `${slug}${parseISODate(plan.dueDate) ? `-${plan.dueDate}` : ''}.ics`;
   }
 
   /* ------------------------------------------------------------------ sync */
@@ -601,6 +863,28 @@
     return ids;
   }
 
+  // True for a stored plan written by an older version of Dayplan, which
+  // didn't know about meetings and so never wrote `kind`.
+  function fromOlderVersion(raw) {
+    return raw !== null && typeof raw === 'object' && !Object.prototype.hasOwnProperty.call(raw, 'kind');
+  }
+
+  // An older version drops the fields it doesn't know about, so its copy of a
+  // meeting arrives without them. Keep the details of the meeting we have.
+  // A copy that says kind: 'plan' was written on purpose and does convert it.
+  function keepMeetingDetails(raw, current) {
+    if (fromOlderVersion(raw) && current && current.kind === 'meeting') {
+      return {
+        ...raw,
+        kind: 'meeting',
+        company: current.company,
+        meetingUrl: current.meetingUrl,
+        jobUrl: current.jobUrl,
+      };
+    }
+    return raw;
+  }
+
   // Applies changes from the server. `data: null` means deleted. Plans with
   // local edits that haven't been sent yet (`skip`) keep the local version.
   function applyRemoteChanges(plans, changes, skip = new Set(), now = new Date()) {
@@ -612,8 +896,8 @@
         if (byId.delete(change.id)) changed = true;
         continue;
       }
-      const incoming = normalizePlan({ ...change.data, id: change.id }, now);
       const current = byId.get(change.id);
+      const incoming = normalizePlan({ ...keepMeetingDetails(change.data, current), id: change.id }, now);
       if (current && JSON.stringify(current) === JSON.stringify(incoming)) continue;
       byId.set(change.id, incoming);
       changed = true;
@@ -627,14 +911,17 @@
     return { app: 'dayplan', version: 1, exportedAt: now.toISOString(), plans };
   }
 
-  function importData(input, now = new Date()) {
+  // `current` is the plans already loaded: a meeting in it keeps its details
+  // when the imported copy was written by an older version (see keepMeetingDetails).
+  function importData(input, now = new Date(), current = []) {
     const data = typeof input === 'string' ? JSON.parse(input) : input;
     const list = Array.isArray(data) ? data : data && Array.isArray(data.plans) ? data.plans : null;
     if (!list) throw new Error('This file does not contain any plans.');
+    const byId = new Map(current.map((p) => [p.id, p]));
     const seen = new Set();
     return list
       .filter((item) => item && typeof item === 'object')
-      .map((item) => normalizePlan(item, now))
+      .map((item) => normalizePlan(keepMeetingDetails(item, byId.get(item.id)), now))
       .filter((plan) => !seen.has(plan.id) && seen.add(plan.id));
   }
 
@@ -690,6 +977,21 @@
         checklist: [step('Outline'), step('Slides'), step('Rehearse once')],
       },
       {
+        title: 'Interview with Northwind Traders',
+        kind: 'meeting',
+        company: 'Northwind Traders',
+        description: 'Ask about the team and the next steps.',
+        dueDate: day(2),
+        dueTime: '14:00',
+        status: 'todo',
+        priority: 'high',
+        tags: ['job-search'],
+        // example.com on purpose: sample links must never lead anywhere real.
+        meetingUrl: 'https://example.com/interview',
+        jobUrl: 'https://example.com/jobs/product-designer',
+        checklist: [step('Research the company'), step('Prepare three questions')],
+      },
+      {
         title: 'Read 20 pages',
         status: 'todo',
         priority: 'low',
@@ -706,6 +1008,8 @@
     STATUS_LABELS,
     PRIORITIES,
     PRIORITY_LABELS,
+    KINDS,
+    KIND_LABELS,
     uid,
     toISODate,
     parseISODate,
@@ -715,9 +1019,15 @@
     daysBetween,
     isValidTime,
     formatTime,
+    formatShortTime,
     formatDate,
     dueInfo,
     parseQuickAdd,
+    cleanUrl,
+    extractUrl,
+    linkHost,
+    isMeeting,
+    meetingTitle,
     normalizeTag,
     normalizePlan,
     createPlan,
@@ -733,7 +1043,11 @@
     nextUp,
     computeStats,
     monthGrid,
+    meetingICS,
+    icsFileName,
     changedPlanIds,
+    fromOlderVersion,
+    keepMeetingDetails,
     applyRemoteChanges,
     exportData,
     importData,

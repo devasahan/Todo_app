@@ -499,10 +499,27 @@ def change_stamp(change, data):
     return canonical_stamp(stamp)
 
 
+def keep_missing_fields(stored, incoming):
+    """Returns `incoming` plus any top-level field the stored copy has and it lacks.
+
+    An older version of the app drops fields it doesn't know about (such as a
+    meeting's company and links) when it saves a plan. So a field left out of
+    a plan never removes it. To clear a field, send it with an empty value.
+    """
+    try:
+        old = json.loads(stored)
+    except ValueError:
+        return incoming
+    if not isinstance(old, dict):
+        return incoming
+    missing = {key: value for key, value in old.items() if key not in incoming}
+    return {**incoming, **missing} if missing else incoming
+
+
 def api_sync(conn, environ, body):
     """Saves the client's changed plans and returns everything changed elsewhere.
 
-    Request:  {"epoch": "...", "cursor": <last rev seen>,
+    Request:  {"epoch": "...", "cursor": <last rev seen>, "full": true (optional),
                "changes": [{"id": "...", "data": {...}} or {"id": "...", "data": null, "deletedAt": "..."}]}
     Response: {"epoch": "...", "cursor": <new rev>, "changes": [...]}  or  {"epoch": "...", "reset": true}
 
@@ -511,6 +528,13 @@ def api_sync(conn, environ, body):
     sent back. So an old copy (from a browser that was signed out for a
     while, a second tab, an undo...) can never overwrite newer work or bring
     back a deleted plan.
+
+    To clear a field, send it with an empty value; leaving it out keeps the stored one.
+
+    "full": true returns every plan instead of only those changed since the
+    cursor (used once to repair copies saved by an older version of the app).
+    The cursor is still checked, so a database restored from an older copy is
+    noticed as usual.
     """
     user = current_user(conn, environ)
     if user is None:
@@ -538,7 +562,7 @@ def api_sync(conn, environ, body):
             encoded = json.dumps(data, separators=(',', ':'))
             if len(encoded) > MAX_PLAN_BYTES:
                 raise ApiError(413, 'A plan is too large to save.')
-        cleaned.append((change['id'], encoded, change_stamp(change, data)))
+        cleaned.append((change['id'], data, encoded, change_stamp(change, data)))
 
     epoch = database_epoch(conn)
     with conn:
@@ -556,16 +580,26 @@ def api_sync(conn, environ, body):
             return 200, {'epoch': epoch, 'reset': True}, []
 
         saved, stale = set(), set()
-        for plan_id, data, stamp in cleaned:
+        for plan_id, data, encoded, stamp in cleaned:
             row = conn.execute(
-                'SELECT data IS NOT NULL AS live, updated_at FROM plans WHERE user_id = ? AND id = ?',
+                'SELECT data, updated_at FROM plans WHERE user_id = ? AND id = ?',
                 (user['id'], plan_id),
             ).fetchone()
+            live = row is not None and row['data'] is not None
             if row is None and data is None:
                 continue  # deleting something the server never had
             if row is not None and not stamp > row['updated_at']:
                 stale.add(plan_id)  # the server has the same or a newer version
                 continue
+            if data is not None and live:
+                # An edit of a plan the server has: keep any field it left out
+                # (an older version of the app drops ones it doesn't know).
+                merged = keep_missing_fields(row['data'], data)
+                if merged is not data:
+                    encoded = json.dumps(merged, separators=(',', ':'))
+                    if len(encoded) > MAX_PLAN_BYTES:
+                        stale.add(plan_id)  # too large with them: the server keeps its copy
+                        continue
             if data is None:
                 # A deletion from a device whose clock runs ahead would beat
                 # later work on other devices: cap its time (but keep it newer
@@ -573,11 +607,11 @@ def api_sync(conn, environ, body):
                 cap = server_stamp(MAX_CLOCK_AHEAD_MS)
                 if stamp > cap:
                     stamp = max(cap, stamp_after(row['updated_at'])) if row is not None else cap
-            if data is not None and not (row and row['live']):
-                live = conn.execute(
+            if data is not None and not live:
+                live_plans = conn.execute(
                     'SELECT COUNT(*) FROM plans WHERE user_id = ? AND data IS NOT NULL', (user['id'],)
                 ).fetchone()[0]
-                if live >= MAX_PLANS:
+                if live_plans >= MAX_PLANS:
                     raise ApiError(413, 'This account has too many plans.')
             rev += 1
             saved.add(plan_id)
@@ -585,12 +619,13 @@ def api_sync(conn, environ, body):
                 'INSERT INTO plans (user_id, id, data, rev, updated_at) VALUES (?, ?, ?, ?, ?) '
                 'ON CONFLICT (user_id, id) DO UPDATE SET '
                 'data = excluded.data, rev = excluded.rev, updated_at = excluded.updated_at',
-                (user['id'], plan_id, data, rev, stamp),
+                (user['id'], plan_id, encoded, rev, stamp),
             )
         conn.execute('UPDATE users SET rev = ? WHERE id = ?', (rev, user['id']))
 
         rows = conn.execute(
-            'SELECT id, data FROM plans WHERE user_id = ? AND rev > ? ORDER BY rev', (user['id'], cursor)
+            'SELECT id, data FROM plans WHERE user_id = ? AND rev > ? ORDER BY rev',
+            (user['id'], 0 if body.get('full') is True else cursor),
         ).fetchall()
         seen = {row['id'] for row in rows}
         for plan_id in stale - seen:  # the client's copy lost: send the current one

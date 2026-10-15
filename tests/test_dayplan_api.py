@@ -17,6 +17,13 @@ from dayplan_wsgi import application  # noqa: E402
 
 EMAIL = 'me@example.com'
 PASSWORD = 'correct horse battery'
+# A meeting's own fields, which an older version of the app drops when it saves.
+MEETING = {
+    'kind': 'meeting',
+    'company': 'Acme',
+    'meetingUrl': 'https://example.com/j/1',
+    'jobUrl': 'https://example.com/jobs/1',
+}
 _clock = [0]
 
 
@@ -465,6 +472,21 @@ class Sync(ApiTestCase):
         # Nothing was saved from the rejected request.
         self.assertEqual(client.post('/api/sync', {'cursor': 0, 'changes': []})['json']['cursor'], 0)
 
+    def test_full_pull_returns_every_plan(self):
+        client = self.signed_in()
+        client.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a'), self.plan('b')]})
+        res = client.post('/api/sync', {'cursor': 2, 'full': True, 'changes': []})
+        self.assertEqual(res['json']['cursor'], 2)
+        self.assertEqual(sorted(c['id'] for c in res['json']['changes']), ['a', 'b'])
+        # Without the flag, only what changed since the cursor.
+        self.assertEqual(sync_part(client.post('/api/sync', {'cursor': 2, 'changes': []})), {'cursor': 2, 'changes': []})
+
+    def test_full_pull_still_notices_a_restored_database(self):
+        client = self.signed_in()
+        client.post('/api/sync', {'cursor': 0, 'changes': [self.plan('a')]})
+        res = client.post('/api/sync', {'cursor': 9, 'full': True, 'changes': []})
+        self.assertEqual(sync_part(res), {'reset': True})
+
     def test_deleting_unknown_plan_is_harmless(self):
         client = self.signed_in()
         res = client.post('/api/sync', {'cursor': 0, 'changes': [{'id': 'ghost', 'data': None}]})
@@ -495,6 +517,58 @@ class Sync(ApiTestCase):
             self.assertEqual(res['status'], 200)
             self.assertEqual(res['json']['cursor'], 3)
             self.assertEqual(client.post('/api/sync', {'cursor': 3, 'changes': [self.plan('c')]})['status'], 413)
+
+    def test_fields_an_older_app_leaves_out_are_kept(self):
+        laptop = self.signed_in()
+        t1, t2 = stamp(), stamp()
+        laptop.post('/api/sync', {'cursor': 0, 'changes': [self.plan('m', 'Interview with Acme', at=t1, **MEETING)]})
+        # A tab still running an older version renames it, leaving out the fields it doesn't know.
+        res = laptop.post('/api/sync', {'cursor': 1, 'changes': [self.plan('m', 'Renamed', at=t2)]})
+        self.assertEqual(sync_part(res), {'cursor': 2, 'changes': []})  # the merged copy isn't echoed back
+
+        phone = Client()
+        phone.post('/api/login', {'email': EMAIL, 'password': PASSWORD})
+        res = phone.post('/api/sync', {'cursor': 0, 'changes': []})
+        self.assertEqual(res['json']['changes'][0]['data'], {'id': 'm', 'title': 'Renamed', 'updatedAt': t2, **MEETING})
+
+    def test_a_field_sent_empty_is_cleared(self):
+        client = self.signed_in()
+        client.post('/api/sync', {'cursor': 0, 'changes': [self.plan('m', 'Interview with Acme', **MEETING)]})
+        as_plan = self.plan('m', 'Interview with Acme', kind='plan', company='', meetingUrl='', jobUrl='')
+        client.post('/api/sync', {'cursor': 1, 'changes': [as_plan]})
+        res = client.post('/api/sync', {'cursor': 0, 'changes': []})
+        self.assertEqual(res['json']['changes'][0]['data'], as_plan['data'])
+
+    def test_a_deleted_plan_does_not_get_old_fields_back(self):
+        client = self.signed_in()
+        client.post('/api/sync', {'cursor': 0, 'changes': [self.plan('m', 'Interview with Acme', **MEETING)]})
+        client.post('/api/sync', {'cursor': 1, 'changes': [self.deleted('m')]})
+        res = client.post('/api/sync', {'cursor': 2, 'changes': [self.plan('m', 'Fresh start')]})
+        self.assertEqual(sync_part(res), {'cursor': 3, 'changes': []})
+        data = client.post('/api/sync', {'cursor': 0, 'changes': []})['json']['changes'][0]['data']
+        self.assertEqual(data['title'], 'Fresh start')
+        self.assertNotIn('company', data)
+
+    def test_out_of_date_copies_are_not_merged(self):
+        client = self.signed_in()
+        t1, t2 = stamp(), stamp()
+        current = self.plan('m', 'Interview with Acme', at=t2, **MEETING)
+        client.post('/api/sync', {'cursor': 0, 'changes': [current]})
+        res = client.post('/api/sync', {'cursor': 1, 'changes': [self.plan('m', 'Old title', at=t1, notes='Old notes')]})
+        # Refused: the server's own copy comes back unchanged, and nothing new was saved.
+        self.assertEqual(sync_part(res), {'cursor': 1, 'changes': [current]})
+
+    def test_a_merge_that_would_be_too_large_keeps_the_server_copy(self):
+        client = self.signed_in()
+        current = self.plan('m', notes='x' * 60000)
+        client.post('/api/sync', {'cursor': 0, 'changes': [current]})
+        # Each copy fits on its own, but together they would pass MAX_PLAN_BYTES.
+        res = client.post('/api/sync', {'cursor': 1, 'changes': [self.plan('m', other='y' * 60000)]})
+        self.assertEqual(res['status'], 200)
+        self.assertEqual(res['json']['cursor'], 1)
+        data = res['json']['changes'][0]['data']
+        self.assertEqual(data['notes'], current['data']['notes'])
+        self.assertNotIn('other', data)
 
     def test_server_errors_do_not_leak_details(self):
         client = self.signed_in()
