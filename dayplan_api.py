@@ -9,6 +9,9 @@ and is active straight away; every later account waits until the admin
 approves it (in the app: account menu > Manage users). The admin can also
 turn accounts off, delete them, and stop new sign-ups.
 
+Only admin accounts plan. Every other approved account can view the
+admin's meetings (not their other plans) and change nothing.
+
 From a console:
 
     python3 ~/Todo_app/dayplan_api.py list-users
@@ -69,6 +72,13 @@ REQUEST_SENT = (
     '(If you already have an account, just sign in.)'
 )
 STATUSES = ('active', 'pending', 'disabled')
+# The parts of the admin's meetings that approved accounts may see. Anything
+# else stored with a meeting (and any field added to plans later) stays
+# private until it is added here.
+SCHEDULE_FIELDS = (
+    'kind', 'title', 'company', 'description', 'dueDate', 'dueTime', 'status', 'priority', 'tags',
+    'checklist', 'meetingUrl', 'jobUrl', 'createdAt', 'updatedAt', 'startedAt', 'completedAt',
+)
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 # Plan versions are compared by their ISO-8601 UTC time, e.g. 2026-10-14T09:30:00.000Z.
 STAMP_RE = re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?Z$')
@@ -535,10 +545,15 @@ def api_sync(conn, environ, body):
     cursor (used once to repair copies saved by an older version of the app).
     The cursor is still checked, so a database restored from an older copy is
     noticed as usual.
+
+    Only admin accounts have plans. Any other account gets 403 and nothing is
+    read or saved: it can only view the admin's meetings (see api_schedule).
     """
     user = current_user(conn, environ)
     if user is None:
         raise ApiError(401, 'Please sign in again.')
+    if not user['is_admin']:
+        raise ApiError(403, 'This account can view the meeting schedule but not change it.')
 
     cursor = body.get('cursor')
     changes = body.get('changes', [])
@@ -645,6 +660,50 @@ def api_sync(conn, environ, body):
     return 200, payload, []
 
 
+def schedule_order(meeting):
+    """Soonest first: by date, then time (untimed ones last in their day), then id.
+
+    Meetings without a date come after all the others.
+    """
+    def text(key):
+        value = meeting.get(key)
+        return value if isinstance(value, str) else ''
+    return (not text('dueDate'), text('dueDate'), text('dueTime') or '24:00', meeting['id'])
+
+
+def api_schedule(conn, environ, body):
+    """The admin's meetings, read-only, for every signed-in account (the admin too).
+
+    Response: {"meetings": [{"id": "...", "kind": "meeting", "title": "...", "dueDate": "...", ...}]}
+
+    This is all that approved accounts which aren't the admin can see. Only
+    plans the admin saved as meetings are shared, never their other plans,
+    and only the fields in SCHEDULE_FIELDS (a field that isn't stored is left
+    out). Meetings of an admin account that has been turned off are not shared.
+    """
+    user = current_user(conn, environ)
+    if user is None:
+        raise ApiError(401, 'Please sign in again.')
+
+    rows = conn.execute(
+        'SELECT plans.id, plans.data FROM plans JOIN users ON users.id = plans.user_id '
+        "WHERE users.is_admin = 1 AND users.status = 'active' AND plans.data IS NOT NULL"
+    ).fetchall()
+    meetings = []
+    for row in rows:
+        try:
+            data = json.loads(row['data'])
+        except (TypeError, ValueError):
+            continue  # not readable: skip it rather than fail the whole schedule
+        if not isinstance(data, dict) or data.get('kind') != 'meeting':
+            continue
+        meeting = {key: data[key] for key in SCHEDULE_FIELDS if key in data}
+        meeting['id'] = row['id']
+        meetings.append(meeting)
+    meetings.sort(key=schedule_order)
+    return 200, {'meetings': meetings}, []
+
+
 # -------------------------------------------------------------------- admin
 
 def require_admin(conn, environ):
@@ -725,6 +784,7 @@ ROUTES = {
     '/api/login': {'POST': api_login},
     '/api/logout': {'POST': api_logout},
     '/api/sync': {'POST': api_sync},
+    '/api/schedule': {'GET': api_schedule},
     '/api/admin/users': {'GET': api_admin_users, 'POST': api_admin_update_user},
     '/api/admin/settings': {'POST': api_admin_settings},
 }

@@ -2992,6 +2992,140 @@ select:hover {
   color: var(--accent);
 }
 
+/* ------------------------------------------------------------- viewers */
+
+/* Accounts the admin approves only look at the meeting schedule. */
+body[data-mode='viewer'] .quick-add,
+body[data-mode='viewer'] .view-tab:not([data-view='calendar']),
+body[data-mode='viewer'] .new-meeting,
+body[data-mode='viewer'] .new-plan,
+body[data-mode='viewer'] #menu,
+body[data-mode='viewer'] .sidebar-section,
+body[data-mode='viewer'] .sidebar-foot,
+body[data-mode='viewer'] .filters {
+  display: none !important;
+}
+
+body[data-mode='viewer'] .cal-side {
+  align-items: start;
+}
+
+.upcoming {
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-xs);
+}
+
+.upcoming .row-list {
+  box-shadow: none;
+}
+
+.upcoming .card.row,
+.day-panel .card.row {
+  padding: 10px 12px;
+}
+
+.upcoming .card.row .card-main {
+  display: block;
+}
+
+.upcoming .card.row .card-meta {
+  justify-content: flex-start;
+  margin-top: 6px;
+}
+
+.upcoming .muted {
+  font-size: 13px;
+}
+
+.details-body {
+  gap: 0;
+  padding-top: 8px;
+}
+
+.detail-list {
+  display: grid;
+  margin: 0;
+}
+
+.detail-row {
+  display: grid;
+  grid-template-columns: 140px minmax(0, 1fr);
+  gap: 4px 16px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.detail-row:last-child {
+  border-bottom: 0;
+}
+
+.detail-row dt {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 30px;
+}
+
+.detail-row dd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.detail-when {
+  font-weight: 500;
+}
+
+.link-host {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.detail-notes {
+  white-space: pre-wrap;
+}
+
+.detail-steps {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.detail-steps li {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.detail-steps .icon {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  color: var(--faint);
+}
+
+.detail-steps li.done {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.detail-steps li.done .icon {
+  color: var(--done);
+}
+
+#details-ics:disabled {
+  display: none;
+}
+
 /* ---------------------------------------------------------------- gate */
 
 /* On a site with accounts, visitors see this sign-in page, not the planner. */
@@ -3395,6 +3529,18 @@ select:hover {
     bottom: calc(80px + env(safe-area-inset-bottom));
   }
 
+  body[data-mode='viewer'] .sidebar {
+    display: none;
+  }
+
+  body[data-mode='viewer'] .page {
+    padding-bottom: calc(40px + env(safe-area-inset-bottom));
+  }
+
+  body[data-mode='viewer'] .toast {
+    bottom: calc(24px + env(safe-area-inset-bottom));
+  }
+
   /* Columns become swipeable panels. */
   .board {
     grid-template-columns: repeat(3, 82%);
@@ -3713,6 +3859,14 @@ select:hover {
 
   .gate-brand {
     padding: 18px 20px 22px;
+  }
+
+  .detail-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .detail-row dt {
+    line-height: 1.4;
   }
 
   .gate-pitch h2 {

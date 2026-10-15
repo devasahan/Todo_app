@@ -176,7 +176,7 @@
             <li><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5" /></svg>Always in sync between your phone and computer</li>
           </ul>
         </div>
-        <p class="gate-foot">Members only. New accounts are approved by the admin.</p>
+        <p class="gate-foot">Members only. Once the admin approves your account, you can view the meeting schedule.</p>
       </div>
 
       <div class="gate-panel">
@@ -226,6 +226,7 @@
             <legend class="sr-only">Type</legend>
             <div class="segmented kind-switch" id="kind-options"></div>
             <span class="field-hint" id="kind-hint" hidden>Saving this as a plan removes the company and links.</span>
+            <span class="field-hint" id="shared-hint" hidden>People you've approved can see this meeting (view only).</span>
           </fieldset>
 
           <label class="field meeting-only" hidden>
@@ -342,6 +343,25 @@
       </form>
     </dialog>
 
+    <!-- Read-only view of a meeting, for people who can only view the schedule. -->
+    <dialog id="details" class="modal" aria-labelledby="details-title">
+      <header class="modal-head">
+        <h2 id="details-title" tabindex="-1"></h2>
+        <button type="button" class="icon-btn" data-close aria-label="Close">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+        </button>
+      </header>
+      <div class="modal-body details-body" id="details-body"></div>
+      <footer class="modal-foot">
+        <button type="button" class="btn ghost" id="details-ics">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2" /><path d="M3 10h18M8 3v4M16 3v4M12 13v5M9.5 15.5h5" /></svg>
+          Add to my calendar
+        </button>
+        <span class="spacer"></span>
+        <button type="button" class="btn primary" data-close>Close</button>
+      </footer>
+    </dialog>
+
     <dialog id="admin" class="modal" aria-labelledby="admin-heading">
       <header class="modal-head">
         <h2 id="admin-heading" tabindex="-1">Manage users</h2>
@@ -360,7 +380,10 @@
         </label>
         <p class="field-error" id="admin-error" role="alert" hidden></p>
         <ul class="user-list" id="admin-users" aria-live="polite"></ul>
-        <p class="hint">You only see accounts here, never anyone's plans.</p>
+        <p class="hint">
+          People you approve can view your meetings (company, time, links and notes) on a read-only calendar. They
+          can't see your other plans or change anything.
+        </p>
       </div>
     </dialog>
 

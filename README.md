@@ -90,8 +90,7 @@ Nobody can use the planner on your site without signing in: visitors only see th
 ### Letting other people use your site
 
 Like most websites, anyone can open the **Create account** tab on the sign-in screen. Their account then
-waits for you: they see *"Request sent"*, and they can't sign in or use the planner until you
-approve them. (Sign-up gives the
+waits for you: they see *"Request sent"*, and they can't sign in until you approve them. (Sign-up gives the
 same answer whether or not an email already has an account, so strangers can't use it to find out
 who uses your site.)
 
@@ -102,8 +101,11 @@ who uses your site.)
 - Turn **Accept new sign-ups** off if you don't want any more requests (for example if strangers
   start spamming). People with accounts can still sign in.
 
-Everyone's plans are private, including from you as admin: **Manage users** shows accounts and
-how many plans each has, never what's in them.
+**What approved people can do: view your meetings, nothing else.** Only you (the admin) plan. Everyone
+you approve gets a read-only **Meetings** calendar of your meetings: company, date and time, the
+meeting link (**Join**), the job description link, notes and prep steps, and **Add to my calendar**.
+They can't see your other plans, and they can't add, change or delete anything; the server refuses
+it, not just the screen. Whatever you change shows up for them within a minute.
 
 **If you see "Something went wrong".** On the **Web** tab, open the **error log** link in the
 **Log files** section. The last lines say what failed. A misspelled username in step 4 is the most
@@ -286,7 +288,8 @@ How it's protected:
   at most 5 passwords a minute, and the whole site checks at most 30 a minute, so a flood of
   guesses can't slow it down. A very large flood from many connections can delay new sign-ins
   while it lasts; people who are already signed in aren't affected.
-- Each account only ever sees its own plans. The admin manages accounts, not their contents.
+- Only admin accounts can save anything. Other approved accounts can only read the admin's
+  meetings (a fixed list of meeting fields), never other plans or anyone else's data.
 - New accounts can't sign in until the admin approves them, and at most 50 requests can wait at
   once, so strangers can't fill up the database.
 

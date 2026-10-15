@@ -22,6 +22,7 @@
     check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
     chevronLeft: '<path d="M15 6l-6 6 6 6"/>',
     chevronRight: '<path d="M9 6l6 6-6 6"/>',
+    circle: '<circle cx="12" cy="12" r="7"/>',
     clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
     external: '<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
     flame: '<path d="M12 3c1 3 5 5 5 10a5 5 0 0 1-10 0c0-2 1-3.5 2-4.5 0 2 1 3 2 3 0-3-1-5 1-8.5z"/>',
@@ -154,10 +155,18 @@
     dragId: null,
     dropBeforeId: null,
     openSections: new Set(), // Today's expanded lists, kept open across refreshes
+    schedule: [], // the admin's meetings, for accounts that can only view them
   };
 
+  // Accounts the admin approves only view the admin's meetings, read-only.
+  const viewing = () => Boolean(sync.user) && !sync.admin;
+  // What the page shows: your own plans, or the meeting schedule when viewing.
+  const shownPlans = () => (viewing() ? state.schedule : state.plans);
   const findPlan = (id) => state.plans.find((p) => p.id === id);
-  const visiblePlans = () => state.plans.filter((p) => C.matchesFilters(p, state.filters));
+  const findShown = (id) => shownPlans().find((p) => p.id === id);
+  // Viewers can only see (and clear) the search box, so other filters don't apply to them.
+  const visiblePlans = () =>
+    shownPlans().filter((p) => C.matchesFilters(p, viewing() ? { query: state.filters.query } : state.filters));
   const filtersActive = () =>
     Boolean(state.filters.query || state.filters.tag || state.filters.priority || state.filters.kind);
 
@@ -223,7 +232,7 @@
   }
 
   function setView(view) {
-    if (!VIEWS.includes(view)) return;
+    if (!VIEWS.includes(view) || (viewing() && view !== 'calendar')) return;
     state.prefs.view = view;
     savePrefs();
     render();
@@ -283,8 +292,10 @@
 
   function render() {
     const restore = focusMemo();
-    const view = state.prefs.view;
+    // Viewers only have the calendar.
+    const view = viewing() ? 'calendar' : state.prefs.view;
     document.body.dataset.view = view;
+    document.body.dataset.mode = viewing() ? 'viewer' : 'planner';
     for (const tab of $$('.view-tab')) {
       if (tab.dataset.view === view) tab.setAttribute('aria-current', 'page');
       else tab.removeAttribute('aria-current');
@@ -361,6 +372,11 @@
   }
 
   function updateBadges() {
+    if (viewing()) {
+      $('[data-badge="today"]').hidden = true;
+      document.title = 'Dayplan';
+      return;
+    }
     const stats = C.computeStats(state.plans);
     const urgent = stats.overdue + stats.dueToday;
     const badge = $('[data-badge="today"]');
@@ -407,7 +423,7 @@
     } else {
       const month = state.calendarMonth;
       const prefix = C.toISODate(month).slice(0, 7);
-      const inMonth = state.plans.filter((p) => p.dueDate.startsWith(prefix));
+      const inMonth = shownPlans().filter((p) => p.dueDate.startsWith(prefix));
       const meetings = inMonth.filter(C.isMeeting).length;
       const due = inMonth.length - meetings;
       const name = month.toLocaleDateString(undefined, { month: 'long' });
@@ -417,13 +433,14 @@
       else if (meetings) subtitle = `${meetingsText} in ${name}`;
       else if (due) subtitle = `${plansText} in ${name}`;
       else subtitle = `No plans due in ${name}`;
+      if (viewing()) subtitle = `${meetings ? `${meetingsText} in ${name}` : `No meetings in ${name}`} · View only`;
     }
-    setText($('#page-title'), VIEW_TITLES[view]);
+    setText($('#page-title'), viewing() ? 'Meetings' : VIEW_TITLES[view]);
     setText($('#page-subtitle'), subtitle);
   }
 
   function renderSidebarTags() {
-    const tags = C.allTags(state.plans);
+    const tags = viewing() ? [] : C.allTags(state.plans);
     $('#sidebar-tags-section').hidden = !tags.length;
     setHTML(
       $('#sidebar-tags'),
@@ -440,7 +457,7 @@
 
   function renderFilters() {
     const box = $('#filters');
-    if (!state.plans.length) {
+    if (!state.plans.length || viewing()) {
       setHTML(box, '');
       return;
     }
@@ -501,7 +518,7 @@
     return `<button type="button" class="status-btn s-${plan.status}" data-action="cycle" aria-label="${esc(label)}" title="${esc(label)}">${icon('check')}</button>`;
   }
 
-  function metaHTML(plan, now) {
+  function metaHTML(plan, now, readOnly = viewing()) {
     const due = C.dueInfo(plan, now);
     const progress = C.checklistProgress(plan);
     const parts = [];
@@ -528,7 +545,9 @@
     }
     for (const t of plan.tags) {
       parts.push(
-        `<button type="button" class="chip tag" data-action="filter-tag" data-tag="${esc(t)}" title="Show only #${esc(t)}">#${esc(t)}</button>`
+        readOnly
+          ? `<span class="chip tag">#${esc(t)}</span>`
+          : `<button type="button" class="chip tag" data-action="filter-tag" data-tag="${esc(t)}" title="Show only #${esc(t)}">#${esc(t)}</button>`
       );
     }
     return parts.length ? `<div class="card-meta">${parts.join('')}</div>` : '';
@@ -571,7 +590,7 @@
     return links ? `<div class="card-links">${links}</div>` : '';
   }
 
-  function cardHTML(plan, { now = new Date(), draggable = false, row = false } = {}) {
+  function cardHTML(plan, { now = new Date(), draggable = false, row = false, readOnly = viewing() } = {}) {
     const progress = C.checklistProgress(plan);
     const meeting = C.isMeeting(plan);
     const due = meeting ? C.dueInfo(plan, now) : null;
@@ -582,9 +601,9 @@
       ? `${plan.title}, meeting, ${due.full || 'date not set'}, ${C.STATUS_LABELS[plan.status]}`
       : `${plan.title}, ${C.STATUS_LABELS[plan.status]}`;
     return `
-      <article class="card${row ? ' row' : ''}${meeting ? ' is-meeting' : ''} p-${plan.priority} is-${plan.status}" data-id="${esc(plan.id)}" data-action="edit"
-        tabindex="0" ${draggable ? 'draggable="true"' : ''} aria-label="${esc(label)}">
-        ${statusButton(plan)}
+      <article class="card${row ? ' row' : ''}${meeting ? ' is-meeting' : ''} p-${plan.priority} is-${plan.status}" data-id="${esc(plan.id)}"
+        data-action="${readOnly ? 'details' : 'edit'}" tabindex="0" ${draggable && !readOnly ? 'draggable="true"' : ''} aria-label="${esc(label)}">
+        ${readOnly ? '' : statusButton(plan)}
         <div class="card-main">
           <h3 class="card-title">${esc(plan.title)}</h3>
           ${plan.description ? `<p class="card-desc">${esc(plan.description)}</p>` : ''}
@@ -846,7 +865,8 @@
       }
       // Meetings read "2:30 PM Acme".
       return `
-        <button type="button" class="cal-chip is-meeting s-${p.status} p-${p.priority}" data-action="edit" data-id="${esc(p.id)}" draggable="true"
+        <button type="button" class="cal-chip is-meeting s-${p.status} p-${p.priority}" data-id="${esc(p.id)}"
+          ${viewing() ? 'data-action="details"' : 'data-action="edit" draggable="true"'}
           title="${esc(`${p.title}${at}${p.company ? ` · ${p.company}` : ''}`)}">
           <span class="sr-only">Meeting: </span>${p.dueTime ? `<span class="cal-time">${esc(C.formatShortTime(p.dueTime))}</span>` : ''}<span class="cal-title">${esc(p.company || p.title)}</span>
         </button>`;
@@ -921,20 +941,50 @@
             <div class="cal-week cal-weekdays" role="row">${headers}</div>
             ${weeks.join('')}
           </div>
-          <p class="hint">Tip: drag a plan onto another day to reschedule it. Double-click a day to add a plan.</p>
+          <p class="hint">${
+            viewing()
+              ? 'Select a meeting to see its details and links.'
+              : 'Tip: drag a plan onto another day to reschedule it. Double-click a day to add a plan.'
+          }</p>
         </section>
 
         <aside class="cal-side">
           ${dayPanelHTML(byDate.get(state.selectedDay) || [], now)}
+          ${viewing() ? upcomingHTML(plans, now) : unscheduledHTML(unscheduled, chip)}
+        </aside>
+      </div>`;
+  }
+
+  function unscheduledHTML(unscheduled, chip) {
+    return `
           <section class="unscheduled" data-drop-date="" aria-label="Plans without a deadline">
             <header class="side-head">
               <h3>No deadline <span class="count">${unscheduled.length}</span></h3>
             </header>
             <p class="hint">Drag one onto a day to schedule it. Drop a scheduled plan here to clear its deadline.</p>
             <div class="chip-list">${unscheduled.map(chip).join('') || '<p class="muted">Every open plan has a deadline.</p>'}</div>
-          </section>
-        </aside>
-      </div>`;
+          </section>`;
+  }
+
+  // For viewers: the meetings still to come, soonest first.
+  function upcomingHTML(plans, now) {
+    const upcoming = C.sortPlans(
+      // Undated ones too (last): otherwise a viewer could never see them.
+      plans.filter((p) => p.status !== 'done' && ['now', 'today', 'soon', 'later', 'none'].includes(C.dueInfo(p, now).state)),
+      'deadline'
+    );
+    const shown = upcoming.slice(0, 30);
+    return `
+      <section class="upcoming" aria-label="Upcoming meetings">
+        <header class="side-head">
+          <h3>Upcoming meetings <span class="count">${upcoming.length}</span></h3>
+        </header>
+        ${
+          shown.length
+            ? `<div class="row-list">${shown.map((p) => cardHTML(p, { now, row: true })).join('')}</div>`
+            : '<p class="muted">No upcoming meetings.</p>'
+        }
+      </section>`;
   }
 
   function dayPanelHTML(plans, now) {
@@ -944,15 +994,19 @@
       <section class="day-panel" aria-label="Plans on ${esc(label)}">
         <header class="side-head">
           <h3>${esc(label)}</h3>
-          <div class="side-actions">
-            <button type="button" class="btn primary small" data-action="new" data-date="${state.selectedDay}" aria-label="Add a plan on ${esc(label)}">${icon('plus')} Plan</button>
-            <button type="button" class="btn ghost small" data-action="new" data-kind="meeting" data-date="${state.selectedDay}" aria-label="Add a meeting on ${esc(label)}">${icon('video')} Meeting</button>
-          </div>
+          ${
+            viewing()
+              ? ''
+              : `<div class="side-actions">
+                  <button type="button" class="btn primary small" data-action="new" data-date="${state.selectedDay}" aria-label="Add a plan on ${esc(label)}">${icon('plus')} Plan</button>
+                  <button type="button" class="btn ghost small" data-action="new" data-kind="meeting" data-date="${state.selectedDay}" aria-label="Add a meeting on ${esc(label)}">${icon('video')} Meeting</button>
+                </div>`
+          }
         </header>
         ${
           plans.length
             ? `<div class="row-list">${plans.map((p) => cardHTML(p, { now, row: true })).join('')}</div>`
-            : '<p class="muted">Nothing planned for this day yet.</p>'
+            : `<p class="muted">${viewing() ? 'No meetings on this day.' : 'Nothing planned for this day yet.'}</p>`
         }
       </section>`;
   }
@@ -1016,7 +1070,7 @@
 
     view.addEventListener('dragstart', (e) => {
       const item = e.target instanceof Element && e.target.closest('[draggable="true"][data-id]');
-      if (!item) return;
+      if (!item || viewing()) return;
       state.dragId = item.dataset.id;
       // dragend still reaches the card itself if it was replaced meanwhile.
       item.addEventListener('dragend', endDrag, { once: true });
@@ -1120,6 +1174,7 @@
   }
 
   function openEditor(plan = null, defaults = {}) {
+    if (viewing()) return; // view-only accounts can't add or change anything
     editor.id = plan ? plan.id : null;
     const source = plan || {
       title: '',
@@ -1206,6 +1261,7 @@
     $('#step-input').placeholder = meeting
       ? 'Add a prep step and press Enter'
       : 'Break it down: add a step and press Enter';
+    $('#shared-hint').hidden = !(meeting && sync.user && sync.admin);
     const warn = Boolean(editor.id && editor.original?.kind === 'meeting' && !meeting);
     $('#kind-hint').hidden = !warn;
     // Read out with the selected type, but only while it's shown.
@@ -1369,6 +1425,7 @@
   }
 
   function saveEditor() {
+    if (viewing()) return;
     if (!validateEditor()) return;
     if ($('#tag-input').value.trim()) addTag($('#tag-input').value);
     if ($('#step-input').value.trim()) {
@@ -1594,6 +1651,65 @@
     });
   }
 
+  /* ----------------------------------------------------- meeting details */
+
+  // A read-only view of a meeting, for accounts that can only view the schedule.
+  const details = { dialog: $('#details'), id: null };
+
+  function openDetails(plan) {
+    if (!plan) return;
+    details.id = plan.id;
+    fillDetails(plan);
+    if (!details.dialog.open) details.dialog.showModal();
+    $('#details-title').focus();
+  }
+
+  function fillDetails(plan) {
+    const now = new Date();
+    const due = C.dueInfo(plan, now);
+    const who = plan.company || plan.title;
+    const row = (label, html) => `<div class="detail-row"><dt>${label}</dt><dd>${html}</dd></div>`;
+    const host = (url) => `<span class="link-host">${esc(C.linkHost(url))}</span>`;
+    const rows = [];
+    const when = due.full ? `${esc(due.full)}${plan.dueTime ? '' : ' (time not set)'}` : 'Date not set';
+    const live = due.label !== due.full && due.state !== 'none' ? ` <span class="chip due due-${due.state}">${esc(due.label)}</span>` : '';
+    rows.push(row('When', `<span class="detail-when">${when}</span>${live}`));
+    if (plan.company) rows.push(row('Company', esc(plan.company)));
+    const join = linkButton(plan.meetingUrl, {
+      action: 'open-meeting',
+      label: `Join the meeting with ${who} (opens in a new tab)`,
+      text: 'Join',
+      iconName: 'video',
+      kind: 'primary',
+    });
+    if (join) rows.push(row('Meeting link', `${join}${host(plan.meetingUrl)}`));
+    const job = jobButton(plan);
+    if (job) rows.push(row('Job description', `${job}${host(plan.jobUrl)}`));
+    if (plan.description) rows.push(row('Notes', `<p class="detail-notes">${esc(plan.description)}</p>`));
+    if (plan.checklist.length) {
+      const steps = plan.checklist
+        .map(
+          (item) =>
+            `<li class="${item.done ? 'done' : ''}">${icon(item.done ? 'check' : 'circle')}<span><span class="sr-only">${item.done ? 'Done: ' : 'Not done: '}</span>${esc(item.text)}</span></li>`
+        )
+        .join('');
+      rows.push(row('Prep steps', `<ul class="detail-steps">${steps}</ul>`));
+    }
+    if (plan.tags.length) rows.push(row('Tags', plan.tags.map((t) => `<span class="chip tag">#${esc(t)}</span>`).join(' ')));
+    if (plan.status === 'done') rows.push(row('Status', '<span class="status-tag s-done">Done</span>'));
+    $('#details-title').textContent = plan.title;
+    $('#details-body').innerHTML = `<dl class="detail-list">${rows.join('')}</dl>`;
+    $('#details-ics').disabled = !plan.dueDate;
+  }
+
+  function setupDetails() {
+    for (const btn of $$('[data-close]', details.dialog)) btn.addEventListener('click', () => details.dialog.close());
+    $('#details-ics').addEventListener('click', () => {
+      const plan = findShown(details.id);
+      if (plan) downloadICS(plan);
+    });
+  }
+
   /* ------------------------------------------------------------ quick add */
 
   function setupQuickAdd() {
@@ -1615,6 +1731,7 @@
 
     form.addEventListener('submit', (e) => {
       e.preventDefault();
+      if (viewing()) return;
       if (!input.value.trim()) {
         input.focus();
         return;
@@ -1949,6 +2066,9 @@
   // none of this appears and plans stay in this browser only.
 
   const SYNC_KEY = 'dayplan.sync.v1';
+  // Whose plans this browser holds, so plans left by one account are never
+  // added to another one (or shown to viewers as the admin's meetings).
+  const PLANS_OWNER_KEY = 'dayplan.plans-owner';
   const LOGOUT_KEY = 'dayplan.logout-pending';
   const SYNC_TEXT = {
     saved: 'All changes saved to your account',
@@ -1956,6 +2076,13 @@
     offline: "You're offline. Changes will be saved when you reconnect.",
     error: "Couldn't save your changes. Trying again…",
   };
+  const VIEWER_TEXT = {
+    saved: 'Showing the latest meetings',
+    saving: 'Loading the meetings…',
+    offline: "You're offline. Showing the meetings from your last visit.",
+    error: "Couldn't load the latest meetings. Trying again…",
+  };
+  const syncText = (status) => (viewing() ? VIEWER_TEXT : SYNC_TEXT)[status];
 
   const sync = {
     available: false, // the server supports accounts
@@ -1993,6 +2120,8 @@
       sync.pending = new Set(pending.filter((id) => typeof id === 'string'));
       const deleted = saved.deletedAt && typeof saved.deletedAt === 'object' ? saved.deletedAt : {};
       sync.deletedAt = new Map(Object.entries(deleted).filter(([, at]) => typeof at === 'string'));
+      // Saved before plans had a recorded owner: they belong to this account.
+      if (!readStorage(PLANS_OWNER_KEY)) writeStorage(PLANS_OWNER_KEY, sync.user);
     } catch {
       /* start without an account */
     }
@@ -2082,6 +2211,7 @@
     const mine = new Set([...sync.pending, ...sync.inflight]);
     const myDeletes = new Map(sync.deletedAt);
     const wasUser = sync.user;
+    const wasViewer = viewing();
     sync.user = '';
     sync.admin = false;
     loadSyncState();
@@ -2092,6 +2222,12 @@
     } else {
       sync.pendingUsers = 0;
       sync.notifiedPending = 0;
+    }
+    loadScheduleCache();
+    // Nothing from the previous account stays open on screen.
+    if (sync.user !== wasUser || viewing() !== wasViewer) {
+      if (details.dialog.open) details.dialog.close();
+      if (viewing()) closeEditingDialogs();
     }
     updateAccountUI();
     if (state.dragId) state.renderAfterDrag = true;
@@ -2148,6 +2284,7 @@
   // Sends local changes and fetches changes made in other browsers.
   // Only one request runs at a time; calls made meanwhile run right after.
   function syncNow() {
+    if (viewing()) return refreshSchedule();
     if (!sync.user || !sync.available) return Promise.resolve();
     if (sync.running) {
       sync.again = true;
@@ -2253,6 +2390,11 @@
         signedOutElsewhere();
         return;
       }
+      if (err.status === 403 && (await confirmedViewOnly(user))) {
+        // This account can only view the meeting schedule.
+        becomeViewer();
+        return;
+      }
       setSyncStatus(err.status ? 'error' : 'offline');
       sync.retryDelay = Math.min(sync.retryDelay ? sync.retryDelay * 2 : 5000, 5 * 60 * 1000);
       scheduleSync(sync.retryDelay);
@@ -2264,6 +2406,29 @@
   function startSession(email, admin = false) {
     sync.user = email;
     sync.admin = Boolean(admin);
+    if (viewing()) {
+      // View-only: nothing on this browser is sent to the account.
+      sync.epoch = '';
+      sync.cursor = 0;
+      sync.pending.clear();
+      sync.inflight.clear();
+      sync.deletedAt.clear();
+      sync.retryDelay = 0;
+      removeStorage(LOGOUT_KEY);
+      loadScheduleCache();
+      saveSyncState();
+      updateAccountUI();
+      render();
+      return refreshSchedule();
+    }
+    const owner = readStorage(PLANS_OWNER_KEY);
+    if (owner && owner !== email && state.plans.length) {
+      // Left here by another account (e.g. signed out by the server): they're
+      // in that account, and must not be added to this one.
+      state.plans = [];
+      savePlans();
+    }
+    writeStorage(PLANS_OWNER_KEY, email);
     sync.epoch = '';
     sync.cursor = 0;
     sync.pending = new Set(state.plans.map((p) => p.id));
@@ -2290,24 +2455,31 @@
   // password was changed). Plans stay here; signing in again merges them.
   function signedOutElsewhere() {
     const email = sync.user;
+    const wasViewer = viewing();
     const deleted = {};
     for (const id of new Set([...sync.pending, ...sync.inflight])) {
       if (!findPlan(id) && sync.deletedAt.has(id)) deleted[id] = sync.deletedAt.get(id);
     }
-    keepUnsentDeletes(email, deleted);
+    // A viewer never deletes anything (and mustn't drop an admin's saved deletions).
+    if (!wasViewer) keepUnsentDeletes(email, deleted);
     clearSyncState();
+    clearSchedule();
     auth.mode = 'signin';
     authField('email').value = email;
     authField('password').value = '';
     updateAccountUI();
     render();
-    toast('You were signed out. Sign in again to keep your plans in sync.', {
+    toast(wasViewer ? 'You were signed out. Sign in again to see the schedule.' : 'You were signed out. Sign in again to keep your plans in sync.', {
       action: 'Sign in',
       onAction: () => openAuth('signin', email),
     });
   }
 
   async function signOut() {
+    if (viewing()) {
+      await signOutViewer();
+      return;
+    }
     // Send everything first, including edits made while a sync was running.
     for (let i = 0; i < 3 && sync.user && (sync.pending.size || sync.running); i += 1) await syncNow();
     if (!sync.user) return; // the server had already signed this browser out
@@ -2327,7 +2499,9 @@
       writeStorage(LOGOUT_KEY, '1');
     }
     clearSyncState();
+    clearSchedule();
     removeStorage(UNSENT_DELETES_KEY);
+    removeStorage(PLANS_OWNER_KEY);
     auth.mode = 'signin';
     auth.form.reset();
     // Plans are safe in the account; don't leave them on a shared computer.
@@ -2339,18 +2513,135 @@
     toast('Signed out. Your plans are safe in your account.');
   }
 
+  // A viewer has nothing to send; only the meetings shown here are cleared.
+  async function signOutViewer() {
+    // Plans this account made before it became view-only are in the account;
+    // don't leave them on a shared computer (or let the admin's sign-in pick them up).
+    const ownPlans = readStorage(PLANS_OWNER_KEY) === sync.user;
+    try {
+      await api('api/logout', {});
+      removeStorage(LOGOUT_KEY);
+    } catch {
+      writeStorage(LOGOUT_KEY, '1');
+    }
+    clearSyncState();
+    clearSchedule();
+    if (ownPlans) {
+      state.plans = [];
+      savePlans();
+      removeStorage(PLANS_OWNER_KEY);
+    }
+    auth.mode = 'signin';
+    auth.form.reset();
+    updateAccountUI();
+    render();
+    toast('Signed out.');
+  }
+
+  /* ---- the meeting schedule, for view-only accounts */
+
+  const SCHEDULE_KEY = 'dayplan.schedule.v1';
+  let scheduleRequest = null;
+
+  // The meetings last seen by this account, so they show at once (and offline).
+  function loadScheduleCache() {
+    state.schedule = [];
+    try {
+      const saved = JSON.parse(readStorage(SCHEDULE_KEY) || 'null');
+      if (saved && saved.user === sync.user && Array.isArray(saved.meetings)) {
+        state.schedule = saved.meetings.map((m) => C.normalizePlan(m)).filter(C.isMeeting);
+      }
+    } catch {
+      /* start empty */
+    }
+  }
+
+  // Closes everything a view-only account mustn't use (without asking to discard).
+  function closeEditingDialogs() {
+    for (const dialog of [editor.dialog, admin.dialog]) if (dialog.open) dialog.close();
+  }
+
+  function clearSchedule() {
+    state.schedule = [];
+    removeStorage(SCHEDULE_KEY);
+    if (details.dialog.open) details.dialog.close();
+  }
+
+  function setSchedule(meetings) {
+    const before = JSON.stringify(state.schedule);
+    state.schedule = meetings;
+    if (JSON.stringify(meetings) === before) return;
+    writeStorage(SCHEDULE_KEY, JSON.stringify({ user: sync.user, meetings }));
+    render();
+    if (details.dialog.open) {
+      const shown = findShown(details.id);
+      if (shown) fillDetails(shown);
+      else {
+        details.dialog.close();
+        toast('That meeting was removed from the schedule.');
+      }
+    }
+  }
+
+  // Fetches the admin's meetings. Only meetings are shared, never other plans.
+  function refreshSchedule() {
+    if (!viewing() || !sync.available) return Promise.resolve();
+    if (scheduleRequest) return scheduleRequest;
+    const user = sync.user;
+    scheduleRequest = api('api/schedule')
+      .then((result) => {
+        if (sync.user !== user || !viewing()) return;
+        const meetings = (Array.isArray(result && result.meetings) ? result.meetings : [])
+          .map((m) => C.normalizePlan(m))
+          .filter(C.isMeeting);
+        setSchedule(meetings);
+        setSyncStatus('saved');
+      })
+      .catch((err) => {
+        if (sync.user !== user) return;
+        if (err.status === 401) signedOutElsewhere();
+        else setSyncStatus(err.status ? 'error' : 'offline');
+      })
+      .finally(() => {
+        scheduleRequest = null;
+      });
+    return scheduleRequest;
+  }
+
+  // A 403 from a proxy or firewall shouldn't lock an admin out: ask who we are.
+  async function confirmedViewOnly(user) {
+    try {
+      const me = await api('api/me');
+      return Boolean(me && me.user && me.user.email === user && !me.user.admin);
+    } catch {
+      return false;
+    }
+  }
+
+  // The server says this account can only view: switch to the schedule.
+  function becomeViewer() {
+    closeEditingDialogs();
+    sync.admin = false;
+    sync.pendingUsers = 0;
+    saveSyncState();
+    loadScheduleCache();
+    updateAccountUI();
+    render();
+    refreshSchedule();
+  }
+
   function setSyncStatus(status) {
     sync.status = status;
     $('#sync-dot').dataset.status = status;
-    $('#sync-text').textContent = SYNC_TEXT[status];
+    $('#sync-text').textContent = syncText(status);
     updateAccountLabel();
   }
 
   function updateAccountLabel() {
     const waiting = sync.admin && sync.pendingUsers ? ` ${sync.pendingUsers} waiting for approval.` : '';
     const summary = $('#account summary');
-    summary.setAttribute('aria-label', `Account: ${sync.user}. ${SYNC_TEXT[sync.status]}${waiting}`);
-    summary.title = `${sync.user}\n${SYNC_TEXT[sync.status]}${waiting ? `\n${waiting.trim()}` : ''}`;
+    summary.setAttribute('aria-label', `Account: ${sync.user}. ${syncText(sync.status)}${waiting}`);
+    summary.title = `${sync.user}\n${syncText(sync.status)}${waiting ? `\n${waiting.trim()}` : ''}`;
   }
 
   function updateAccountUI() {
@@ -2482,12 +2773,12 @@
       tab.tabIndex = selected ? 0 : -1;
     }
     setText($('#auth-heading'), requested ? 'Request sent' : signup ? 'Create your account' : 'Sign in');
-    let intro = 'Welcome back. Sign in to see your plans.';
+    let intro = 'Welcome back. Sign in to continue.';
     if (requested) intro = auth.requested;
     else if (signup && sync.first) {
       intro = "You're the first person here, so this account will be the admin, who approves everyone else.";
     } else if (signup) {
-      intro = 'Your plans are saved to your account, so you can open them in any browser. The admin approves new accounts before you can sign in.';
+      intro = 'An account lets you see the meeting schedule. The admin approves new accounts before you can sign in.';
     }
     setText($('#auth-intro'), intro);
     $('#auth-fields').hidden = requested;
@@ -2545,6 +2836,7 @@
       await startSession(result.user.email, result.user.admin);
       let message = `Signed in as ${result.user.email}.`;
       if (signup) message = `Account created. You're the admin of this site, and your plans are saved to ${result.user.email}.`;
+      else if (!sync.admin) message = `Signed in as ${result.user.email}. You can view the meeting schedule.`;
       else if (brought) message = `Signed in. The ${brought} ${brought === 1 ? 'plan' : 'plans'} on this browser were added to your account.`;
       const waiting = sync.admin ? sync.pendingUsers : 0;
       if (waiting) {
@@ -2608,7 +2900,7 @@
       const waitingBefore = sync.notifiedPending;
       await syncNow();
       if (!sync.user) return; // signed out meanwhile: keep that notice visible
-      if (sync.status !== 'saved') toast(SYNC_TEXT[sync.status]);
+      if (sync.status !== 'saved') toast(syncText(sync.status));
       // Don't cover a "people are waiting for approval" notice.
       else if (sync.notifiedPending <= waitingBefore) toast('Everything is up to date.');
     });
@@ -2707,7 +2999,9 @@
         day: 'numeric',
         year: 'numeric',
       });
-      const meta = u.status === 'pending' ? `Asked on ${date}` : `Joined ${date} · ${u.plans} ${u.plans === 1 ? 'plan' : 'plans'}`;
+      let meta = `Joined ${date} · ${u.plans} ${u.plans === 1 ? 'plan' : 'plans'}`;
+      if (u.status === 'pending') meta = `Asked on ${date}`;
+      else if (!u.admin) meta = `Joined ${date} · View only: sees your meetings`;
       let actions = '';
       if (!self && u.status === 'pending') actions = button('approve', 'Approve', 'primary') + button('delete', 'Decline', 'ghost');
       else if (!self && u.status === 'active') actions = button('disable', 'Turn off', 'ghost');
@@ -2857,6 +3151,7 @@
     const serverUser = me && me.user ? me.user.email : '';
     if (serverUser && serverUser === sync.user) {
       sync.admin = Boolean(me.user.admin);
+      if (sync.admin && state.schedule.length) clearSchedule(); // e.g. a viewer made admin
       saveSyncState();
       updateAccountUI();
       render();
@@ -2877,11 +3172,17 @@
   function setupViewEvents() {
     const view = $('#view');
 
+    // What a viewer may do: look around and open a meeting's details.
+    const VIEWER_ACTIONS = ['details', 'select-day', 'cal-prev', 'cal-next', 'cal-today'];
     view.addEventListener('click', (e) => {
       const el = e.target.closest('[data-action]');
       if (!el || !view.contains(el)) return;
       const id = el.closest('[data-id]')?.dataset.id;
+      if (viewing() && !VIEWER_ACTIONS.includes(el.dataset.action)) return;
       switch (el.dataset.action) {
+        case 'details':
+          openDetails(findShown(id));
+          break;
         case 'edit': {
           const plan = findPlan(id);
           if (plan) openEditor(plan);
@@ -2946,6 +3247,7 @@
     );
 
     view.addEventListener('dblclick', (e) => {
+      if (viewing()) return;
       const day = e.target.closest('.cal-day');
       if (day && !e.target.closest('.cal-chip')) openEditor(null, { dueDate: day.dataset.date });
     });
@@ -2953,8 +3255,8 @@
     view.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && e.target.matches('.card')) {
         e.preventDefault();
-        const plan = findPlan(e.target.dataset.id);
-        if (plan) openEditor(plan);
+        if (viewing()) openDetails(findShown(e.target.dataset.id));
+        else if (findPlan(e.target.dataset.id)) openEditor(findPlan(e.target.dataset.id));
       }
     });
   }
@@ -3004,6 +3306,7 @@
       if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
       if (document.querySelector('dialog[open]') || document.body.classList.contains('gated')) return;
       if (e.target.closest('input, textarea, select, [contenteditable="true"]')) return;
+      if (viewing() && !['/', '[', ']', 'd', 'D', '3'].includes(e.key)) return;
       switch (e.key) {
         case 'n':
         case 'N':
@@ -3026,7 +3329,7 @@
           break;
         case '[':
         case ']':
-          if (state.prefs.view === 'calendar') shiftMonth(e.key === ']' ? 1 : -1);
+          if (document.body.dataset.view === 'calendar') shiftMonth(e.key === ']' ? 1 : -1);
           break;
         case 'd':
         case 'D':
@@ -3109,6 +3412,8 @@
     }, 60 * 1000);
 
     loadSyncState();
+    loadScheduleCache();
+    setupDetails();
     setupAccounts();
     render();
     if (loadProblem) toast(loadProblem);

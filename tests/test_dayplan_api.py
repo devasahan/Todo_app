@@ -116,12 +116,35 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(res['status'], 201, res['json'])
         return client
 
-    def member(self, email, password=PASSWORD):
-        """An approved, signed-in second account."""
-        dayplan_api.set_password(dayplan_api.connect(), email, password)
+    def member(self, email, password=PASSWORD, admin=False):
+        """An approved, signed-in second account (view-only unless `admin`)."""
+        dayplan_api.set_password(dayplan_api.connect(), email, password, admin=admin)
         client = Client()
         self.assertEqual(client.post('/api/login', {'email': email, 'password': password})['status'], 200)
         return client
+
+    def stored_directly(self, email, *changes):
+        """Puts plans straight into an account's storage, the way a member's
+        plans were saved before members became view-only."""
+        conn = dayplan_api.connect()
+        with conn:
+            user_id = conn.execute('SELECT id FROM users WHERE email = ?', (email,)).fetchone()[0]
+            for rev, change in enumerate(changes, start=1):
+                conn.execute(
+                    'INSERT INTO plans (user_id, id, data, rev, updated_at) VALUES (?, ?, ?, ?, ?)',
+                    (user_id, change['id'], json.dumps(change['data']), rev, change['data']['updatedAt']),
+                )
+        conn.close()
+
+    def plans_of(self, email):
+        """Every stored row (including deletions) of an account, as {id: data}."""
+        conn = dayplan_api.connect()
+        rows = conn.execute(
+            'SELECT plans.id, plans.data FROM plans JOIN users ON users.id = plans.user_id WHERE users.email = ?',
+            (email,),
+        ).fetchall()
+        conn.close()
+        return {row['id']: row['data'] for row in rows}
 
     def plan(self, plan_id, title='Plan', at=None, **fields):
         return {'id': plan_id, 'data': {'id': plan_id, 'title': title, 'updatedAt': at or stamp(), **fields}}
@@ -363,9 +386,10 @@ class Sync(ApiTestCase):
         self.assertEqual(sync_part(laptop.post('/api/sync', {'cursor': 4, 'changes': []})), {'cursor': 4, 'changes': []})
 
     def test_accounts_never_see_each_other(self):
+        """Each admin account keeps its own plans. (Other accounts can't sync at all: see Viewers.)"""
         mine = self.signed_in()
         mine.post('/api/sync', {'cursor': 0, 'changes': [self.plan('secret', 'My diary')]})
-        theirs = self.member('other@example.com')
+        theirs = self.member('other@example.com', admin=True)
         res = theirs.post('/api/sync', {'cursor': 0, 'changes': []})
         self.assertEqual(sync_part(res), {'cursor': 0, 'changes': []})
         # Same plan id in another account is a separate plan.
@@ -586,7 +610,8 @@ class Admin(ApiTestCase):
         super().setUp()
         self.admin = self.signed_in()
         self.friend = self.member('friend@example.com')
-        self.friend.post('/api/sync', {'cursor': 0, 'changes': [self.plan('f1', 'Friend plan')]})
+        # Members can't sync any more, but may still have plans saved before that.
+        self.stored_directly('friend@example.com', self.plan('f1', 'Friend plan'))
 
     def act(self, action, email='friend@example.com', client=None):
         return (client or self.admin).post('/api/admin/users', {'email': email, 'action': action})
@@ -658,6 +683,130 @@ class Admin(ApiTestCase):
             self.assertEqual(Client().post('/api/register', {'email': 'p9@example.com', 'password': PASSWORD})['status'], 429)
             self.act('delete', 'p0@example.com')  # declining frees a place
             self.assertEqual(Client().post('/api/register', {'email': 'p9@example.com', 'password': PASSWORD})['status'], 202)
+
+
+class Viewers(ApiTestCase):
+    """Approved accounts that aren't the admin only view the admin's meetings."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.signed_in()
+        self.interview = self.plan(
+            'm-late', 'Final round', kind='meeting', company='Acme', description='Bring the portfolio.',
+            dueDate='2026-10-20', dueTime='15:00', status='todo', priority='high', tags=['interview'],
+            checklist=[{'id': 'c1', 'text': 'Research Acme', 'done': True}],
+            meetingUrl='https://example.com/j/1', jobUrl='https://example.com/jobs/1',
+            createdAt=stamp(), startedAt='', completedAt='',
+            order=3, secret='Salary I would accept',  # stored, but never shared
+        )
+        res = self.admin.post('/api/sync', {'cursor': 0, 'changes': [
+            self.interview,
+            self.plan('m-early', 'Phone screen', kind='meeting', dueDate='2026-10-16', dueTime='09:30'),
+            self.plan('m-untimed', 'Prep call', kind='meeting', dueDate='2026-10-16'),
+            self.plan('m-undated', 'Coffee chat', kind='meeting', dueDate=''),
+            self.plan('p-plain', 'Buy groceries'),
+            self.plan('p-plan', 'Update CV', kind='plan', dueDate='2026-10-16'),
+            self.plan('m-gone', 'Cancelled call', kind='meeting', dueDate='2026-10-18'),
+        ]})
+        self.assertEqual(res['status'], 200)
+        self.assertEqual(self.admin.post('/api/sync', {'cursor': 7, 'changes': [self.deleted('m-gone')]})['status'], 200)
+        self.friend = self.member('friend@example.com')
+        self.stored_directly(
+            'friend@example.com',
+            self.plan('f-plan', 'Friend plan'),
+            self.plan('f-meeting', 'Friend meeting', kind='meeting', dueDate='2026-10-17'),
+        )
+
+    def schedule(self, client):
+        res = client.get('/api/schedule')
+        self.assertEqual(res['status'], 200, res['json'])
+        self.assertEqual(list(res['json']), ['meetings'])
+        return res['json']['meetings']
+
+    def test_a_member_cannot_sync(self):
+        before = self.plans_of('friend@example.com')
+        for body in [
+            {'cursor': 0, 'changes': []},
+            {'cursor': 0, 'full': True, 'changes': []},
+            {'cursor': 0, 'changes': [self.plan('new', 'My own plan')]},
+            # Same ids as the admin's meetings: still only the member's own storage, and still refused.
+            {'cursor': 0, 'changes': [self.plan('m-late', 'Hijacked', kind='meeting'), self.deleted('m-early')]},
+        ]:
+            res = self.friend.post('/api/sync', body)
+            self.assertEqual(res['status'], 403, body)
+            # Nothing read either: the answer is the error alone, without the member's old plans.
+            self.assertEqual(res['json'], {'error': 'This account can view the meeting schedule but not change it.'})
+        self.assertEqual(self.plans_of('friend@example.com'), before)
+        titles = {m['id']: m['title'] for m in self.schedule(self.admin)}
+        self.assertEqual(titles['m-late'], 'Final round')
+        self.assertIn('m-early', titles)
+
+    def test_schedule_shares_only_the_admins_meetings(self):
+        meetings = self.schedule(self.friend)
+        # Soonest first (untimed last in their day, undated at the end). Not the admin's
+        # other plans, not a deleted meeting, not the member's own old plans or meetings.
+        self.assertEqual([m['id'] for m in meetings], ['m-early', 'm-untimed', 'm-late', 'm-undated'])
+        allowed = set(dayplan_api.SCHEDULE_FIELDS) | {'id'}
+        for meeting in meetings:
+            self.assertLessEqual(set(meeting), allowed)
+        # Every listed field is shared; anything else stored with the meeting is not.
+        shared = {k: v for k, v in self.interview['data'].items() if k not in ('order', 'secret')}
+        self.assertEqual(meetings[2], shared)
+        self.assertNotIn('Salary', json.dumps(meetings))
+        # Fields a meeting doesn't have are simply absent.
+        self.assertEqual(set(meetings[0]), {'id', 'kind', 'title', 'dueDate', 'dueTime', 'updatedAt'})
+
+    def test_meetings_of_a_disabled_admin_are_not_shared(self):
+        boss = self.member('boss@example.com', admin=True)
+        meeting = self.plan('b1', 'Board meeting', kind='meeting', dueDate='2026-10-15')
+        self.assertEqual(boss.post('/api/sync', {'cursor': 0, 'changes': [meeting]})['status'], 200)
+        self.assertEqual(self.schedule(self.friend)[0]['title'], 'Board meeting')  # every admin's meetings
+        res = self.admin.post('/api/admin/users', {'email': 'boss@example.com', 'action': 'disable'})
+        self.assertEqual(res['status'], 200)
+        self.assertNotIn('b1', [m['id'] for m in self.schedule(self.friend)])
+
+    def test_unreadable_rows_are_skipped(self):
+        odd = self.plan('m-odd', 'Odd dates', kind='meeting', dueDate=5, dueTime=None)
+        self.assertEqual(self.admin.post('/api/sync', {'cursor': 8, 'changes': [odd]})['status'], 200)
+        conn = dayplan_api.connect()
+        with conn:
+            for plan_id, data in (('broken', '{not json'), ('list', '[1, 2]'), ('text', '"meeting"')):
+                conn.execute(
+                    "INSERT INTO plans (user_id, id, data, rev, updated_at) "
+                    "SELECT id, ?, ?, 99, '' FROM users WHERE email = ?",
+                    (plan_id, data, EMAIL),
+                )
+        conn.close()
+        ids = [m['id'] for m in self.schedule(self.friend)]
+        self.assertEqual(ids, ['m-early', 'm-untimed', 'm-late', 'm-odd', 'm-undated'])
+
+    def test_needs_sign_in_and_works_for_the_admin(self):
+        res = Client().get('/api/schedule')
+        self.assertEqual(res['status'], 401)
+        self.assertEqual(res['json'], {'error': 'Please sign in again.'})
+        self.assertEqual(self.schedule(self.admin), self.schedule(self.friend))
+        self.assertEqual(self.friend.post('/api/schedule', {})['status'], 405)
+
+    def test_pending_and_disabled_accounts_cannot_read_it(self):
+        waiting = Client()
+        waiting.post('/api/register', {'email': 'waiting@example.com', 'password': PASSWORD})
+        self.assertEqual(waiting.post('/api/login', {'email': 'waiting@example.com', 'password': PASSWORD})['status'], 401)
+        self.assertEqual(waiting.get('/api/schedule')['status'], 401)
+        # Even a session of its own counts for nothing until the account is approved.
+        conn = dayplan_api.connect()
+        user_id = conn.execute("SELECT id FROM users WHERE email = 'waiting@example.com'").fetchone()[0]
+        waiting.cookie = 'dayplan_session=' + dayplan_api.create_session(conn, user_id)
+        conn.close()
+        self.assertEqual(waiting.get('/api/schedule')['status'], 401)
+
+        # Once approved, it sees the meetings, and still can't plan.
+        self.admin.post('/api/admin/users', {'email': 'waiting@example.com', 'action': 'approve'})
+        self.assertEqual(len(self.schedule(waiting)), 4)
+        self.assertEqual(waiting.post('/api/sync', {'cursor': 0, 'changes': []})['status'], 403)
+
+        self.admin.post('/api/admin/users', {'email': 'friend@example.com', 'action': 'disable'})
+        self.assertEqual(self.friend.get('/api/schedule')['status'], 401)
+        self.assertEqual(Client().post('/api/login', {'email': 'friend@example.com', 'password': PASSWORD})['status'], 403)
 
 
 class Upgrade(ApiTestCase):
