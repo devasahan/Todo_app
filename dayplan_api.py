@@ -12,6 +12,9 @@ turn accounts off, delete them, and stop new sign-ups.
 Only admin accounts plan. Every other approved account can view the
 admin's meetings (not their other plans) and change nothing.
 
+An admin can attach PDFs to a meeting (a resume, a cover letter). They are
+stored in the same database, and whoever can see the meeting can open them.
+
 From a console:
 
     python3 ~/Todo_app/dayplan_api.py list-users
@@ -36,9 +39,10 @@ import sqlite3
 import sys
 import time
 import traceback
+import unicodedata
 from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT.parent / 'dayplan-data' / 'dayplan.sqlite3'
@@ -63,6 +67,19 @@ MAX_PASSWORD_CHECKS_PER_ADDRESS = 5
 # A deletion from a device whose clock runs ahead must not beat later work:
 # its time is capped at the server's clock plus this margin.
 MAX_CLOCK_AHEAD_MS = 60_000
+# Uploaded PDFs (a meeting's resume or cover letter).
+MAX_FILE_BYTES = 10 * 1024 * 1024  # one file; the only request body allowed to be larger than MAX_BODY_BYTES
+MAX_ACCOUNT_FILE_BYTES = 200 * 1024 * 1024  # all of one account's files together
+MAX_FILES = 500  # files per account
+MAX_FILE_NAME = 120
+DEFAULT_FILE_NAME = 'document.pdf'
+# A new file no plan mentions yet is left alone this long: the plan that uses
+# it may not have been synced yet.
+UNUSED_FILE_SECONDS = 24 * 3600
+# A file no plan has mentioned for this long is deleted. Until then a deleted
+# meeting that comes back (undo, a backup, another device) still has its PDFs.
+KEEP_UNUSED_SECONDS = 30 * 24 * 3600
+VIEW_ONLY = 'This account can view the meeting schedule but not change it.'
 WRONG_OR_WAITING = (
     'Wrong email or password. (If you asked for an account recently, '
     "you can sign in once the admin has approved it.)"
@@ -78,6 +95,7 @@ STATUSES = ('active', 'pending', 'disabled')
 SCHEDULE_FIELDS = (
     'kind', 'title', 'company', 'description', 'dueDate', 'dueTime', 'status', 'priority', 'tags',
     'checklist', 'meetingUrl', 'jobUrl', 'createdAt', 'updatedAt', 'startedAt', 'completedAt',
+    'timeZone', 'endTime', 'resume', 'coverLetter',
 )
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 # Plan versions are compared by their ISO-8601 UTC time, e.g. 2026-10-14T09:30:00.000Z.
@@ -120,6 +138,16 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS files (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    data BLOB NOT NULL,
+    created_at INTEGER NOT NULL,
+    unused_since INTEGER  -- when no plan mentioned it any more (NULL while in use)
+);
+CREATE INDEX IF NOT EXISTS files_by_user ON files (user_id);
 """
 
 
@@ -497,6 +525,16 @@ def api_logout(conn, environ, body):
     return 200, {'ok': True}, [session_cookie(environ, '', 0)]
 
 
+def require_planner(conn, environ):
+    """The signed-in account, if it may plan (an admin). Every other account only views."""
+    user = current_user(conn, environ)
+    if user is None:
+        raise ApiError(401, 'Please sign in again.')
+    if not user['is_admin']:
+        raise ApiError(403, VIEW_ONLY)
+    return user
+
+
 def change_stamp(change, data):
     """The time a change was made: the plan's updatedAt, or deletedAt for a deletion.
 
@@ -549,11 +587,7 @@ def api_sync(conn, environ, body):
     Only admin accounts have plans. Any other account gets 403 and nothing is
     read or saved: it can only view the admin's meetings (see api_schedule).
     """
-    user = current_user(conn, environ)
-    if user is None:
-        raise ApiError(401, 'Please sign in again.')
-    if not user['is_admin']:
-        raise ApiError(403, 'This account can view the meeting schedule but not change it.')
+    user = require_planner(conn, environ)
 
     cursor = body.get('cursor')
     changes = body.get('changes', [])
@@ -680,6 +714,9 @@ def api_schedule(conn, environ, body):
     plans the admin saved as meetings are shared, never their other plans,
     and only the fields in SCHEDULE_FIELDS (a field that isn't stored is left
     out). Meetings of an admin account that has been turned off are not shared.
+
+    A meeting's resume and cover letter come as {"id", "name", "size"}; the
+    PDF itself is at GET /api/files/<id> (see api_get_file).
     """
     user = current_user(conn, environ)
     if user is None:
@@ -702,6 +739,165 @@ def api_schedule(conn, environ, body):
         meetings.append(meeting)
     meetings.sort(key=schedule_order)
     return 200, {'meetings': meetings}, []
+
+
+# -------------------------------------------------------------------- files
+
+def clean_file_name(raw):
+    """A safe name to keep and show for an uploaded PDF.
+
+    `raw` is the X-File-Name header: the file's original name, URL-encoded.
+    Any folders, control characters and quotes are removed, the name is cut to
+    MAX_FILE_NAME characters, and it always ends with .pdf.
+    """
+    name = unquote(raw or '')
+    name = re.split(r'[/\\]', name)[-1]  # only the name, never a path
+    # Control characters, invisible formatting ones (which can make a name
+    # read backwards, say), line breaks and quotes.
+    name = ''.join(
+        ch for ch in name
+        if unicodedata.category(ch) not in ('Cc', 'Cf', 'Cs', 'Zl', 'Zp') and ch not in '"\''
+    ).strip()
+    if name.lower().endswith('.pdf'):
+        stem, extension = name[:-4], name[-4:]
+    else:
+        stem, extension = name, '.pdf'
+    stem = stem[:MAX_FILE_NAME - len(extension)].strip()
+    return stem + extension if stem else DEFAULT_FILE_NAME
+
+
+def inline_disposition(name):
+    """A Content-Disposition header that shows the PDF in the browser under its own name.
+
+    filename= is a plain-ASCII stand-in for old browsers; filename*= has the
+    real name (UTF-8, percent-encoded).
+    """
+    plain = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode('ascii')
+    plain = ''.join(ch for ch in plain if ch.isprintable() and ch not in '"\\')
+    plain = ' '.join(plain.split())  # no double spaces where a character was dropped
+    if not plain or plain.lower() == '.pdf':
+        plain = DEFAULT_FILE_NAME
+    return "inline; filename=\"{}\"; filename*=UTF-8''{}".format(plain, quote(name, safe=''))
+
+
+def attached_to_meeting(conn, owner_id, file_id):
+    """Whether one of the account's meetings has this file as its resume or cover letter."""
+    rows = conn.execute(
+        'SELECT data FROM plans WHERE user_id = ? AND data IS NOT NULL AND instr(data, ?) > 0',
+        (owner_id, file_id),
+    ).fetchall()
+    for row in rows:
+        try:
+            data = json.loads(row['data'])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get('kind') != 'meeting':
+            continue
+        for key in ('resume', 'coverLetter'):
+            document = data.get(key)
+            if isinstance(document, dict) and document.get('id') == file_id:
+                return True
+    return False
+
+
+def forget_unused_files(conn, user_id):
+    """Deletes the account's files that no plan of it has mentioned for
+    KEEP_UNUSED_SECONDS (an attachment that was replaced or removed, or whose
+    meeting was deleted), so they don't pile up.
+
+    The clock starts when a file is first seen unused, and stops again if a
+    plan mentions it again (an undone delete, a restored backup). Files newer
+    than UNUSED_FILE_SECONDS are never counted as unused: the plan that uses
+    one may not have been synced yet.
+    """
+    now = int(time.time())
+    used = (
+        'EXISTS (SELECT 1 FROM plans WHERE plans.user_id = files.user_id AND plans.data IS NOT NULL '
+        'AND instr(plans.data, files.id) > 0)'
+    )
+    with conn:
+        conn.execute(
+            'UPDATE files SET unused_since = NULL WHERE user_id = ? AND unused_since IS NOT NULL AND ' + used,
+            (user_id,),
+        )
+        conn.execute(
+            'UPDATE files SET unused_since = ? WHERE user_id = ? AND unused_since IS NULL AND created_at < ? '
+            'AND NOT ' + used,
+            (now, user_id, now - UNUSED_FILE_SECONDS),
+        )
+        conn.execute(
+            'DELETE FROM files WHERE user_id = ? AND unused_since IS NOT NULL AND unused_since < ?',
+            (user_id, now - KEEP_UNUSED_SECONDS),
+        )
+
+
+def api_upload_file(conn, environ, body):
+    """Saves one PDF (a meeting's resume or cover letter) for the signed-in admin.
+
+    Request:  the file itself, sent as Content-Type: application/pdf, with its
+              original name URL-encoded in the X-File-Name header.
+    Response: 201 {"id": "<32 hex characters>", "name": "resume.pdf", "size": <bytes>}
+
+    The browser then saves the meeting with that {"id", "name", "size"} as its
+    resume or coverLetter. Only admins upload; other accounts only view.
+    Each upload first clears out this account's files that no plan mentions
+    any more (see forget_unused_files).
+    """
+    user = require_planner(conn, environ)
+    if not body.startswith(b'%PDF-'):
+        raise ApiError(400, 'This file is not a PDF.')
+    name = clean_file_name(environ.get('HTTP_X_FILE_NAME', ''))
+    forget_unused_files(conn, user['id'])
+
+    file_id = secrets.token_hex(16)
+    with conn:
+        # Check the limits and save in one locked step, so two uploads at once can't both squeeze in.
+        conn.execute('BEGIN IMMEDIATE')
+        count, total = conn.execute(
+            'SELECT COUNT(*), COALESCE(SUM(size), 0) FROM files WHERE user_id = ?', (user['id'],)
+        ).fetchone()
+        cleared = 'PDFs that no meeting has used for 30 days are cleared when you upload.'
+        if count >= MAX_FILES:
+            raise ApiError(413, 'This account already keeps {} files, the most it can. {}'.format(MAX_FILES, cleared))
+        if total + len(body) > MAX_ACCOUNT_FILE_BYTES:
+            room = MAX_ACCOUNT_FILE_BYTES // (1024 * 1024)
+            raise ApiError(413, 'This account has no room for this file ({} MB of PDFs at most). {}'.format(room, cleared))
+        conn.execute(
+            'INSERT INTO files (id, user_id, name, size, data, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+            (file_id, user['id'], name, len(body), body, int(time.time())),
+        )
+    return 201, {'id': file_id, 'name': name, 'size': len(body)}, []
+
+
+def api_get_file(conn, environ, body, file_id):
+    """Sends a stored PDF (GET /api/files/<id>) to whoever may see it.
+
+    The account that uploaded it can always open it. Any other signed-in
+    account can open it only while one of the uploader's meetings has it as
+    its resume or cover letter (and the uploader is an active admin), so
+    taking it off the meeting takes it away. Everything else gets 404, the
+    same as a file that doesn't exist, so nobody learns which files exist.
+    """
+    user = current_user(conn, environ)
+    if user is None:
+        raise ApiError(401, 'Please sign in again.')
+    row = conn.execute(
+        'SELECT files.user_id, files.name, users.is_admin, users.status FROM files '
+        'JOIN users ON users.id = files.user_id WHERE files.id = ?',
+        (file_id,),
+    ).fetchone()
+    allowed = row is not None and (
+        row['user_id'] == user['id']
+        or (row['is_admin'] and row['status'] == 'active' and attached_to_meeting(conn, row['user_id'], file_id))
+    )
+    if not allowed:
+        raise ApiError(404, 'Not found.')
+    data = conn.execute('SELECT data FROM files WHERE id = ?', (file_id,)).fetchone()['data']
+    return 200, bytes(data), [
+        ('Content-Type', 'application/pdf'),
+        ('Content-Disposition', inline_disposition(row['name'])),
+        ('Cache-Control', 'private, no-store'),
+    ]
 
 
 # -------------------------------------------------------------------- admin
@@ -760,6 +956,7 @@ def api_admin_update_user(conn, environ, body):
             conn.execute('DELETE FROM sessions WHERE user_id = ?', (target['id'],))
         else:
             conn.execute('DELETE FROM plans WHERE user_id = ?', (target['id'],))
+            conn.execute('DELETE FROM files WHERE user_id = ?', (target['id'],))
             conn.execute('DELETE FROM sessions WHERE user_id = ?', (target['id'],))
             conn.execute('DELETE FROM users WHERE id = ?', (target['id'],))
     return 200, admin_overview(conn), []
@@ -787,29 +984,69 @@ ROUTES = {
     '/api/schedule': {'GET': api_schedule},
     '/api/admin/users': {'GET': api_admin_users, 'POST': api_admin_update_user},
     '/api/admin/settings': {'POST': api_admin_settings},
+    '/api/files': {'POST': api_upload_file},
 }
+# Paths with a part that changes. Each named part of the pattern is passed
+# to the endpoint as a keyword argument.
+PATTERN_ROUTES = (
+    (re.compile(r'/api/files/(?P<file_id>[0-9a-f]{32})'), {'GET': api_get_file, 'HEAD': api_get_file}),
+)
+# POST endpoints whose body is a file of this type (at most MAX_FILE_BYTES)
+# instead of JSON (at most MAX_BODY_BYTES). The endpoint gets the raw bytes.
+UPLOADS = {'/api/files': 'application/pdf'}
+
+
+def find_route(path):
+    """The endpoints for a path by method, and the parts of the path they take ((None, {}) if none)."""
+    if path in ROUTES:
+        return ROUTES[path], {}
+    for pattern, route in PATTERN_ROUTES:
+        match = pattern.fullmatch(path)
+        if match:
+            return route, match.groupdict()
+    return None, {}
 
 
 # ------------------------------------------------------------------- WSGI
 
-def check_same_origin(environ):
-    """Blocks requests sent from other websites (CSRF)."""
+def check_same_origin(environ, expected='application/json'):
+    """Blocks requests sent from other websites (CSRF).
+
+    A page on another site can't send a body of type `expected` (JSON, or a
+    PDF for uploads) without asking this server first (a CORS preflight),
+    which it never allows; and a request that says where it comes from must
+    come from this site.
+    """
     content_type = environ.get('CONTENT_TYPE', '').split(';')[0].strip().lower()
-    if content_type != 'application/json':
-        raise ApiError(415, 'Expected JSON.')
+    if content_type != expected:
+        raise ApiError(415, 'Expected JSON.' if expected == 'application/json' else 'Only PDF files can be uploaded.')
     origin = environ.get('HTTP_ORIGIN')
     host = environ.get('HTTP_HOST')
     if origin and host and urlsplit(origin).netloc.lower() != host.lower():
         raise ApiError(403, 'Cross-site request blocked.')
 
 
-def read_json(environ):
+def content_length(environ, limit, too_large):
+    """The request body's declared length, refused (413) when it is over `limit`."""
     try:
         length = int(environ.get('CONTENT_LENGTH') or 0)
     except ValueError:
         raise ApiError(400, 'Invalid request.')
-    if length > MAX_BODY_BYTES:
-        raise ApiError(413, 'Request too large.')
+    if length > limit:
+        raise ApiError(413, too_large)
+    return length
+
+
+def read_upload(environ):
+    """The raw bytes of an uploaded file."""
+    length = content_length(
+        environ, MAX_FILE_BYTES, 'PDF files can be up to {} MB.'.format(MAX_FILE_BYTES // (1024 * 1024))
+    )
+    return environ['wsgi.input'].read(length) if length > 0 else b''
+
+
+def read_json(environ):
+    length = content_length(environ, MAX_BODY_BYTES, 'Request too large.')
     if length <= 0:
         return {}
     raw = environ['wsgi.input'].read(length)
@@ -827,7 +1064,7 @@ def handle(environ, start_response):
     method = environ.get('REQUEST_METHOD', 'GET')
     headers = [('Content-Type', 'application/json'), ('Cache-Control', 'no-store'), ('X-Content-Type-Options', 'nosniff')]
     try:
-        route = ROUTES.get(path)
+        route, params = find_route(path)
         if route is None:
             raise ApiError(404, 'Not found.')
         endpoint = route.get(method)
@@ -836,24 +1073,28 @@ def handle(environ, start_response):
             raise ApiError(405, 'Method not allowed.')
         body = {}
         if method == 'POST':
-            check_same_origin(environ)
-            body = read_json(environ)
+            upload_type = UPLOADS.get(path)
+            check_same_origin(environ, upload_type or 'application/json')
+            body = read_upload(environ) if upload_type else read_json(environ)
         conn = connect()
         try:
-            status, payload, extra = endpoint(conn, environ, body)
+            status, payload, extra = endpoint(conn, environ, body, **params)
         finally:
             conn.close()
-        headers.extend(extra)
+        # A header the endpoint sets (a file's Content-Type, say) replaces the default one.
+        replaced = {name.lower() for name, _ in extra}
+        headers = [header for header in headers if header[0].lower() not in replaced] + list(extra)
     except ApiError as err:
         status, payload = err.status, {'error': err.message}
     except Exception:  # never leak details; the traceback goes to the error log
         traceback.print_exc(file=sys.stderr)
         status, payload = 500, {'error': 'Something went wrong on the server.'}
 
-    data = json.dumps(payload).encode('utf-8')
+    # Endpoints answer with JSON, except a file download, which gives its bytes.
+    data = payload if isinstance(payload, bytes) else json.dumps(payload).encode('utf-8')
     headers.append(('Content-Length', str(len(data))))
     start_response('{} {}'.format(status, STATUS_TEXT.get(status, 'Error')), headers)
-    return [data]
+    return [b''] if method == 'HEAD' else [data]
 
 
 STATUS_TEXT = {

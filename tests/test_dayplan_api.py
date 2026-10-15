@@ -2,13 +2,16 @@
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
+from urllib.parse import quote
 from wsgiref.util import setup_testing_defaults
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -24,6 +27,8 @@ MEETING = {
     'meetingUrl': 'https://example.com/j/1',
     'jobUrl': 'https://example.com/jobs/1',
 }
+# A tiny but real-looking PDF file.
+PDF = b'%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n'
 _clock = [0]
 
 
@@ -50,7 +55,7 @@ class Client:
         self.https = https
         self.ip = ''
 
-    def request(self, method, path, body=None, content_type='application/json', origin='same'):
+    def request(self, method, path, body=None, content_type='application/json', origin='same', headers=None):
         data = b'' if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
         environ = {}
         setup_testing_defaults(environ)
@@ -72,11 +77,13 @@ class Client:
             environ['HTTP_COOKIE'] = self.cookie
         if self.ip:
             environ['HTTP_X_REAL_IP'] = self.ip
+        for name, value in (headers or {}).items():
+            environ['HTTP_' + name.upper().replace('-', '_')] = value
         captured = {}
 
-        def start_response(status, headers):
+        def start_response(status, response_headers):
             captured['status'] = int(status.split()[0])
-            captured['headers'] = headers
+            captured['headers'] = response_headers
 
         raw = b''.join(application(environ, start_response))
         for name, value in captured['headers']:
@@ -84,7 +91,9 @@ class Client:
                 pair = value.split(';')[0]
                 self.cookie = '' if pair.endswith('=') else pair
                 captured['set_cookie'] = value
-        captured['json'] = json.loads(raw) if raw else None
+        captured['body'] = raw
+        is_json = dict(captured['headers']).get('Content-Type') == 'application/json'
+        captured['json'] = json.loads(raw) if raw and is_json else None
         return captured
 
     def post(self, path, body=None, **kwargs):
@@ -92,6 +101,11 @@ class Client:
 
     def get(self, path):
         return self.request('GET', path)
+
+    def upload(self, data=PDF, name='resume.pdf', **kwargs):
+        """Sends a file the way the app does (a `name` of None sends no name at all)."""
+        headers = {} if name is None else {'X-File-Name': quote(name, safe='')}
+        return self.post('/api/files', data, content_type='application/pdf', headers=headers, **kwargs)
 
 
 class ApiTestCase(unittest.TestCase):
@@ -809,6 +823,322 @@ class Viewers(ApiTestCase):
         self.assertEqual(Client().post('/api/login', {'email': 'friend@example.com', 'password': PASSWORD})['status'], 403)
 
 
+class Files(ApiTestCase):
+    """PDFs (a resume, a cover letter) attached to the admin's meetings."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.signed_in()
+        self.friend = self.member('friend@example.com')
+
+    def uploaded(self, client=None, data=PDF, name='resume.pdf'):
+        res = (client or self.admin).upload(data, name)
+        self.assertEqual(res['status'], 201, res['json'])
+        return res['json']
+
+    def save(self, *changes, client=None):
+        res = (client or self.admin).post('/api/sync', {'cursor': 0, 'changes': list(changes)})
+        self.assertEqual(res['status'], 200, res['json'])
+
+    def meeting(self, plan_id='m1', resume=None, cover_letter=None, **fields):
+        fields = {'kind': 'meeting', 'dueDate': '2026-10-20', 'dueTime': '15:00', **fields}
+        return self.plan(plan_id, 'Interview', resume=resume, coverLetter=cover_letter, **fields)
+
+    def file_ids(self, email=None):
+        conn = dayplan_api.connect()
+        sql = 'SELECT files.id FROM files JOIN users ON users.id = files.user_id'
+        rows = conn.execute(sql + ' WHERE users.email = ?', (email,)) if email else conn.execute(sql)
+        ids = {row[0] for row in rows}
+        conn.close()
+        return ids
+
+    def stored_file(self, email, name='old.pdf'):
+        """Puts a file straight into an account's storage (e.g. a viewer's, which can't upload)."""
+        file_id = dayplan_api.secrets.token_hex(16)
+        conn = dayplan_api.connect()
+        with conn:
+            conn.execute(
+                'INSERT INTO files (id, user_id, name, size, data, created_at) '
+                'SELECT ?, id, ?, ?, ?, ? FROM users WHERE email = ?',
+                (file_id, name, len(PDF), PDF, int(time.time()), email),
+            )
+        conn.close()
+        return file_id
+
+    def test_the_admin_uploads_a_pdf(self):
+        res = self.admin.upload(PDF, 'My Resume.pdf')
+        self.assertEqual(res['status'], 201)
+        doc = res['json']
+        self.assertEqual(set(doc), {'id', 'name', 'size'})
+        self.assertRegex(doc['id'], r'^[0-9a-f]{32}$')
+        self.assertEqual((doc['name'], doc['size']), ('My Resume.pdf', len(PDF)))
+        conn = dayplan_api.connect()
+        row = conn.execute('SELECT name, size, data FROM files WHERE id = ?', (doc['id'],)).fetchone()
+        conn.close()
+        self.assertEqual((row['name'], row['size'], bytes(row['data'])), ('My Resume.pdf', len(PDF), PDF))
+        self.assertNotEqual(self.uploaded()['id'], doc['id'])  # every upload is a new file
+
+    def test_only_a_signed_in_admin_uploads(self):
+        res = self.friend.upload()
+        self.assertEqual(res['status'], 403)
+        self.assertEqual(res['json'], {'error': 'This account can view the meeting schedule but not change it.'})
+        self.assertEqual(Client().upload()['status'], 401)
+        self.assertEqual(self.file_ids(), set())
+
+    def test_only_pdfs_from_this_site(self):
+        for content_type in ('application/octet-stream', 'text/plain', 'application/json', 'multipart/form-data'):
+            res = self.admin.post('/api/files', PDF, content_type=content_type)
+            self.assertEqual(res['status'], 415, content_type)
+        # ...and the JSON endpoints still only take JSON.
+        self.assertEqual(self.admin.post('/api/sync', PDF, content_type='application/pdf')['status'], 415)
+
+        res = self.admin.upload(origin='https://evil.example')
+        self.assertEqual(res['status'], 403)
+        self.assertEqual(res['json'], {'error': 'Cross-site request blocked.'})
+        self.assertEqual(self.file_ids(), set())
+        # Like the other requests, one that doesn't say where it comes from isn't from another site's page.
+        self.assertEqual(self.admin.upload(origin=None)['status'], 201)
+
+    def test_files_that_are_not_pdfs_are_refused(self):
+        for data in (b'<html><script>alert(1)</script></html>', b'', b'%PDF', b' %PDF-1.7'):
+            res = self.admin.upload(data)
+            self.assertEqual(res['status'], 400, data)
+            self.assertEqual(res['json'], {'error': 'This file is not a PDF.'})
+        self.assertEqual(self.file_ids(), set())
+
+    def test_size_limit(self):
+        with mock.patch.object(dayplan_api, 'MAX_FILE_BYTES', 200):
+            res = self.admin.upload(PDF + b'x' * (201 - len(PDF)))
+            self.assertEqual(res['status'], 413)
+            self.assertIn('PDF files can be up to', res['json']['error'])
+            self.assertEqual(self.admin.upload(PDF + b'x' * (200 - len(PDF)))['status'], 201)
+        self.assertEqual(dayplan_api.MAX_FILE_BYTES, 10 * 1024 * 1024)
+        # Uploads may be larger than any other request; those keep their own limit.
+        with mock.patch.object(dayplan_api, 'MAX_BODY_BYTES', 10):
+            self.assertEqual(self.admin.upload()['status'], 201)
+            self.assertEqual(self.admin.post('/api/sync', {'cursor': 0, 'changes': []})['status'], 413)
+
+    def test_limits_per_account(self):
+        with mock.patch.object(dayplan_api, 'MAX_FILES', 2):
+            self.uploaded()
+            self.uploaded()
+            res = self.admin.upload()
+            self.assertEqual(res['status'], 413)
+            self.assertIn('2 files', res['json']['error'])
+            # Each account has its own allowance.
+            boss = self.member('boss@example.com', admin=True)
+            self.uploaded(boss)
+        self.assertEqual(len(self.file_ids(EMAIL)), 2)
+
+        with mock.patch.object(dayplan_api, 'MAX_ACCOUNT_FILE_BYTES', 4 * len(PDF)):
+            self.uploaded(boss, PDF + b'x' * len(PDF))  # 3 PDFs' worth with the first one: room for 1 more
+            self.uploaded(boss)
+            res = boss.upload()
+            self.assertEqual(res['status'], 413)
+            self.assertIn('no room', res['json']['error'])
+        self.assertEqual(len(self.file_ids('boss@example.com')), 3)
+
+    def test_file_names_are_cleaned(self):
+        clean = dayplan_api.clean_file_name
+        for raw, expected in [
+            ('resume.pdf', 'resume.pdf'),
+            ('C:\\Users\\me\\Cover letter.PDF', 'Cover letter.PDF'),
+            ('../../etc/passwd', 'passwd.pdf'),
+            ('My "best" CV\'s.pdf', 'My best CVs.pdf'),
+            ('line\r\nbreak\x00\t\x7f.pdf', 'linebreak.pdf'),
+            ('invoice\u202efdp.exe', 'invoicefdp.exe.pdf'),  # no right-to-left trick
+            ('Résumé – 2026 ✓.pdf', 'Résumé – 2026 ✓.pdf'),
+            ('  spaced out .pdf  ', 'spaced out.pdf'),
+            ('notes.txt', 'notes.txt.pdf'),
+            ('', 'document.pdf'),
+            ('   ', 'document.pdf'),
+            ('.pdf', 'document.pdf'),
+            ('folder/', 'document.pdf'),
+            ('"\'', 'document.pdf'),
+        ]:
+            self.assertEqual(clean(quote(raw, safe='')), expected, raw)
+        self.assertEqual(clean(None), 'document.pdf')
+        self.assertEqual(clean('a' * 300 + '.pdf'), 'a' * 116 + '.pdf')
+        self.assertEqual(clean('b' * 300), 'b' * 116 + '.pdf')
+        self.assertTrue(clean('%E2%28%A1%ZZ.pdf').endswith('.pdf'))  # broken encoding is harmless
+        # The same through the API, with or without a name.
+        self.assertEqual(self.uploaded(name='C:\\fakepath\\Lebenslauf "final".pdf')['name'], 'Lebenslauf final.pdf')
+        self.assertEqual(self.uploaded(name=None)['name'], 'document.pdf')
+
+    def test_the_owner_downloads_with_safe_headers(self):
+        doc = self.uploaded(name='Résumé "2026".pdf')
+        self.assertEqual(doc['name'], 'Résumé 2026.pdf')
+        path = '/api/files/' + doc['id']
+        res = self.admin.get(path)
+        self.assertEqual(res['status'], 200)
+        self.assertEqual(res['body'], PDF)
+        headers = dict(res['headers'])
+        self.assertEqual(len(headers), len(res['headers']))  # each header once (the JSON default is replaced)
+        self.assertEqual(headers['Content-Type'], 'application/pdf')
+        self.assertEqual(headers['Content-Length'], str(len(PDF)))
+        self.assertEqual(
+            headers['Content-Disposition'],
+            'inline; filename="Resume 2026.pdf"; filename*=UTF-8\'\'R%C3%A9sum%C3%A9%202026.pdf',
+        )
+        self.assertEqual(headers['Cache-Control'], 'private, no-store')
+        self.assertEqual(headers['X-Content-Type-Options'], 'nosniff')
+
+        head = self.admin.request('HEAD', path)
+        self.assertEqual(head['status'], 200)
+        self.assertEqual(head['body'], b'')
+        self.assertEqual(dict(head['headers'])['Content-Length'], str(len(PDF)))
+
+        # A name with no plain-ASCII letters still gets a usable stand-in.
+        other = self.uploaded(name='履歴書.pdf')
+        disposition = dict(self.admin.get('/api/files/' + other['id'])['headers'])['Content-Disposition']
+        self.assertEqual(disposition, 'inline; filename="document.pdf"; filename*=UTF-8\'\'%E5%B1%A5%E6%AD%B4%E6%9B%B8.pdf')
+
+    def test_viewers_open_a_file_only_while_a_meeting_has_it(self):
+        resume = self.uploaded(name='resume.pdf')
+        letter = self.uploaded(name='letter.pdf')
+
+        def opens(doc, client=None):
+            res = (client or self.friend).get('/api/files/' + doc['id'])
+            if res['status'] == 404:
+                self.assertEqual(res['json'], {'error': 'Not found.'})  # the same as a file that doesn't exist
+                return False
+            self.assertEqual((res['status'], res['body']), (200, PDF))
+            return True
+
+        self.assertFalse(opens(resume))  # uploaded, but not on a meeting yet
+        self.save(self.meeting(resume=resume, cover_letter=letter))
+        self.assertTrue(opens(resume))
+        self.assertTrue(opens(letter))
+
+        # Turned into a plain plan: not shared any more (the owner can still open it).
+        self.save(self.meeting(resume=resume, cover_letter=letter, kind='plan'))
+        self.assertFalse(opens(resume))
+        self.assertFalse(opens(letter))
+        self.assertTrue(opens(resume, self.admin))
+
+        # The resume taken off the meeting; its id mentioned elsewhere doesn't count.
+        self.save(self.meeting(resume=None, cover_letter=letter, description='Old resume: ' + resume['id']))
+        self.assertFalse(opens(resume))
+        self.assertTrue(opens(letter))
+
+        self.save(self.deleted('m1'))
+        self.assertFalse(opens(letter))
+        self.assertTrue(opens(letter, self.admin))
+
+    def test_everyone_else_gets_not_found(self):
+        mine = self.uploaded()
+        boss = self.member('boss@example.com', admin=True)
+        theirs = self.uploaded(boss)
+        for client in (self.admin, self.friend):
+            for path in [
+                '/api/files/' + '0' * 32,  # no such file
+                '/api/files/' + mine['id'].upper(),
+                '/api/files/' + mine['id'][:-1],
+                '/api/files/' + mine['id'] + '/x',
+                '/api/files/' + mine['id'] + '.pdf',
+                '/api/files/' + theirs['id'],  # another admin's file that no meeting has
+            ]:
+                res = client.get(path)
+                self.assertEqual((res['status'], res['json']), (404, {'error': 'Not found.'}), path)
+        self.assertEqual(boss.get('/api/files/' + theirs['id'])['status'], 200)
+
+        # Another admin's meeting can't share my file: only the owner's meetings count.
+        self.save(self.meeting('b1', resume=mine), client=boss)
+        self.assertEqual(self.friend.get('/api/files/' + mine['id'])['status'], 404)
+
+        # A viewer's own file (stored before viewers became view-only) stays theirs alone.
+        old = self.stored_file('friend@example.com')
+        self.assertEqual(self.friend.get('/api/files/' + old)['status'], 200)
+        self.assertEqual(self.admin.get('/api/files/' + old)['status'], 404)
+        self.assertEqual(self.member('other@example.com').get('/api/files/' + old)['status'], 404)
+
+        # Signed out: asked to sign in, whether or not the file exists.
+        for path in ('/api/files/' + mine['id'], '/api/files/' + '0' * 32):
+            res = Client().get(path)
+            self.assertEqual((res['status'], res['json']), (401, {'error': 'Please sign in again.'}))
+
+        # Only the methods each path has.
+        res = self.admin.get('/api/files')
+        self.assertEqual((res['status'], dict(res['headers'])['Allow']), (405, 'POST'))
+        res = self.admin.post('/api/files/' + mine['id'], {})
+        self.assertEqual((res['status'], dict(res['headers'])['Allow']), (405, 'GET, HEAD'))
+
+    def test_files_of_a_disabled_admin_are_not_shared(self):
+        boss = self.member('boss@example.com', admin=True)
+        doc = self.uploaded(boss)
+        self.save(self.meeting('b1', resume=doc), client=boss)
+        self.assertEqual(self.friend.get('/api/files/' + doc['id'])['status'], 200)
+        self.admin.post('/api/admin/users', {'email': 'boss@example.com', 'action': 'disable'})
+        self.assertEqual(self.friend.get('/api/files/' + doc['id'])['status'], 404)
+
+    def test_old_files_no_plan_uses_are_cleared(self):
+        now = time.time()
+        on_meeting = self.uploaded(name='on-meeting.pdf')
+        in_plan = self.uploaded(name='in-plan.pdf')
+        replaced = self.uploaded(name='replaced.pdf')
+        deleted_with_meeting = self.uploaded(name='deleted.pdf')
+        boss = self.member('boss@example.com', admin=True)
+        boss_unused = self.uploaded(boss)
+        self.save(self.meeting('m1', resume=replaced), self.meeting('m2', resume=deleted_with_meeting))
+        self.save(
+            self.meeting('m1', resume=on_meeting),  # a new resume replaces the first one
+            self.plan('p1', 'Follow up', description='See ' + in_plan['id']),
+            self.deleted('m2'),
+        )
+
+        # 23 hours later: too soon to clear anything (a plan may not have been synced yet).
+        with mock.patch('time.time', return_value=now + 23 * 3600):
+            recent = self.uploaded(name='recent.pdf')
+        self.assertEqual(len(self.file_ids(EMAIL)), 5)
+
+        # A day later, the next upload notes which files no live plan mentions; nothing is deleted yet.
+        day = now + dayplan_api.UNUSED_FILE_SECONDS + 60
+        with mock.patch('time.time', return_value=day):
+            newest = self.uploaded(name='newest.pdf')
+        self.assertEqual(len(self.file_ids(EMAIL)), 6)
+
+        # The deleted meeting comes back (undo, a backup): its resume is in use again.
+        self.save(self.meeting('m2', resume=deleted_with_meeting, at=stamp()))
+
+        # 30 days after that, the next upload clears what is still unused.
+        with mock.patch('time.time', return_value=day + dayplan_api.KEEP_UNUSED_SECONDS + 60):
+            last = self.uploaded(name='last.pdf')
+        self.assertEqual(
+            self.file_ids(EMAIL),
+            {on_meeting['id'], in_plan['id'], recent['id'], newest['id'], deleted_with_meeting['id'], last['id']},
+        )
+        self.assertNotIn(replaced['id'], self.file_ids())
+        self.assertEqual(self.admin.get('/api/files/' + replaced['id'])['status'], 404)
+        self.assertEqual(self.admin.get('/api/files/' + deleted_with_meeting['id'])['status'], 200)
+        # Other accounts' files are left alone.
+        self.assertEqual(self.file_ids('boss@example.com'), {boss_unused['id']})
+
+    def test_deleting_an_account_deletes_its_files(self):
+        boss = self.member('boss@example.com', admin=True)
+        self.uploaded(boss)
+        self.uploaded(boss)
+        mine = self.uploaded()
+        res = self.admin.post('/api/admin/users', {'email': 'boss@example.com', 'action': 'delete'})
+        self.assertEqual(res['status'], 200)
+        self.assertEqual(self.file_ids(), {mine['id']})
+
+    def test_schedule_shares_time_zone_end_time_and_documents(self):
+        resume = self.uploaded(name='resume.pdf')
+        letter = self.uploaded(name='letter.pdf')
+        self.save(self.meeting(resume=resume, cover_letter=letter, timeZone='America/New_York', endTime='16:00'))
+        self.save(self.meeting('m2'))  # no documents
+        meetings = {m['id']: m for m in self.friend.get('/api/schedule')['json']['meetings']}
+        shared = meetings['m1']
+        self.assertEqual(shared['timeZone'], 'America/New_York')
+        self.assertEqual(shared['endTime'], '16:00')
+        self.assertEqual(shared['resume'], resume)
+        self.assertEqual(shared['coverLetter'], letter)
+        self.assertIsNone(meetings['m2']['resume'])
+        # The links the viewer gets work for them.
+        for doc in (resume, letter):
+            self.assertEqual(self.friend.get('/api/files/' + doc['id'])['status'], 200)
+
+
 class Upgrade(ApiTestCase):
     def test_database_from_before_approvals(self):
         """A site whose owner signed up before approvals existed keeps working, owner becomes admin."""
@@ -848,6 +1178,9 @@ class Upgrade(ApiTestCase):
         # A plan deleted before the upgrade stays deleted when an old copy is offered.
         res = owner.post('/api/sync', {'cursor': 0, 'changes': [self.plan('gone', 'Back?', at=dayplan_api.server_stamp(-60_000))]})
         self.assertIsNone({c['id']: c['data'] for c in res['json']['changes']}['gone'])
+        # The database got a place for uploaded files too.
+        doc = owner.upload()['json']
+        self.assertEqual(owner.get('/api/files/' + doc['id'])['body'], PDF)
 
 
 class CommandLine(ApiTestCase):

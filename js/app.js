@@ -24,6 +24,9 @@
     chevronRight: '<path d="M9 6l6 6-6 6"/>',
     circle: '<circle cx="12" cy="12" r="7"/>',
     clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    file: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/>',
+    globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
+    upload: '<path d="M12 16V4M7 9l5-5 5 5M5 20h14"/>',
     external: '<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
     flame: '<path d="M12 3c1 3 5 5 5 10a5 5 0 0 1-10 0c0-2 1-3.5 2-4.5 0 2 1 3 2 3 0-3-1-5 1-8.5z"/>',
     halfCircle: '<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/>',
@@ -90,7 +93,11 @@
     try {
       const data = JSON.parse(raw);
       const list = Array.isArray(data) ? data : data && Array.isArray(data.plans) ? data.plans : [];
-      const older = list.filter(C.fromOlderVersion);
+      // Also meetings saved before they had a time zone (or PDFs): an older
+      // tab would have dropped those.
+      const beforeZones = (item) =>
+        item && typeof item === 'object' && item.kind === 'meeting' && !Object.prototype.hasOwnProperty.call(item, 'timeZone');
+      const older = list.filter((item) => C.fromOlderVersion(item) || beforeZones(item));
       if (older.length) {
         olderDataLoads += 1;
         const shown = new Map(previous.map((p) => [p.id, p]));
@@ -423,7 +430,7 @@
     } else {
       const month = state.calendarMonth;
       const prefix = C.toISODate(month).slice(0, 7);
-      const inMonth = shownPlans().filter((p) => p.dueDate.startsWith(prefix));
+      const inMonth = shownPlans().filter((p) => p.dueDate && C.localDue(p).date.startsWith(prefix));
       const meetings = inMonth.filter(C.isMeeting).length;
       const due = inMonth.length - meetings;
       const name = month.toLocaleDateString(undefined, { month: 'long' });
@@ -527,6 +534,11 @@
       const title = due.full && !plan.dueTime ? `${due.full} (time not set)` : due.full;
       const label = due.state === 'now' ? `<span data-countdown>${esc(due.label)}</span>` : esc(due.label);
       parts.push(`<span class="chip due due-${due.state}" title="${esc(title)}">${icon('video')}${label}</span>`);
+      // In another time zone: also say when it is there ("2:00 – 3:00 PM EDT").
+      if (C.zoneDiffers(plan)) {
+        const start = C.meetingStart(plan) || undefined;
+        parts.push(`<span class="chip zone" title="${esc(C.zoneLabel(plan.timeZone, start))}">${icon('globe')}${esc(C.formatZoneTime(plan))}</span>`);
+      }
       if (plan.company && !plan.title.toLowerCase().includes(plan.company.toLowerCase())) {
         parts.push(
           `<span class="chip company" title="${esc(plan.company)}">${icon('briefcase')}<span class="chip-text">${esc(plan.company)}</span></span>`
@@ -585,8 +597,12 @@
     });
   }
 
+  function docLinksHTML(plan, size = 'small') {
+    return docLink(plan.resume, 'Resume', { size, action: 'open-resume' }) + docLink(plan.coverLetter, 'Cover letter', { size, action: 'open-cover' });
+  }
+
   function meetingLinksHTML(plan, due) {
-    const links = joinButton(plan, due) + jobButton(plan);
+    const links = joinButton(plan, due) + jobButton(plan) + docLinksHTML(plan);
     return links ? `<div class="card-links">${links}</div>` : '';
   }
 
@@ -677,7 +693,7 @@
       } else if (due.state === 'now') {
         meetingSentence = `Your meeting with ${name} is happening now.`;
       } else {
-        meetingSentence = `Next meeting: ${name} at ${C.formatTime(nextMeeting.dueTime)}.`;
+        meetingSentence = `Next meeting: ${name} at ${C.formatTime(C.localDue(nextMeeting).time)}.`;
       }
     }
 
@@ -801,6 +817,7 @@
         <div class="focus-actions">
           ${join}
           ${jobButton(plan, '')}
+          ${docLinksHTML(plan, '')}
           <button type="button" class="btn ${join ? 'ghost' : 'primary'}" data-action="set-status" data-status="done">${icon('check')} Mark done</button>
           <button type="button" class="btn ghost" data-action="edit">Open</button>
         </div>
@@ -849,9 +866,11 @@
     const plans = visiblePlans();
 
     const byDate = new Map();
+    // By the day it happens here (a meeting in another time zone can fall on another date).
     for (const p of C.sortPlans(plans.filter((plan) => plan.dueDate), 'deadline')) {
-      if (!byDate.has(p.dueDate)) byDate.set(p.dueDate, []);
-      byDate.get(p.dueDate).push(p);
+      const day = C.localDue(p).date;
+      if (!byDate.has(day)) byDate.set(day, []);
+      byDate.get(day).push(p);
     }
     const unscheduled = C.sortPlans(plans.filter((p) => !p.dueDate && p.status !== 'done'));
     const chip = (p) => {
@@ -863,14 +882,39 @@
             <span class="cal-title">${esc(p.title)}</span>
           </button>`;
       }
-      // Meetings read "2:30 PM Acme".
+      // Meetings read "2:30 PM Acme", at the time it is here.
+      const time = C.localDue(p).time;
       return `
         <button type="button" class="cal-chip is-meeting s-${p.status} p-${p.priority}" data-id="${esc(p.id)}"
           ${viewing() ? 'data-action="details"' : 'data-action="edit" draggable="true"'}
-          title="${esc(`${p.title}${at}${p.company ? ` · ${p.company}` : ''}`)}">
-          <span class="sr-only">Meeting: </span>${p.dueTime ? `<span class="cal-time">${esc(C.formatShortTime(p.dueTime))}</span>` : ''}<span class="cal-title">${esc(p.company || p.title)}</span>
+          title="${esc(`${p.title} · ${C.dueInfo(p, now).full || 'Date not set'}${p.company ? ` · ${p.company}` : ''}`)}">
+          <span class="sr-only">Meeting: </span>${time ? `<span class="cal-time">${esc(C.formatShortTime(time))}</span>` : ''}<span class="cal-title">${esc(p.company || p.title)}</span>
         </button>`;
     };
+    // The same day at double size, shown while hovering it: every item, in full.
+    const zoomItem = (p) => {
+      const meeting = C.isMeeting(p);
+      const time = meeting ? C.formatTimeRange(p) : p.dueTime ? C.formatTime(p.dueTime) : '';
+      const main = meeting ? p.company || p.title : p.title;
+      const sub = meeting && p.company && p.title !== C.meetingTitle(p.company) ? p.title : '';
+      return `
+        <button type="button" tabindex="-1" class="cal-zoom-item s-${p.status}${meeting ? ' is-meeting' : ''}" data-id="${esc(p.id)}"
+          ${viewing() ? 'data-action="details"' : 'data-action="edit" draggable="true"'}>
+          ${time ? `<span class="cal-zoom-time">${esc(time)}</span>` : ''}
+          <span class="cal-zoom-title">${meeting ? icon('video') : ''}${esc(main)}</span>
+          ${sub ? `<span class="cal-zoom-sub">${esc(sub)}</span>` : ''}
+        </button>`;
+    };
+    const zoomHTML = (d, items) => `
+      <div class="cal-zoom" aria-hidden="true">
+        <div class="cal-zoom-head">
+          <span class="cal-zoom-num">${d.getDate()}</span>
+          <span class="cal-zoom-day">${esc(d.toLocaleDateString(undefined, { weekday: 'long' }))}</span>
+        </div>
+        <div class="cal-zoom-items">
+          ${items.map(zoomItem).join('') || `<p class="cal-zoom-empty">${viewing() ? 'No meetings' : 'Nothing planned'}</p>`}
+        </div>
+      </div>`;
     const countLabel = (items) => {
       const meetings = items.filter(C.isMeeting).length;
       const others = items.length - meetings;
@@ -921,6 +965,7 @@
                     .join('')}</span>`
                 : ''
             }
+            ${zoomHTML(d, items)}
           </div>`;
       });
       weeks.push(`<div class="cal-week" role="row">${cells.join('')}</div>`);
@@ -1030,7 +1075,7 @@
       cell.querySelector('.cal-num').setAttribute('aria-pressed', String(on));
     }
     const plans = C.sortPlans(
-      visiblePlans().filter((p) => p.dueDate === date),
+      visiblePlans().filter((p) => p.dueDate && C.localDue(p).date === date),
       'deadline'
     );
     $('#view .day-panel').outerHTML = dayPanelHTML(plans, new Date());
@@ -1131,9 +1176,17 @@
       }
 
       const date = zone.dataset.dropDate;
-      if (plan.dueDate === date) return;
-      const previous = { dueDate: plan.dueDate, dueTime: plan.dueTime };
-      updatePlan(id, { dueDate: date });
+      const shownOn = plan.dueDate ? C.localDue(plan).date : '';
+      if (shownOn === date) return;
+      const previous = { dueDate: plan.dueDate, dueTime: plan.dueTime, endTime: plan.endTime };
+      // Keep the meeting's own date and time zone in step: move it by as many
+      // days as it moved on this calendar.
+      const shift = (from, to, days) => C.toISODate(C.addDays(C.parseISODate(from), C.daysBetween(C.parseISODate(to), C.parseISODate(days))));
+      let dueDate = date && shownOn && shownOn !== plan.dueDate ? shift(plan.dueDate, shownOn, date) : date;
+      // A clock change in between can still leave it a day off: correct that.
+      const landed = dueDate && C.localDue({ ...plan, dueDate }).date;
+      if (date && landed && landed !== date) dueDate = shift(dueDate, landed, date);
+      updatePlan(id, { dueDate });
       const message = date
         ? `Moved “${truncate(plan.title)}” to ${C.formatDate(C.parseISODate(date))}`
         : `Removed the deadline from “${truncate(plan.title)}”`;
@@ -1149,6 +1202,10 @@
     dialog: $('#editor'),
     form: $('#editor-form'),
     id: null,
+    docs: { resume: null, coverLetter: null }, // the meeting's PDFs while editing
+    docSlot: '',
+    uploading: new Set(), // slots with an upload running
+    session: 0, // which opening of the editor an upload belongs to
     tags: [],
     checklist: [],
     snapshot: '',
@@ -1189,6 +1246,10 @@
       company: '',
       meetingUrl: '',
       jobUrl: '',
+      timeZone: '',
+      endTime: '',
+      resume: null,
+      coverLetter: null,
       ...defaults,
     };
     const meeting = source.kind === 'meeting';
@@ -1213,6 +1274,13 @@
     field('description').value = source.description || '';
     field('dueDate').value = source.dueDate || '';
     field('dueTime').value = source.dueTime || '';
+    field('endTime').value = source.endTime || '';
+    setZoneSelect(source.timeZone || C.localTimeZone());
+    editor.docs = { resume: source.resume || null, coverLetter: source.coverLetter || null };
+    editor.session += 1; // uploads from an earlier opening never land here
+    editor.uploading = new Set();
+    $('#docs-error').hidden = true;
+    $('#end-time-error').hidden = true;
     renderSegmented('status-options', 'status', C.STATUSES, C.STATUS_LABELS, source.status);
     renderSegmented('priority-options', 'priority', C.PRIORITIES, C.PRIORITY_LABELS, source.priority);
     editor.tags = [...source.tags];
@@ -1230,6 +1298,8 @@
     $('#title-error').hidden = true;
     editor.snapshot = editorSnapshot();
     editor.original = editorValues(); // to save only what the user changes
+    // A meeting saved before time zones existed: saving it stores the zone shown.
+    if (plan && C.isMeeting(plan)) editor.original.timeZone = plan.timeZone || '';
     applyKind();
     editor.dialog.showModal();
     if (!plan && meeting) {
@@ -1253,7 +1323,10 @@
     $('#title-error').textContent = meeting ? 'Add the company name or a title.' : 'Give your plan a title.';
     $('#due-legend').textContent = meeting ? 'Date and time' : 'Deadline';
     field('dueDate').setAttribute('aria-label', meeting ? 'Meeting date' : 'Deadline date');
-    field('dueTime').setAttribute('aria-label', meeting ? 'Meeting time' : 'Deadline time (optional)');
+    field('dueTime').setAttribute('aria-label', meeting ? 'Start time' : 'Deadline time (optional)');
+    editor.form.classList.toggle('is-meeting', meeting);
+    updateZoneHint();
+    renderDocs();
     $('#description-label').textContent = meeting ? 'Notes' : 'Description';
     field('description').placeholder = meeting
       ? "Who you're meeting, questions to ask, phone number…"
@@ -1277,6 +1350,179 @@
     const company = oneLine(field('company').value);
     if (!isMeetingForm()) field('title').placeholder = "What's the plan?";
     else field('title').placeholder = company ? C.meetingTitle(company) : 'e.g. Phone screen with Acme';
+  }
+
+  // Offered at the top of the time zone list.
+  const COMMON_ZONES = [
+    'America/New_York',
+    'America/Chicago',
+    'America/Denver',
+    'America/Los_Angeles',
+    'Europe/London',
+    'Europe/Paris',
+    'Asia/Kolkata',
+    'Asia/Singapore',
+    'Asia/Tokyo',
+    'Australia/Sydney',
+    'UTC',
+  ];
+
+  function setZoneSelect(zone) {
+    const select = $('#zone-select');
+    // Built on first use (listing every zone takes a moment), then kept.
+    if (!select.options.length) {
+      const all = C.timeZoneOptions(new Date(), zone ? [zone] : []);
+      const option = (z) => `<option value="${esc(z.id)}">${esc(z.label)}</option>`;
+      const local = C.localTimeZone();
+      const common = [local, ...COMMON_ZONES].filter((id, i, list) => id && list.indexOf(id) === i);
+      const top = common.map((id) => all.find((z) => z.id === id)).filter(Boolean);
+      select.innerHTML = `<optgroup label="Common">${top.map(option).join('')}</optgroup>
+        <optgroup label="All time zones">${all.map(option).join('')}</optgroup>`;
+    }
+    if (zone && ![...select.options].some((o) => o.value === zone)) {
+      select.add(new window.Option(C.zoneLabel(zone) || zone, zone)); // a zone this browser doesn't list
+    }
+    select.value = zone || C.localTimeZone() || select.options[0]?.value || '';
+  }
+
+  // "That's 11:00 AM – 12:00 PM your time" when the meeting's time zone isn't yours.
+  function updateZoneHint() {
+    const hint = $('#zone-hint');
+    const preview = {
+      kind: 'meeting',
+      dueDate: field('dueDate').value,
+      dueTime: field('dueTime').value,
+      endTime: field('endTime').value > field('dueTime').value ? field('endTime').value : '',
+      timeZone: field('timeZone').value,
+    };
+    if (!isMeetingForm() || !preview.dueDate || !preview.dueTime || !C.zoneDiffers(preview)) {
+      hint.hidden = true;
+      return;
+    }
+    const local = C.localDue(preview);
+    const day = local.date !== preview.dueDate ? ` on ${C.formatDate(C.parseISODate(local.date))}` : '';
+    hint.textContent = `That's ${C.formatTimeRange(preview)}${day} your time (${C.zoneLabel(C.localTimeZone(), C.meetingStart(preview) || undefined)}).`;
+    hint.hidden = false;
+  }
+
+  /* ---- PDF documents for meetings (resume, cover letter) */
+
+  const DOC_LABELS = { resume: 'Resume', coverLetter: 'Cover letter' };
+  const MAX_PDF_BYTES = 10 * 1024 * 1024;
+  const isFileId = (id) => typeof id === 'string' && /^[0-9a-f]{32}$/.test(id);
+  const uploadsAvailable = () => Boolean(sync.user && sync.admin && sync.available);
+
+  function fileSize(bytes) {
+    if (bytes < 1024) return `${bytes} bytes`;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  // A link that opens an attached PDF in a new tab (only on the hosted site).
+  function docLink(doc, label, { size = 'small', kind = 'ghost', action = 'open-doc' } = {}) {
+    if (!doc || !isFileId(doc.id) || location.protocol === 'file:') return '';
+    return `<a class="btn ${size} ${kind}" href="api/files/${doc.id}" target="_blank" rel="noopener" draggable="false"
+      data-action="${action}" title="${esc(doc.name)}" aria-label="${esc(`${label}: ${doc.name} (PDF, opens in a new tab)`)}">${icon('file')}${label}</a>`;
+  }
+
+  function renderDocs() {
+    const available = uploadsAvailable();
+    for (const slot of Object.keys(DOC_LABELS)) {
+      const doc = editor.docs[slot];
+      const label = DOC_LABELS[slot];
+      let html;
+      if (editor.uploading.has(slot)) {
+        html = '<span class="muted">Uploading…</span>';
+      } else if (doc) {
+        const open = docLink(doc, 'Open', { action: 'open-doc' });
+        html = `<span class="doc-name" title="${esc(doc.name)}">${icon('file')}<span>${esc(doc.name)}</span></span>
+          <span class="muted">${fileSize(doc.size)}</span>${open}
+          ${available ? `<button type="button" class="btn small ghost" data-doc="${slot}" data-doc-action="upload" aria-label="Replace the ${label.toLowerCase()}">Replace</button>` : ''}
+          <button type="button" class="btn small danger" data-doc="${slot}" data-doc-action="remove" aria-label="Remove the ${label.toLowerCase()}">Remove</button>`;
+      } else {
+        html = `<button type="button" class="btn small ghost" data-doc="${slot}" data-doc-action="upload"${available ? '' : ' disabled'}
+          aria-label="Upload the ${label.toLowerCase()} (PDF)">${icon('upload')}Upload PDF</button>`;
+      }
+      $(`#doc-${slot}`).innerHTML = html;
+    }
+    $('#docs-hint').textContent = available
+      ? 'PDF, up to 10 MB. People you approve can open these too.'
+      : 'Attaching PDFs works on your Dayplan website, signed in as the admin.';
+  }
+
+  // Uploads a PDF and attaches it to the meeting being edited (saved with the meeting).
+  async function attachPdf(slot, file) {
+    const error = $('#docs-error');
+    error.hidden = true;
+    const fail = (message) => {
+      error.textContent = message;
+      error.hidden = false;
+    };
+    if (file.size > MAX_PDF_BYTES) return fail('PDF files can be up to 10 MB.');
+    try {
+      const head = new Uint8Array(await file.slice(0, 5).arrayBuffer());
+      if (String.fromCharCode(...head) !== '%PDF-') return fail('This file is not a PDF.');
+    } catch {
+      return fail("Couldn't read that file.");
+    }
+    const session = editor.session;
+    const current = () => editor.session === session && editor.dialog.open;
+    editor.uploading.add(slot);
+    renderDocs();
+    try {
+      const doc = await uploadFile(file);
+      if (!current()) return; // closed (or opened for something else) meanwhile
+      editor.docs = { ...editor.docs, [slot]: doc };
+      $('#docs-error').hidden = true;
+    } catch (err) {
+      if (current()) fail(err.status ? err.message : "Couldn't upload the PDF. Check your connection and try again.");
+    } finally {
+      if (editor.session === session) {
+        editor.uploading.delete(slot);
+        if (editor.dialog.open) {
+          renderDocs();
+          focusDoc(slot);
+        }
+      }
+    }
+  }
+
+  // After a change, keep the keyboard on that document's row.
+  function focusDoc(slot) {
+    const row = $(`#doc-${slot}`);
+    const target = row && (row.querySelector('a') || row.querySelector('button:not([disabled])'));
+    if (target) target.focus();
+  }
+
+  async function uploadFile(file) {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 120000) : null;
+    let response;
+    try {
+      response = await fetch('api/files', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/pdf', 'X-File-Name': encodeURIComponent(file.name) },
+        body: file,
+        credentials: 'same-origin',
+        cache: 'no-store',
+        signal: controller ? controller.signal : undefined,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      /* not JSON */
+    }
+    const doc = response.ok ? C.normalizeFile(data) : null;
+    if (!doc) {
+      const err = new Error((data && data.error) || `Upload failed (error ${response.status}).`);
+      err.status = response.status;
+      throw err;
+    }
+    return doc;
   }
 
   // "Add to my calendar" is offered for saved meetings that have a date.
@@ -1319,6 +1565,11 @@
       description: field('description').value.trim(),
       dueDate,
       dueTime: dueDate ? dueTime : '',
+      // Meetings: when it ends, the time zone the times are in, and the PDFs.
+      endTime: meeting && dueDate && dueTime ? field('endTime').value : '',
+      timeZone: meeting ? field('timeZone').value : '',
+      resume: meeting ? editor.docs.resume : null,
+      coverLetter: meeting ? editor.docs.coverLetter : null,
       status: field('status').value,
       priority: field('priority').value,
       tags: [...editor.tags],
@@ -1328,6 +1579,9 @@
 
   function editorSnapshot() {
     return JSON.stringify([
+      field('endTime').value,
+      field('timeZone').value,
+      editor.docs,
       field('kind').value,
       field('company').value,
       field('meetingUrl').value,
@@ -1402,6 +1656,18 @@
     // For a meeting the cursor goes to Company, so the message is read out there.
     setNameError(meeting && !named);
     if (!named) problems.push(field(meeting ? 'company' : 'title'));
+    const start = field('dueTime').value;
+    const end = field('endTime').value;
+    const badEnd = meeting && Boolean(end) && (!start || end <= start);
+    $('#end-time-error').hidden = !badEnd;
+    field('endTime').setAttribute('aria-invalid', String(badEnd));
+    if (badEnd) problems.push(field('endTime'));
+    // Saving mid-upload would leave the PDF out.
+    const uploading = editor.uploading.size > 0;
+    if (uploading) {
+      $('#docs-error').textContent = 'Wait until the PDF has finished uploading.';
+      $('#docs-error').hidden = false;
+    }
     for (const [name, errorId] of LINK_FIELDS) {
       const value = field(name).value.trim();
       const bad = meeting && Boolean(value) && !C.cleanUrl(C.extractUrl(value));
@@ -1410,7 +1676,7 @@
       if (bad) problems.push(field(name));
     }
     if (problems.length) problems[0].focus();
-    return !problems.length;
+    return !problems.length && !uploading;
   }
 
   function setNameError(on) {
@@ -1433,6 +1699,12 @@
     }
 
     const values = editorValues();
+    if (values.kind === 'plan' && editor.original?.kind === 'meeting' && values.dueDate && values.dueTime) {
+      // A plan's time is local: a meeting in another time zone keeps its moment.
+      const local = C.localDue({ kind: 'meeting', dueDate: values.dueDate, dueTime: values.dueTime, timeZone: field('timeZone').value });
+      values.dueDate = local.date;
+      values.dueTime = local.time;
+    }
     const point = centerOf(editor.form.querySelector('[type="submit"]'));
     editor.dialog.close();
 
@@ -1535,6 +1807,7 @@
         field('dueDate').value = C.toISODate(C.addDays(now, Number(value)));
       }
       updateIcsButton();
+      updateZoneHint();
     });
 
     form.addEventListener('change', (e) => {
@@ -1570,14 +1843,36 @@
     }
     for (const type of ['input', 'change']) field('dueDate').addEventListener(type, updateIcsButton);
     $('#editor-ics').addEventListener('click', () => downloadICS({ ...editorValues(), id: editor.id }));
-    let zone = '';
-    try {
-      const parts = new Intl.DateTimeFormat(undefined, { timeZoneName: 'long' }).formatToParts(new Date());
-      zone = parts.find((part) => part.type === 'timeZoneName')?.value || '';
-    } catch {
-      /* no time zone name available */
+    // Time zone and end time
+    for (const name of ['dueDate', 'dueTime', 'endTime', 'timeZone']) {
+      for (const type of ['input', 'change']) field(name).addEventListener(type, updateZoneHint);
     }
-    $('#zone-hint').textContent = zone ? `Times are in your time zone (${zone}).` : 'Times are in your time zone.';
+    for (const type of ['input', 'change']) {
+      field('endTime').addEventListener(type, () => {
+        $('#end-time-error').hidden = true;
+        field('endTime').setAttribute('aria-invalid', 'false');
+      });
+    }
+
+    // Documents (PDF)
+    $('.docs-field', form).addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-doc-action]');
+      if (!btn) return;
+      const slot = btn.dataset.doc;
+      if (btn.dataset.docAction === 'remove') {
+        editor.docs = { ...editor.docs, [slot]: null };
+        renderDocs();
+        focusDoc(slot);
+        return;
+      }
+      editor.docSlot = slot;
+      $('#doc-file').click();
+    });
+    $('#doc-file').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      e.target.value = '';
+      if (file && editor.docSlot) await attachPdf(editor.docSlot, file);
+    });
 
     // Tags
     const tagInput = $('#tag-input');
@@ -1674,6 +1969,10 @@
     const when = due.full ? `${esc(due.full)}${plan.dueTime ? '' : ' (time not set)'}` : 'Date not set';
     const live = due.label !== due.full && due.state !== 'none' ? ` <span class="chip due due-${due.state}">${esc(due.label)}</span>` : '';
     rows.push(row('When', `<span class="detail-when">${when}</span>${live}`));
+    if (plan.timeZone && plan.dueTime) {
+      const there = C.zoneDiffers(plan) ? '' : ' (same as yours)';
+      rows.push(row('Time zone', `${esc(C.zoneLabel(plan.timeZone, C.meetingStart(plan) || undefined))}${there}`));
+    }
     if (plan.company) rows.push(row('Company', esc(plan.company)));
     const join = linkButton(plan.meetingUrl, {
       action: 'open-meeting',
@@ -1685,6 +1984,11 @@
     if (join) rows.push(row('Meeting link', `${join}${host(plan.meetingUrl)}`));
     const job = jobButton(plan);
     if (job) rows.push(row('Job description', `${job}${host(plan.jobUrl)}`));
+    for (const [slot, label] of Object.entries(DOC_LABELS)) {
+      const doc = plan[slot];
+      const link = docLink(doc, 'Open PDF', { action: `open-${slot}` });
+      if (link) rows.push(row(label, `${link}<span class="link-host">${esc(doc.name)} · ${fileSize(doc.size)}</span>`));
+    }
     if (plan.description) rows.push(row('Notes', `<p class="detail-notes">${esc(plan.description)}</p>`));
     if (plan.checklist.length) {
       const steps = plan.checklist
@@ -2367,10 +2671,18 @@
         let repaired = false;
         state.plans = state.plans.map((p) => {
           const copy = server.get(p.id);
-          if (!held.includes(p.id) || C.isMeeting(p) || !C.isMeeting(copy)) return p;
+          if (!held.includes(p.id) || !C.isMeeting(copy)) return p;
+          const fields = {};
+          if (!C.isMeeting(p)) {
+            Object.assign(fields, { kind: 'meeting', company: copy.company, meetingUrl: copy.meetingUrl, jobUrl: copy.jobUrl });
+          }
+          // Details the older copy didn't have: take them from the account.
+          for (const key of ['timeZone', 'endTime', 'resume', 'coverLetter']) {
+            if (!p[key] && copy[key]) fields[key] = copy[key];
+          }
+          if (!Object.keys(fields).length) return p;
           repaired = true;
-          const { company, meetingUrl, jobUrl } = copy;
-          return C.normalizePlan({ ...p, kind: 'meeting', company, meetingUrl, jobUrl });
+          return C.normalizePlan({ ...p, ...fields });
         });
         if (repaired) render();
         if (pullTo === olderDataLoads) olderIds.clear(); // unless another old copy was read meanwhile
@@ -3246,10 +3558,25 @@
       true
     );
 
+    // The big (hovered) day covers its neighbours: once the pointer is over the
+    // part that lies on another day, step aside so that day can be reached.
+    view.addEventListener('pointermove', (e) => {
+      const zoom = e.target instanceof Element && e.target.closest('.cal-zoom');
+      if (!zoom || e.target.closest('.cal-zoom-item')) return;
+      const r = zoom.parentElement.getBoundingClientRect();
+      if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) {
+        zoom.parentElement.classList.add('zoom-off');
+      }
+    });
+    view.addEventListener('pointerout', (e) => {
+      const day = e.target instanceof Element && e.target.closest('.cal-day.zoom-off');
+      if (day && !day.contains(e.relatedTarget)) day.classList.remove('zoom-off');
+    });
+
     view.addEventListener('dblclick', (e) => {
       if (viewing()) return;
       const day = e.target.closest('.cal-day');
-      if (day && !e.target.closest('.cal-chip')) openEditor(null, { dueDate: day.dataset.date });
+      if (day && !e.target.closest('.cal-chip, .cal-zoom-item')) openEditor(null, { dueDate: day.dataset.date });
     });
 
     view.addEventListener('keydown', (e) => {

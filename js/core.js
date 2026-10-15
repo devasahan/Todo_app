@@ -19,9 +19,13 @@
   const KIND_LABELS = { plan: 'Plan', meeting: 'Meeting' };
   const COMPANY_MAX = 120;
   const URL_MAX = 2000;
-  // How long a meeting is assumed to last, and how early it counts as "now".
+  const FILE_NAME_MAX = 120;
+  // How long a meeting without an end time is assumed to last, and how early
+  // any meeting counts as "now".
   const MEETING_WINDOW_MIN = 60;
+  const MINUTE_MS = 60 * 1000;
   const DAY_MS = 24 * 60 * 60 * 1000;
+  const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 
   /* ------------------------------------------------------------------ ids */
 
@@ -109,10 +113,305 @@
     return `${n} ${word}${n === 1 ? '' : 's'}`;
   }
 
-  // Local start time of a plan with a valid date and time.
-  function startTime(due, time) {
-    const [h, m] = time.split(':').map(Number);
-    return new Date(due.getFullYear(), due.getMonth(), due.getDate(), h, m);
+  /* ----------------------------------------------------------- time zones */
+
+  // A meeting's date, start and end are wall-clock times in its own time zone
+  // (an IANA id such as "America/New_York"), so "2 PM in New York" stays 2 PM
+  // in New York wherever the planner is opened. '' means the device's own
+  // time zone: meetings saved before time zones existed keep working as before.
+
+  // Building an Intl formatter takes about a tenth of a millisecond, so they
+  // (and a few results) are kept. A cache is emptied once it gets big, so odd
+  // input can never make it grow forever.
+  function cached(map, key, make, limit = 1000) {
+    let value = map.get(key);
+    if (value === undefined) {
+      if (map.size >= limit) map.clear();
+      value = make();
+      map.set(key, value);
+    }
+    return value;
+  }
+
+  const partFormats = new Map();
+
+  // Reads the wall clock of `timeZone` at a moment, as numbers.
+  // null for a time zone this browser doesn't know.
+  function partFormat(timeZone) {
+    return cached(partFormats, timeZone, () => {
+      try {
+        return new Intl.DateTimeFormat('en-US', {
+          timeZone,
+          hourCycle: 'h23',
+          year: 'numeric',
+          month: 'numeric',
+          day: 'numeric',
+          hour: 'numeric',
+          minute: 'numeric',
+          second: 'numeric',
+        });
+      } catch {
+        return null;
+      }
+    });
+  }
+
+  function isValidTimeZone(tz) {
+    return typeof tz === 'string' && tz !== '' && tz.length <= 100 && partFormat(tz) !== null;
+  }
+
+  // The device's own time zone, or '' when the browser can't tell.
+  function localTimeZone() {
+    try {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      return isValidTimeZone(tz) ? tz : '';
+    } catch {
+      return '';
+    }
+  }
+
+  // How far `timeZone` is ahead of UTC at the moment `ms`, in milliseconds
+  // (New York in summer: minus 4 hours). Its wall clock read as if it were
+  // UTC, minus the moment itself.
+  function zoneOffset(ms, timeZone) {
+    const p = {};
+    for (const part of partFormat(timeZone).formatToParts(new Date(ms))) p[part.type] = Number(part.value);
+    const wall = Date.UTC(p.year, p.month - 1, p.day, p.hour % 24, p.minute, p.second);
+    return wall - Math.floor(ms / 1000) * 1000;
+  }
+
+  const zoneWalls = new Map();
+
+  // { time, offset }: the moment (ms) the clocks in `timeZone` show
+  // `date time`, and the zone's UTC offset at that moment.
+  function zoneWall(date, time, timeZone) {
+    return cached(
+      zoneWalls,
+      `${date}|${time}|${timeZone}`,
+      () => {
+        const [y, mo, d] = date.split('-').map(Number);
+        const [h, mi] = time.split(':').map(Number);
+        const wall = Date.UTC(y, mo - 1, d, h, mi);
+        // The offsets a day before and a day after cover any change of the
+        // clocks near this time. An offset fits when the zone really has it
+        // at the moment it points to.
+        const before = zoneOffset(wall - DAY_MS, timeZone);
+        const after = zoneOffset(wall + DAY_MS, timeZone);
+        const fits = [...new Set([before, after])].filter((o) => zoneOffset(wall - o, timeZone) === o);
+        // The night the clocks go back, the time happens twice: take the
+        // first. The night they go forward, it is skipped: move on by the
+        // jump (2:30 becomes 3:30). Both are what a local Date does.
+        if (fits.length) {
+          const offset = Math.max(...fits);
+          return { time: wall - offset, offset };
+        }
+        const moment = wall - before;
+        return { time: moment, offset: zoneOffset(moment, timeZone) };
+      },
+      2000
+    );
+  }
+
+  /*
+   * The moment the clocks in `timeZone` show `date` ("YYYY-MM-DD") at `time`
+   * ("HH:MM"). With no time zone (''), the device's own local time.
+   * null when the date or time is not valid.
+   */
+  function zonedInstant(date, time, timeZone = '') {
+    if (!parseISODate(date) || !isValidTime(time)) return null;
+    if (!isValidTimeZone(timeZone)) {
+      const [y, mo, d] = date.split('-').map(Number);
+      const [h, mi] = time.split(':').map(Number);
+      return new Date(y, mo - 1, d, h, mi);
+    }
+    return new Date(zoneWall(date, time, timeZone).time);
+  }
+
+  // The time zone a meeting's times are in; '' for plans and for meetings
+  // without one (those use the device's own time).
+  function meetingZone(plan) {
+    return isMeeting(plan) && isValidTimeZone(plan.timeZone) ? plan.timeZone : '';
+  }
+
+  // When a meeting starts, or null without a date and time.
+  function meetingStart(plan) {
+    return plan ? zonedInstant(plan.dueDate, plan.dueTime, meetingZone(plan)) : null;
+  }
+
+  // When a meeting ends, or null when it has no end time.
+  function meetingEnd(plan) {
+    const start = meetingStart(plan);
+    if (!start || !isValidTime(plan.endTime) || plan.endTime <= plan.dueTime) return null;
+    const end = zonedInstant(plan.dueDate, plan.endTime, meetingZone(plan));
+    return end > start ? end : null;
+  }
+
+  // The end time, or an hour after the start when none is set.
+  function meetingEndOrDefault(plan) {
+    const start = meetingStart(plan);
+    if (!start) return null;
+    return meetingEnd(plan) || new Date(start.getTime() + MEETING_WINDOW_MIN * MINUTE_MS);
+  }
+
+  /*
+   * The date and time a plan is due on this device: for a meeting in another
+   * time zone, the local day and time of its start ("2 PM in New York" is
+   * 8 PM in Berlin). Everything else as saved. Plain Date getters only: this
+   * runs inside sort comparisons.
+   */
+  function localDue(plan) {
+    const start = meetingZone(plan) ? meetingStart(plan) : null;
+    if (!start) return { date: plan.dueDate, time: plan.dueTime };
+    return { date: toISODate(start), time: `${pad(start.getHours())}:${pad(start.getMinutes())}` };
+  }
+
+  // True when a meeting's time zone is set and its clocks differ from this
+  // device's at the meeting's start, so both times are worth showing.
+  function zoneDiffers(plan) {
+    const zone = meetingZone(plan);
+    if (!zone || !parseISODate(plan.dueDate) || !isValidTime(plan.dueTime)) return false;
+    const { time, offset } = zoneWall(plan.dueDate, plan.dueTime, zone);
+    return Math.round(offset / MINUTE_MS) !== Math.round(-new Date(time).getTimezoneOffset());
+  }
+
+  const timeFormats = new Map();
+  const timeRanges = new Map();
+
+  // "2:00 PM", or "2:00 PM EDT" with `named`.
+  function timeFormat(timeZone, named) {
+    return cached(timeFormats, `${timeZone}|${named}`, () => {
+      const opts = { hour: 'numeric', minute: '2-digit', timeZone };
+      if (named) opts.timeZoneName = 'short';
+      return new Intl.DateTimeFormat(undefined, opts);
+    });
+  }
+
+  // A copy of a local time whose UTC clock shows the same hours and minutes.
+  // Local times are formatted from these, so no kept formatter depends on the
+  // device's time zone (which can change while the page is open).
+  function wallCopy(date) {
+    return new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate(), date.getHours(), date.getMinutes()));
+  }
+
+  /*
+   * A meeting's start and end ("2:00 – 3:00 PM"), or just the start without
+   * an end time. Local time by default; `zone: true` gives the meeting's own
+   * time zone with its short name ("2:00 – 3:00 PM EDT"). '' without a time.
+   */
+  function formatTimeRange(plan, { zone = false } = {}) {
+    const start = meetingStart(plan);
+    if (!start) return '';
+    const end = meetingEnd(plan);
+    const timeZone = zone ? meetingZone(plan) || localTimeZone() : '';
+    const format = timeZone ? timeFormat(timeZone, true) : timeFormat('UTC', false);
+    const from = timeZone ? start : wallCopy(start);
+    const to = end && (timeZone ? end : wallCopy(end));
+    if (!to) return format.format(from);
+    // formatRange is slow (it runs on every render), so its results are kept too.
+    return cached(
+      timeRanges,
+      `${from.getTime()}|${to.getTime()}|${timeZone}`,
+      () => {
+        // In its own zone a meeting starts and ends on the same day. In local
+        // time it may not, and formatRange would then add both dates: just
+        // the times read better.
+        const sameDay = timeZone || from.getUTCDate() === to.getUTCDate();
+        if (sameDay && typeof format.formatRange === 'function') return format.formatRange(from, to);
+        return `${format.format(from)} – ${format.format(to)}`;
+      },
+      2000
+    );
+  }
+
+  // Intl still knows a few cities by their old names.
+  const RENAMED_CITIES = {
+    Calcutta: 'Kolkata',
+    Kiev: 'Kyiv',
+    Saigon: 'Ho Chi Minh',
+    Katmandu: 'Kathmandu',
+    Rangoon: 'Yangon',
+  };
+
+  // "America/Argentina/Buenos_Aires" gives "Buenos Aires".
+  function zoneCity(tz) {
+    const city = tz.split('/').pop().replace(/_/g, ' ');
+    return RENAMED_CITIES[city] || city;
+  }
+
+  const nameFormats = new Map();
+
+  // "New York (Eastern Daylight Time)": the city in the id and the zone's
+  // name at the moment `at` (summer and winter names differ). '' when invalid.
+  function zoneLabel(tz, at = new Date()) {
+    if (!isValidTimeZone(tz)) return '';
+    if (tz === 'UTC') return 'UTC';
+    const format = cached(nameFormats, tz, () => new Intl.DateTimeFormat(undefined, { timeZone: tz, timeZoneName: 'long' }));
+    const name = (format.formatToParts(at).find((part) => part.type === 'timeZoneName') || {}).value;
+    const city = zoneCity(tz);
+    return name && name !== city ? `${city} (${name})` : city;
+  }
+
+  // "−04:00" (with a real minus sign) for an offset in milliseconds.
+  const genericFormats = new Map();
+
+  // "Eastern Time": the zone's name without summer/winter, or '' when the
+  // browser has none (it would only repeat "GMT+3").
+  function genericZoneName(tz, at) {
+    try {
+      const format = cached(genericFormats, tz, () => new Intl.DateTimeFormat(undefined, { timeZone: tz, timeZoneName: 'longGeneric' }));
+      const name = (format.formatToParts(at).find((part) => part.type === 'timeZoneName') || {}).value || '';
+      return /GMT|UTC[+−-]/.test(name) ? '' : name;
+    } catch {
+      return ''; // older browsers don't know 'longGeneric'
+    }
+  }
+
+  function formatOffset(ms) {
+    const minutes = Math.round(ms / MINUTE_MS);
+    const abs = Math.abs(minutes);
+    return `${minutes < 0 ? '\u2212' : '+'}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+  }
+
+  // Offered when the browser can't list its time zones.
+  const COMMON_TIME_ZONES = [
+    'Pacific/Honolulu', 'America/Adak', 'America/Anchorage', 'America/Los_Angeles', 'America/Vancouver',
+    'America/Phoenix', 'America/Denver', 'America/Edmonton', 'America/Chicago', 'America/Winnipeg',
+    'America/Mexico_City', 'America/New_York', 'America/Toronto', 'America/Halifax', 'America/St_Johns',
+    'America/Sao_Paulo', 'Europe/London', 'Europe/Dublin', 'Europe/Lisbon', 'Europe/Paris', 'Europe/Berlin',
+    'Europe/Madrid', 'Europe/Rome', 'Europe/Amsterdam', 'Europe/Stockholm', 'Europe/Warsaw', 'Europe/Athens',
+    'Europe/Istanbul', 'Europe/Moscow', 'Africa/Lagos', 'Africa/Johannesburg', 'Africa/Cairo', 'Africa/Nairobi',
+    'Asia/Dubai', 'Asia/Karachi', 'Asia/Kolkata', 'Asia/Dhaka', 'Asia/Bangkok', 'Asia/Jakarta', 'Asia/Singapore',
+    'Asia/Manila', 'Asia/Hong_Kong', 'Asia/Shanghai', 'Asia/Seoul', 'Asia/Tokyo', 'Australia/Sydney',
+    'Australia/Melbourne', 'Pacific/Auckland', 'UTC',
+  ];
+
+  /*
+   * Choices for a time zone menu: [{ id, label }] with labels such as
+   * "(GMT−04:00) New York" (the offset at `now`), sorted by offset, then
+   * name. Always offers the device's own zone, UTC and any id in `include`
+   * (a meeting's saved zone, which another browser may spell differently).
+   */
+  function timeZoneOptions(now = new Date(), include = []) {
+    let ids = [];
+    try {
+      if (typeof Intl.supportedValuesOf === 'function') ids = Intl.supportedValuesOf('timeZone');
+    } catch {
+      ids = [];
+    }
+    if (!ids.length) ids = COMMON_TIME_ZONES;
+    const unique = new Set([...ids, 'UTC', localTimeZone(), ...include].filter(isValidTimeZone));
+    return [...unique]
+      .map((id) => {
+        const offset = zoneOffset(now.getTime(), id);
+        // City first, so typing "New York" (or "Eastern") in the list finds it.
+        const city = zoneCity(id);
+        const generic = genericZoneName(id, now);
+        const name = generic && generic !== city ? `${city} — ${generic}` : city;
+        return { id, offset, label: `${name} (GMT${formatOffset(offset)})` };
+      })
+      // Plain comparisons: ids are ASCII, and localeCompare is slow on 400 zones.
+      .sort((a, b) => a.offset - b.offset || (a.label < b.label ? -1 : a.label > b.label ? 1 : a.id < b.id ? -1 : 1))
+      .map(({ id, label }) => ({ id, label }));
   }
 
   /*
@@ -149,32 +448,57 @@
 
   /*
    * Describes when a meeting starts. A meeting is "now" from 60 minutes
-   * before its start until 60 minutes after, then "past".
+   * before its start until it ends (its end time, or 60 minutes after the
+   * start without one), then "past".
    * state: none | now | past | today | soon | later | done
    * `minutes` is the time until the start (negative once it has begun),
    * or null when no time is set.
+   * Days and times are this device's: a meeting in another time zone shows
+   * up on the day it happens here. `full` adds the end time and, when its
+   * zone's clocks differ, the time there: "Tue, Oct 20 at 8:00 – 9:00 PM
+   * (2:00 – 3:00 PM EDT)".
    */
-  function meetingInfo(plan, now) {
-    const due = parseISODate(plan.dueDate);
-    if (!due) return { state: 'none', label: 'Date not set', full: '', days: null, minutes: null };
+  // The time in the meeting's own zone, with its date when that isn't the
+  // local date: "Thu, Oct 15, 2:00 – 3:00 PM EDT".
+  function formatZoneTime(plan) {
+    const range = formatTimeRange(plan, { zone: true });
+    if (!range) return '';
+    const own = parseISODate(plan.dueDate);
+    if (!own || localDue(plan).date === plan.dueDate) return range;
+    return `${own.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}, ${range}`;
+  }
 
+  function meetingInfo(plan, now) {
+    if (!parseISODate(plan.dueDate)) {
+      return { state: 'none', label: 'Date not set', full: '', days: null, minutes: null };
+    }
+
+    const local = localDue(plan);
+    const due = parseISODate(local.date);
     const days = daysBetween(now, due);
-    const hasTime = isValidTime(plan.dueTime);
-    const at = hasTime ? ` at ${formatTime(plan.dueTime)}` : '';
-    const full = `${formatDate(due, now)}${at}`;
+    const start = meetingStart(plan);
+    const at = start ? ` at ${formatTime(local.time)}` : '';
+    const date = formatDate(due, now);
+    const when = `${date}${at}`;
+    let full = when;
+    if (start) {
+      full = `${date} at ${formatTimeRange(plan)}`;
+      if (zoneDiffers(plan)) full += ` (${formatZoneTime(plan)})`;
+    }
     // `|| 0` turns -0 into 0, so the last half-minute still reads "Starting now".
-    const minutes = hasTime ? Math.ceil((startTime(due, plan.dueTime) - now) / 60000) || 0 : null;
+    const minutes = start ? Math.ceil((start - now) / MINUTE_MS) || 0 : null;
+    const end = start ? meetingEndOrDefault(plan).getTime() : null;
     const info = (state, label) => ({ state, label, full, days, minutes });
 
-    if (plan.status === 'done') return info('done', full);
-    if (minutes !== null && minutes > -MEETING_WINDOW_MIN && minutes <= MEETING_WINDOW_MIN) {
+    if (plan.status === 'done') return info('done', when);
+    if (start && now.getTime() >= start.getTime() - MEETING_WINDOW_MIN * MINUTE_MS && now.getTime() < end) {
       if (minutes > 0) return info('now', `Starts in ${plural(minutes, 'minute')}`);
       return info('now', minutes === 0 ? 'Starting now' : 'Happening now');
     }
-    if (days < 0 || (minutes !== null && minutes <= -MEETING_WINDOW_MIN)) {
+    if (days < 0 || (start && now.getTime() >= end)) {
       if (days === 0) return info('past', `Earlier today${at}`);
       if (days === -1) return info('past', `Yesterday${at}`);
-      return info('past', full);
+      return info('past', when);
     }
     if (days === 0) return info('today', `Today${at}`);
     if (days === 1) return info('soon', `Tomorrow${at}`);
@@ -183,7 +507,7 @@
       return info(days <= 3 ? 'soon' : 'later', `${weekday}${at}`);
     }
     // Unlike plans, the time is kept: it matters for a meeting.
-    return info('later', full);
+    return info('later', when);
   }
 
   /* ------------------------------------------------------------ quick add */
@@ -411,17 +735,35 @@
   const isStamp = (v) => typeof v === 'string' && v !== '' && !Number.isNaN(Date.parse(v));
   const text = (v, max) => (typeof v === 'string' ? v.slice(0, max) : '');
 
+  /*
+   * An uploaded PDF (a meeting's resume or cover letter) as the server
+   * describes it: { id, name, size }, or null for anything else. The id is
+   * all the server needs; the name is only shown.
+   */
+  function normalizeFile(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    if (typeof value.id !== 'string' || !/^[0-9a-f]{32}$/.test(value.id)) return null;
+    if (!Number.isSafeInteger(value.size) || value.size < 0) return null;
+    const raw = typeof value.name === 'string' ? value.name.replace(CONTROL_CHARS, '').trim() : '';
+    // Counted in characters, not UTF-16 units, so no emoji is cut in half.
+    const name = Array.from(raw).slice(0, FILE_NAME_MAX).join('').trim();
+    return { id: value.id, name: name || 'document.pdf', size: value.size };
+  }
+
   // Validates and fills in any plan-shaped object (also used for imports).
   function normalizePlan(raw, now = new Date()) {
     const r = raw && typeof raw === 'object' ? raw : {};
     const stamp = now.toISOString();
     const status = STATUSES.includes(r.status) ? r.status : 'todo';
     const dueDate = parseISODate(r.dueDate) ? r.dueDate : '';
+    const dueTime = dueDate && isValidTime(r.dueTime) ? r.dueTime : '';
     const updatedAt = isStamp(r.updatedAt) ? r.updatedAt : stamp;
     const kind = r.kind === 'meeting' ? 'meeting' : 'plan';
     const meeting = kind === 'meeting';
     // Only meetings keep a company and links; saving one as a plan clears them.
     const company = meeting ? text(r.company, COMPANY_MAX).replace(/\s+/g, ' ').trim() : '';
+    // A meeting ends on the day it starts, so its end time must be later.
+    const endTime = meeting && dueTime && isValidTime(r.endTime) && r.endTime > dueTime ? r.endTime : '';
 
     const tags = Array.isArray(r.tags) ? r.tags.map(normalizeTag).filter(Boolean) : [];
     const checklist = Array.isArray(r.checklist)
@@ -440,7 +782,7 @@
       title: text(r.title, 200).trim() || (meeting ? meetingTitle(company) || 'Untitled meeting' : 'Untitled plan'),
       description: text(r.description, 5000),
       dueDate,
-      dueTime: dueDate && isValidTime(r.dueTime) ? r.dueTime : '',
+      dueTime,
       status,
       priority: PRIORITIES.includes(r.priority) ? r.priority : 'medium',
       // Always written. A stored plan without `kind` was saved by an older
@@ -449,6 +791,12 @@
       company,
       meetingUrl: meeting ? cleanUrl(r.meetingUrl) : '',
       jobUrl: meeting ? cleanUrl(r.jobUrl) : '',
+      // Also always written (empty on plans). dueDate, dueTime and endTime
+      // are wall-clock times in timeZone; '' is the device's own time zone.
+      timeZone: meeting && isValidTimeZone(r.timeZone) ? r.timeZone : '',
+      endTime,
+      resume: meeting ? normalizeFile(r.resume) : null,
+      coverLetter: meeting ? normalizeFile(r.coverLetter) : null,
       tags: [...new Set(tags)].slice(0, 20),
       checklist,
       order: Number.isFinite(r.order) ? r.order : 0,
@@ -584,8 +932,10 @@
   }
 
   // Timed deadlines sort before all-day ones; no deadline sorts last.
+  // Meetings in another time zone sort by when they happen on this device.
   function deadlineKey(plan) {
-    return plan.dueDate ? `${plan.dueDate} ${plan.dueTime || '24:00'}` : '~';
+    const { date, time } = localDue(plan);
+    return date ? `${date} ${time || '24:00'}` : '~';
   }
 
   // Manual order, with the id as a tie-break so every device shows the same order.
@@ -713,7 +1063,7 @@
       } else if (plan.status !== 'done') {
         const due = dueInfo(plan, now);
         if (due.state === 'overdue') stats.overdue += 1;
-        if (plan.dueDate === todayKey) stats.dueToday += 1;
+        if (localDue(plan).date === todayKey) stats.dueToday += 1;
       }
     }
 
@@ -727,13 +1077,11 @@
 
     // Today's progress: finished today vs. still due (or overdue) today.
     // Meetings from earlier days are over, so they don't count as remaining.
-    const remaining = plans.filter(
-      (p) =>
-        p.status !== 'done' &&
-        p.dueDate &&
-        p.dueDate <= todayKey &&
-        !(p.kind === 'meeting' && p.dueDate < todayKey)
-    ).length;
+    const remaining = plans.filter((p) => {
+      if (p.status === 'done') return false;
+      const { date } = localDue(p);
+      return date && date <= todayKey && !(p.kind === 'meeting' && date < todayKey);
+    }).length;
     stats.todayTotal = stats.doneToday + remaining;
     stats.todayPct = stats.todayTotal ? Math.round((stats.doneToday / stats.todayTotal) * 100) : 0;
     return stats;
@@ -788,12 +1136,16 @@
   /*
    * A calendar file (.ics) for a meeting, with a reminder 15 minutes before
    * when it has a time. Times are written in UTC, so calendar apps show the
-   * same moment the planner does. Returns '' for plans and undated meetings.
+   * same moment the planner does, wherever the meeting's time zone is.
+   * Attached documents stay out of the file. Returns '' for plans and
+   * undated meetings.
    */
   function meetingICS(plan, now = new Date()) {
     const due = parseISODate(plan.dueDate);
     if (!isMeeting(plan) || !due) return '';
-    const hasTime = isValidTime(plan.dueTime);
+    const start = meetingStart(plan);
+    const hasTime = start !== null;
+    const zone = meetingZone(plan);
     const meetingUrl = cleanUrl(plan.meetingUrl);
     const jobUrl = cleanUrl(plan.jobUrl);
 
@@ -801,6 +1153,7 @@
       plan.company ? `Company: ${plan.company}` : '',
       meetingUrl ? `Meeting link: ${meetingUrl}` : '',
       jobUrl ? `Job description: ${jobUrl}` : '',
+      zone ? `Time zone: ${zoneLabel(zone, start || zonedInstant(plan.dueDate, '12:00', zone))}` : '',
     ].filter(Boolean);
     const notes = String(plan.description || '').trim();
     const description = [details.join('\n'), notes].filter(Boolean).join('\n\n');
@@ -816,9 +1169,7 @@
       `DTSTAMP:${icsStamp(now)}`,
     ];
     if (hasTime) {
-      const start = startTime(due, plan.dueTime);
-      const end = new Date(start.getTime() + MEETING_WINDOW_MIN * 60000);
-      lines.push(`DTSTART:${icsStamp(start)}`, `DTEND:${icsStamp(end)}`);
+      lines.push(`DTSTART:${icsStamp(start)}`, `DTEND:${icsStamp(meetingEndOrDefault(plan))}`);
     } else {
       lines.push(`DTSTART;VALUE=DATE:${icsDate(due)}`, `DTEND;VALUE=DATE:${icsDate(addDays(due, 1))}`);
     }
@@ -872,16 +1223,27 @@
   // An older version drops the fields it doesn't know about, so its copy of a
   // meeting arrives without them. Keep the details of the meeting we have.
   // A copy that says kind: 'plan' was written on purpose and does convert it.
+  // Versions from before time zones wrote `kind` but not `timeZone`: their
+  // copy of a meeting keeps its zone, end time and documents the same way.
   function keepMeetingDetails(raw, current) {
-    if (fromOlderVersion(raw) && current && current.kind === 'meeting') {
+    if (!current || current.kind !== 'meeting' || raw === null || typeof raw !== 'object') return raw;
+    const newer = {
+      timeZone: current.timeZone,
+      endTime: current.endTime,
+      resume: current.resume,
+      coverLetter: current.coverLetter,
+    };
+    if (fromOlderVersion(raw)) {
       return {
         ...raw,
         kind: 'meeting',
         company: current.company,
         meetingUrl: current.meetingUrl,
         jobUrl: current.jobUrl,
+        ...newer,
       };
     }
+    if (raw.kind === 'meeting' && !Object.prototype.hasOwnProperty.call(raw, 'timeZone')) return { ...raw, ...newer };
     return raw;
   }
 
@@ -983,6 +1345,8 @@
         description: 'Ask about the team and the next steps.',
         dueDate: day(2),
         dueTime: '14:00',
+        endTime: '15:00',
+        timeZone: localTimeZone(),
         status: 'todo',
         priority: 'high',
         tags: ['job-search'],
@@ -1021,6 +1385,18 @@
     formatTime,
     formatShortTime,
     formatDate,
+    isValidTimeZone,
+    localTimeZone,
+    zonedInstant,
+    meetingStart,
+    meetingEnd,
+    meetingEndOrDefault,
+    localDue,
+    zoneDiffers,
+    formatTimeRange,
+    formatZoneTime,
+    zoneLabel,
+    timeZoneOptions,
     dueInfo,
     parseQuickAdd,
     cleanUrl,
@@ -1029,6 +1405,7 @@
     isMeeting,
     meetingTitle,
     normalizeTag,
+    normalizeFile,
     normalizePlan,
     createPlan,
     withStatus,

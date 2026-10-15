@@ -225,7 +225,7 @@
           <fieldset class="field">
             <legend class="sr-only">Type</legend>
             <div class="segmented kind-switch" id="kind-options"></div>
-            <span class="field-hint" id="kind-hint" hidden>Saving this as a plan removes the company and links.</span>
+            <span class="field-hint" id="kind-hint" hidden>Saving this as a plan removes the company, links, time zone, end time and documents.</span>
             <span class="field-hint" id="shared-hint" hidden>People you've approved can see this meeting (view only).</span>
           </fieldset>
 
@@ -244,8 +244,18 @@
           <fieldset class="field">
             <legend class="label" id="due-legend">Deadline</legend>
             <div class="deadline-inputs">
-              <input name="dueDate" type="date" aria-label="Deadline date" />
-              <input name="dueTime" type="time" aria-label="Deadline time (optional)" />
+              <label class="mini-field">
+                <span class="mini-label meeting-only" hidden>Date</span>
+                <input name="dueDate" type="date" aria-label="Deadline date" />
+              </label>
+              <label class="mini-field">
+                <span class="mini-label meeting-only" hidden>Starts</span>
+                <input name="dueTime" type="time" aria-label="Deadline time (optional)" />
+              </label>
+              <label class="mini-field meeting-only" hidden>
+                <span class="mini-label">Ends</span>
+                <input name="endTime" type="time" aria-label="End time" />
+              </label>
             </div>
             <div class="quick-dates">
               <button type="button" class="pill" data-due="0">Today</button>
@@ -253,7 +263,12 @@
               <button type="button" class="pill" data-due="next-week">Next week</button>
               <button type="button" class="pill plan-only" data-due="">No deadline</button>
             </div>
-            <span class="field-hint meeting-only" id="zone-hint" hidden></span>
+            <span class="field-error" id="end-time-error" hidden>The end time must be after the start time.</span>
+            <label class="zone-field meeting-only" hidden>
+              <span class="mini-label">Time zone</span>
+              <select name="timeZone" id="zone-select" aria-describedby="zone-hint"></select>
+            </label>
+            <span class="field-hint" id="zone-hint" hidden></span>
           </fieldset>
 
           <label class="field meeting-only" hidden>
@@ -283,6 +298,21 @@
             />
             <span class="field-error" id="job-url-error" hidden>This doesn't look like a web link. Paste the full link, starting with https://</span>
           </label>
+
+          <fieldset class="field meeting-only docs-field" hidden>
+            <legend class="label">Documents</legend>
+            <div class="doc-row">
+              <span class="doc-kind">Resume</span>
+              <span class="doc-body" id="doc-resume" aria-live="polite"></span>
+            </div>
+            <div class="doc-row">
+              <span class="doc-kind">Cover letter</span>
+              <span class="doc-body" id="doc-coverLetter" aria-live="polite"></span>
+            </div>
+            <input type="file" id="doc-file" accept="application/pdf,.pdf" hidden />
+            <span class="field-hint" id="docs-hint"></span>
+            <p class="field-error" id="docs-error" role="alert" hidden></p>
+          </fieldset>
 
           <div class="field ics-row" id="editor-ics-row" hidden>
             <button type="button" class="btn ghost small" id="editor-ics">

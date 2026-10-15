@@ -102,8 +102,9 @@ who uses your site.)
   start spamming). People with accounts can still sign in.
 
 **What approved people can do: view your meetings, nothing else.** Only you (the admin) plan. Everyone
-you approve gets a read-only **Meetings** calendar of your meetings: company, date and time, the
-meeting link (**Join**), the job description link, notes and prep steps, and **Add to my calendar**.
+you approve gets a read-only **Meetings** calendar of your meetings: company, date, start and end
+time with the time zone (and their own local time), the meeting link (**Join**), the job description
+link, the resume and cover letter PDFs, notes and prep steps, and **Add to my calendar**.
 They can't see your other plans, and they can't add, change or delete anything; the server refuses
 it, not just the screen. Whatever you change shows up for them within a minute.
 
@@ -171,7 +172,7 @@ They're added to your account and appear on every device you sign in on.
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Today**    | Your daily dashboard: a greeting, a progress ring for what's due today, tiles for *due today*, *overdue*, *in progress* and *done this week*, your streak, a **Focus now** card with the single most urgent plan, then *Overdue*, *Due today*, *In progress* and *Next 7 days*. |
 | **Board**    | A Kanban board with **To do / In progress / Done** columns. Drag cards between columns or reorder them. Sort by your own order, deadline, priority or newest.                                                 |
-| **Calendar** | A month view of deadlines and meetings. Drag a plan onto another day to reschedule it, double-click a day to add a plan, or drop a plan into **No deadline** to clear its date.                            |
+| **Calendar** | A month view of deadlines and meetings. Hover a day to see it at double size with everything on it. Drag a plan onto another day to reschedule it, double-click a day to add a plan, or drop a plan into **No deadline** to clear its date. |
 
 ### Plans
 
@@ -193,16 +194,21 @@ Press **New meeting** in the top bar (or <kbd>M</kbd>, or **Meeting** on a calen
 **⋯** menu on a phone), or switch the editor from **Plan** to **Meeting**. A meeting has:
 
 - **Company**: the title fills itself in as *Interview with Acme* unless you type your own.
-- **Date and time** of the call, in your own time zone.
+- **Date, start time, end time and time zone** of the call: enter the time the way the recruiter
+  gave it (say 2:00–3:00 PM New York time). If that isn't your time zone, the editor shows what it
+  is for you, and the calendar puts the meeting at your local time, with the other time beside it.
 - **Meeting link** (Zoom, Teams, Google Meet…): paste the link, or the whole invitation, and the
   link is picked out of it.
 - **Job description link**: the job posting.
+- **Resume and cover letter** (PDF, up to 10 MB each): the versions you sent for this job. They're
+  stored on your Dayplan site and open in a new tab. (Attaching needs the hosted site, signed in as
+  the admin.)
 - Notes, prep steps, tags and priority, just like a plan.
 
 Meetings show on the calendar with their time (*2:30 PM Acme*), on Today and on the board. Cards
 get a **Join** button (highlighted from an hour before the start) and a **Job description** button,
 both opening in a new tab. Meetings never count as overdue: once a meeting is over it moves to
-**Past meetings** on Today until you tick it off. **Add to my calendar** downloads a calendar file
+**Past meetings** on Today (after its end time) until you tick it off. **Add to my calendar** downloads a calendar file
 for your phone or computer calendar, with a reminder 15 minutes before. Only web links (`https://…`)
 are accepted, so a link can never run code.
 
@@ -236,7 +242,10 @@ Press <kbd>Shift</kbd>+<kbd>Enter</kbd> to open the full editor with the parsed 
 - **Dark mode** that follows your system, with a manual toggle.
 - **Backups**: export all plans to a `.json` file and import them again from the **⋯** menu.
   Importing merges by plan, so re-importing the same backup never creates duplicates. (An older
-  version of Dayplan can import these backups too, but ignores meeting details.)
+  version of Dayplan can import these backups too, but ignores meeting details.) A backup holds the
+  names of attached PDFs, not the files: those stay on your site and are copied with the
+  `dayplan-data` folder. A PDF that no meeting has used for 30 days (because it was replaced, or its
+  meeting was deleted) is removed then.
 - **New plan** button in the top bar opens the full editor (on the calendar, for the selected day).
 - Works on phones: the views move to a tab bar at the bottom, the board columns become swipeable
   panels, the calendar shows dots, and the editor opens as a bottom sheet.

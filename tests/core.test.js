@@ -792,3 +792,715 @@ test('sample plans include a meeting with example links', () => {
   assert.ok(m.meetingUrl.startsWith('https://example.com/'));
   assert.ok(m.jobUrl.startsWith('https://example.com/'));
 });
+
+/* ------------------------------------- time zones, end times, documents */
+
+// Runs `fn` as if the device were in `zone`. Node reads TZ again whenever it
+// changes, so local Dates and Intl both follow.
+function inZone(zone, fn) {
+  const saved = process.env.TZ;
+  process.env.TZ = zone;
+  try {
+    return fn();
+  } finally {
+    if (saved === undefined) delete process.env.TZ;
+    else process.env.TZ = saved;
+  }
+}
+
+const PDF = { id: 'a'.repeat(32), name: 'Resume.pdf', size: 48213 };
+const LETTER = { id: '0123456789abcdef0123456789abcdef', name: 'Cover letter.pdf', size: 1200 };
+const SUMMER = new Date(Date.UTC(2026, 6, 1, 12));
+const WINTER = new Date(Date.UTC(2026, 0, 15, 12));
+
+test('normalizePlan adds time zone, end time and documents, kept only on meetings', () => {
+  const p = plan();
+  assert.equal(p.timeZone, '');
+  assert.equal(p.endTime, '');
+  assert.equal(p.resume, null);
+  assert.equal(p.coverLetter, null);
+  // Always written, right after the other meeting fields.
+  const keys = Object.keys(p);
+  const after = keys.indexOf('jobUrl') + 1;
+  assert.deepEqual(keys.slice(after, after + 4), ['timeZone', 'endTime', 'resume', 'coverLetter']);
+
+  const asPlan = plan({
+    dueDate: '2026-10-20',
+    dueTime: '14:00',
+    endTime: '15:00',
+    timeZone: 'America/New_York',
+    resume: PDF,
+    coverLetter: LETTER,
+  });
+  assert.deepEqual([asPlan.timeZone, asPlan.endTime, asPlan.resume, asPlan.coverLetter], ['', '', null, null]);
+
+  for (const tz of ['America/New_York', 'Asia/Kolkata', 'UTC', 'Pacific/Chatham', 'Australia/Lord_Howe']) {
+    assert.equal(meeting({ timeZone: tz }).timeZone, tz);
+  }
+  for (const tz of ['Nowhere/Special', ' America/New_York', '', 42, null, {}, ['UTC'], `America/${'x'.repeat(200)}`]) {
+    assert.equal(meeting({ timeZone: tz }).timeZone, '', JSON.stringify(tz));
+  }
+
+  const at = (f) => meeting({ dueDate: '2026-10-20', dueTime: '14:00', ...f });
+  assert.equal(at({ endTime: '15:30' }).endTime, '15:30');
+  assert.equal(at({ endTime: '14:01' }).endTime, '14:01');
+  assert.equal(at({ endTime: '23:59' }).endTime, '23:59');
+  // Never at or before the start (no overnight meetings), and only a real time.
+  for (const endTime of ['14:00', '13:59', '00:30', '24:00', '3pm', '15:3', '', null, 1530]) {
+    assert.equal(at({ endTime }).endTime, '', JSON.stringify(endTime));
+  }
+  assert.equal(at({ dueTime: '', endTime: '15:00' }).endTime, ''); // needs a start time
+  assert.equal(meeting({ dueTime: '14:00', endTime: '15:00' }).endTime, ''); // and a date
+});
+
+test('normalizePlan keeps only well-formed documents', () => {
+  assert.deepEqual(meeting({ resume: PDF }).resume, PDF);
+  assert.deepEqual(meeting({ coverLetter: LETTER }).coverLetter, LETTER);
+  assert.deepEqual(meeting({ resume: { ...PDF, url: 'javascript:x', extra: 1 } }).resume, PDF);
+  assert.deepEqual(meeting({ resume: { ...PDF, size: 0 } }).resume, { ...PDF, size: 0 });
+
+  const named = (name) => meeting({ resume: { ...PDF, name } }).resume.name;
+  assert.equal(named('  My\u0000 CV\r\n.pdf\u0085  '), 'My CV.pdf');
+  for (const name of ['', '   ', '\u0007\u0008', 42, null, undefined, {}]) {
+    assert.equal(named(name), 'document.pdf', JSON.stringify(name));
+  }
+  assert.equal(named('a'.repeat(300)).length, 120);
+  assert.equal(named(`${'a'.repeat(119)} tail`), 'a'.repeat(119)); // trimmed after cutting
+  // Cut by characters, so an emoji is never split in half.
+  const emoji = named('😀'.repeat(130));
+  assert.equal([...emoji].length, 120);
+  assert.equal(emoji, '😀'.repeat(120));
+
+  const bad = [
+    null,
+    'Resume.pdf',
+    PDF.id,
+    [PDF],
+    42,
+    { ...PDF, id: 'A'.repeat(32) },
+    { ...PDF, id: 'a'.repeat(31) },
+    { ...PDF, id: 'a'.repeat(33) },
+    { ...PDF, id: 'g'.repeat(32) },
+    { ...PDF, id: `../${'a'.repeat(29)}` },
+    { ...PDF, id: 123 },
+    { ...PDF, size: -1 },
+    { ...PDF, size: 1.5 },
+    { ...PDF, size: '10' },
+    { ...PDF, size: NaN },
+    { ...PDF, size: Infinity },
+    { name: 'x.pdf', size: 1 },
+  ];
+  for (const value of bad) {
+    assert.equal(meeting({ resume: value }).resume, null, JSON.stringify(value));
+    assert.equal(C.normalizeFile(value), null);
+  }
+
+  assert.deepEqual(C.normalizeFile({ ...PDF, name: ' x.pdf ' }), { ...PDF, name: 'x.pdf' });
+});
+
+test('normalizePlan stays idempotent with the new fields', () => {
+  const full = meeting({
+    title: '',
+    company: 'Acme',
+    dueDate: '2026-10-20',
+    dueTime: '14:30',
+    endTime: '15:15',
+    timeZone: 'America/New_York',
+    resume: { ...PDF, name: `  ${'é'.repeat(118)} \u0001xyz  ` },
+    coverLetter: { ...LETTER, name: '\tCover letter.pdf ' },
+  });
+  assert.deepEqual(C.normalizePlan(full, NOW), full);
+  assert.equal(JSON.stringify(C.normalizePlan(full, NOW)), JSON.stringify(full));
+  assert.equal(JSON.stringify(C.normalizePlan(JSON.parse(JSON.stringify(full)), NOW)), JSON.stringify(full));
+});
+
+test('meetings saved before time zones keep working exactly as before', () => {
+  const stored = {
+    id: 'old',
+    kind: 'meeting',
+    title: 'Call',
+    company: 'Acme',
+    dueDate: '2026-10-20',
+    dueTime: '14:30',
+    status: 'todo',
+    priority: 'medium',
+    meetingUrl: '',
+    jobUrl: '',
+    tags: [],
+    checklist: [],
+    order: 0,
+    createdAt: NOW.toISOString(),
+    updatedAt: NOW.toISOString(),
+  };
+  const m = C.normalizePlan(stored, NOW);
+  assert.deepEqual([m.timeZone, m.endTime, m.resume, m.coverLetter], ['', '', null, null]);
+  for (const zone of ['UTC', 'Asia/Tokyo', 'America/New_York']) {
+    inZone(zone, () => {
+      // Device time, as before.
+      assert.equal(C.meetingStart(m).getTime(), new Date(2026, 9, 20, 14, 30).getTime(), zone);
+      assert.equal(C.meetingEnd(m), null);
+      assert.equal(C.meetingEndOrDefault(m).getTime(), new Date(2026, 9, 20, 15, 30).getTime(), zone);
+      assert.deepEqual(C.localDue(m), { date: '2026-10-20', time: '14:30' });
+      assert.equal(C.zoneDiffers(m), false);
+      assert.equal(C.formatTimeRange(m), C.formatTime('14:30'));
+      const now = new Date(2026, 9, 14, 10, 0);
+      const due = C.dueInfo(m, now);
+      assert.equal(due.label, `Tuesday at ${C.formatTime('14:30')}`);
+      assert.equal(due.full, `${C.formatDate(new Date(2026, 9, 20), now)} at ${C.formatTime('14:30')}`);
+    });
+  }
+});
+
+test('isValidTimeZone and localTimeZone', () => {
+  for (const tz of ['America/New_York', 'Asia/Kolkata', 'UTC', 'Europe/Berlin', 'Pacific/Chatham']) {
+    assert.ok(C.isValidTimeZone(tz), tz);
+  }
+  for (const tz of ['', 'Nowhere/Special', 'New York', null, undefined, 42, {}, `Europe/${'x'.repeat(200)}`]) {
+    assert.ok(!C.isValidTimeZone(tz), JSON.stringify(tz));
+  }
+  // '' when the device can't tell (Node says "Etc/Unknown" for an empty TZ).
+  const local = C.localTimeZone();
+  assert.ok(local === '' || C.isValidTimeZone(local), local);
+  inZone('Asia/Tokyo', () => assert.equal(C.localTimeZone(), 'Asia/Tokyo'));
+  inZone('America/New_York', () => assert.equal(C.localTimeZone(), 'America/New_York'));
+});
+
+test('zonedInstant finds the moment a wall clock shows, in any time zone', () => {
+  const at = (date, time, zone) => C.zonedInstant(date, time, zone).toISOString();
+
+  assert.equal(at('2026-10-20', '14:30', 'America/New_York'), '2026-10-20T18:30:00.000Z'); // EDT
+  assert.equal(at('2026-01-15', '09:00', 'America/New_York'), '2026-01-15T14:00:00.000Z'); // EST
+  assert.equal(at('2026-10-20', '09:00', 'Asia/Kolkata'), '2026-10-20T03:30:00.000Z'); // +05:30
+  assert.equal(at('2026-10-20', '00:15', 'Asia/Kolkata'), '2026-10-19T18:45:00.000Z'); // the day before in UTC
+  assert.equal(at('2026-10-20', '00:00', 'UTC'), '2026-10-20T00:00:00.000Z');
+  assert.equal(at('2026-06-15', '12:00', 'Pacific/Chatham'), '2026-06-14T23:15:00.000Z'); // +12:45
+  assert.equal(at('2026-12-15', '12:00', 'Pacific/Chatham'), '2026-12-14T22:15:00.000Z'); // +13:45
+  assert.equal(at('2026-06-15', '12:00', 'Australia/Lord_Howe'), '2026-06-15T01:30:00.000Z'); // +10:30
+  assert.equal(at('2026-12-15', '12:00', 'Australia/Lord_Howe'), '2026-12-15T01:00:00.000Z'); // +11, half-hour DST
+
+  // The night the clocks go forward, a skipped time moves on by the jump.
+  assert.equal(at('2026-03-08', '01:59', 'America/New_York'), '2026-03-08T06:59:00.000Z');
+  assert.equal(at('2026-03-08', '02:00', 'America/New_York'), '2026-03-08T07:00:00.000Z');
+  assert.equal(at('2026-03-08', '02:30', 'America/New_York'), '2026-03-08T07:30:00.000Z'); // 3:30 EDT
+  assert.equal(at('2026-03-08', '03:00', 'America/New_York'), '2026-03-08T07:00:00.000Z');
+  assert.equal(at('2026-10-04', '02:15', 'Australia/Lord_Howe'), '2026-10-03T15:45:00.000Z'); // 2:45, +11
+  assert.equal(at('2026-09-27', '03:00', 'Pacific/Chatham'), '2026-09-26T14:15:00.000Z'); // 4:00, +13:45
+
+  // The night they go back, a time that happens twice is the first one.
+  assert.equal(at('2026-11-01', '00:59', 'America/New_York'), '2026-11-01T04:59:00.000Z');
+  assert.equal(at('2026-11-01', '01:30', 'America/New_York'), '2026-11-01T05:30:00.000Z'); // EDT, not EST
+  assert.equal(at('2026-11-01', '02:00', 'America/New_York'), '2026-11-01T07:00:00.000Z');
+  assert.equal(at('2026-04-05', '01:45', 'Australia/Lord_Howe'), '2026-04-04T14:45:00.000Z'); // +11, not +10:30
+  assert.equal(at('2026-04-05', '03:00', 'Pacific/Chatham'), '2026-04-04T13:15:00.000Z'); // +13:45, not +12:45
+
+  // No time zone, or one the browser doesn't know: the device's own time.
+  const local = new Date(2026, 9, 20, 14, 30).getTime();
+  assert.equal(C.zonedInstant('2026-10-20', '14:30', '').getTime(), local);
+  assert.equal(C.zonedInstant('2026-10-20', '14:30').getTime(), local);
+  assert.equal(C.zonedInstant('2026-10-20', '14:30', 'Nowhere/Special').getTime(), local);
+
+  assert.equal(C.zonedInstant('2026-02-31', '14:30', 'UTC'), null);
+  assert.equal(C.zonedInstant('2026-10-20', '25:00', 'UTC'), null);
+  assert.equal(C.zonedInstant('', '', 'UTC'), null);
+
+  // Every call returns its own Date, even from the cache.
+  const first = C.zonedInstant('2026-10-20', '14:30', 'America/New_York');
+  first.setFullYear(2000);
+  assert.equal(at('2026-10-20', '14:30', 'America/New_York'), '2026-10-20T18:30:00.000Z');
+});
+
+test('zonedInstant agrees with a device in that time zone, around every change of the clocks', () => {
+  const days = {
+    'America/New_York': ['2026-03-08', '2026-11-01'],
+    'Europe/Berlin': ['2026-03-29', '2026-10-25'],
+    'Asia/Kolkata': ['2026-10-20'],
+    'Pacific/Chatham': ['2026-04-05', '2026-09-27'],
+    'Australia/Lord_Howe': ['2026-04-05', '2026-10-04'],
+  };
+  const pad = (n) => String(n).padStart(2, '0');
+  for (const [zone, dates] of Object.entries(days)) {
+    inZone(zone, () => {
+      for (const date of dates) {
+        const [y, mo, d] = date.split('-').map(Number);
+        for (let m = 0; m < 24 * 60; m += 15) {
+          const h = Math.floor(m / 60);
+          const time = `${pad(h)}:${pad(m % 60)}`;
+          const expected = new Date(y, mo - 1, d, h, m % 60).getTime();
+          assert.equal(C.zonedInstant(date, time, zone).getTime(), expected, `${zone} ${date} ${time}`);
+        }
+      }
+    });
+  }
+});
+
+test('meetingStart, meetingEnd and localDue follow the meeting time zone', () => {
+  const ny = meeting({ dueDate: '2026-10-20', dueTime: '14:00', endTime: '15:30', timeZone: 'America/New_York' });
+  assert.equal(C.meetingStart(ny).toISOString(), '2026-10-20T18:00:00.000Z');
+  assert.equal(C.meetingEnd(ny).toISOString(), '2026-10-20T19:30:00.000Z');
+  assert.equal(C.meetingEndOrDefault(ny).toISOString(), '2026-10-20T19:30:00.000Z');
+
+  const noEnd = { ...ny, endTime: '' };
+  assert.equal(C.meetingEnd(noEnd), null);
+  assert.equal(C.meetingEndOrDefault(noEnd).toISOString(), '2026-10-20T19:00:00.000Z'); // an hour
+  assert.equal(C.meetingEnd({ ...ny, endTime: '13:00' }), null); // even when not normalized
+  assert.equal(C.meetingStart({ ...ny, dueTime: '' }), null);
+  assert.equal(C.meetingEnd({ ...ny, dueTime: '' }), null);
+  assert.equal(C.meetingEndOrDefault({ ...ny, dueTime: '' }), null);
+  assert.equal(C.meetingStart(meeting()), null);
+  assert.equal(C.meetingStart(null), null);
+
+  // 1:30 to 3:30 the night the clocks go forward is one hour.
+  const short = meeting({ dueDate: '2026-03-08', dueTime: '01:30', endTime: '03:30', timeZone: 'America/New_York' });
+  assert.equal(C.meetingEnd(short) - C.meetingStart(short), 60 * 60 * 1000);
+
+  inZone('Asia/Tokyo', () => assert.deepEqual(C.localDue(ny), { date: '2026-10-21', time: '03:00' }));
+  inZone('America/Los_Angeles', () => assert.deepEqual(C.localDue(ny), { date: '2026-10-20', time: '11:00' }));
+  inZone('America/New_York', () => assert.deepEqual(C.localDue(ny), { date: '2026-10-20', time: '14:00' }));
+  inZone('Asia/Kolkata', () => assert.deepEqual(C.localDue(ny), { date: '2026-10-20', time: '23:30' }));
+
+  // Without a zone or a time, or for a plan: as saved.
+  inZone('Asia/Tokyo', () => {
+    assert.deepEqual(C.localDue({ ...ny, timeZone: '' }), { date: '2026-10-20', time: '14:00' });
+    assert.deepEqual(C.localDue({ ...ny, dueTime: '' }), { date: '2026-10-20', time: '' });
+    const p = plan({ dueDate: '2026-10-20', dueTime: '14:00' });
+    assert.deepEqual(C.localDue(p), { date: '2026-10-20', time: '14:00' });
+    assert.deepEqual(C.localDue({ ...p, timeZone: 'America/New_York' }), { date: '2026-10-20', time: '14:00' });
+    assert.deepEqual(C.localDue(plan()), { date: '', time: '' });
+  });
+});
+
+test('zoneDiffers compares the clocks, not the names', () => {
+  const ny = meeting({ dueDate: '2026-10-20', dueTime: '14:00', timeZone: 'America/New_York' });
+  inZone('America/New_York', () => assert.equal(C.zoneDiffers(ny), false));
+  inZone('America/Detroit', () => assert.equal(C.zoneDiffers(ny), false)); // another name, same clocks
+  inZone('Europe/Berlin', () => assert.equal(C.zoneDiffers(ny), true));
+  inZone('Asia/Kolkata', () => assert.equal(C.zoneDiffers(ny), true));
+  assert.equal(C.zoneDiffers({ ...ny, timeZone: '' }), false);
+  assert.equal(C.zoneDiffers({ ...ny, dueTime: '' }), false);
+  assert.equal(C.zoneDiffers(plan({ dueDate: '2026-10-20', dueTime: '14:00' })), false);
+
+  // London and UTC agree in winter, but not in summer.
+  const london = (dueDate) => meeting({ dueDate, dueTime: '10:00', timeZone: 'Europe/London' });
+  inZone('UTC', () => {
+    assert.equal(C.zoneDiffers(london('2026-01-15')), false);
+    assert.equal(C.zoneDiffers(london('2026-07-15')), true);
+  });
+});
+
+test('formatTimeRange shows start and end, locally or in the meeting time zone', () => {
+  const ny = meeting({ dueDate: '2026-10-20', dueTime: '14:00', endTime: '15:30', timeZone: 'America/New_York' });
+  const opts = { hour: 'numeric', minute: '2-digit' };
+  const there = new Intl.DateTimeFormat(undefined, { ...opts, timeZone: 'America/New_York', timeZoneName: 'short' });
+  const shortName = there.formatToParts(C.meetingStart(ny)).find((p) => p.type === 'timeZoneName').value;
+
+  inZone('Europe/Berlin', () => {
+    const here = new Intl.DateTimeFormat(undefined, opts);
+    // 14:00-15:30 in New York is 20:00-21:30 in Berlin.
+    assert.equal(C.formatTimeRange(ny), here.formatRange(new Date(2026, 9, 20, 20, 0), new Date(2026, 9, 20, 21, 30)));
+    assert.equal(C.formatTimeRange(ny, { zone: true }), there.formatRange(C.meetingStart(ny), C.meetingEnd(ny)));
+    assert.ok(C.formatTimeRange(ny, { zone: true }).includes(shortName));
+    assert.ok(!C.formatTimeRange(ny).includes(shortName));
+
+    // Just the start without an end time.
+    assert.equal(C.formatTimeRange({ ...ny, endTime: '' }), C.formatTime('20:00'));
+    assert.equal(C.formatTimeRange({ ...ny, endTime: '' }, { zone: true }), there.format(C.meetingStart(ny)));
+  });
+  if (/^en/.test(new Intl.DateTimeFormat().resolvedOptions().locale)) {
+    assert.match(C.formatTimeRange(ny, { zone: true }), /^2:00\s–\s3:30\sPM EDT$/);
+  }
+
+  // Nothing without a time.
+  assert.equal(C.formatTimeRange({ ...ny, dueTime: '' }), '');
+  assert.equal(C.formatTimeRange(meeting()), '');
+
+  // A meeting without a zone, asked for its zone: the device's own.
+  inZone('Asia/Tokyo', () => {
+    const local = meeting({ dueDate: '2026-10-20', dueTime: '09:00', endTime: '10:00' });
+    const tokyo = new Intl.DateTimeFormat(undefined, { ...opts, timeZone: 'Asia/Tokyo', timeZoneName: 'short' });
+    assert.equal(
+      C.formatTimeRange(local, { zone: true }),
+      tokyo.formatRange(new Date(2026, 9, 20, 9, 0), new Date(2026, 9, 20, 10, 0))
+    );
+  });
+
+  // Over local midnight: just the two times, no dates.
+  const tokyoDay = meeting({ dueDate: '2026-10-20', dueTime: '09:00', endTime: '17:00', timeZone: 'Asia/Tokyo' });
+  inZone('America/New_York', () => {
+    const range = C.formatTimeRange(tokyoDay);
+    assert.equal(range, `${C.formatTime('20:00')} – ${C.formatTime('04:00')}`);
+    assert.doesNotMatch(range, /2026|10\/|\/20/);
+  });
+
+  // Browsers without formatRange join the two times. (Times not formatted
+  // above: results are kept, and a browser never gains or loses formatRange.)
+  const odd = meeting({ dueDate: '2026-10-20', dueTime: '13:10', endTime: '13:50', timeZone: 'America/New_York' });
+  const descriptor = Object.getOwnPropertyDescriptor(Intl.DateTimeFormat.prototype, 'formatRange');
+  delete Intl.DateTimeFormat.prototype.formatRange;
+  try {
+    inZone('Europe/Berlin', () => {
+      assert.equal(C.formatTimeRange(odd), `${C.formatTime('19:10')} – ${C.formatTime('19:50')}`);
+      assert.equal(
+        C.formatTimeRange(odd, { zone: true }),
+        `${there.format(C.meetingStart(odd))} – ${there.format(C.meetingEnd(odd))}`
+      );
+    });
+  } finally {
+    Object.defineProperty(Intl.DateTimeFormat.prototype, 'formatRange', descriptor);
+  }
+
+  // Kept results never mix up time zones: the same meeting seen from elsewhere.
+  inZone('Asia/Tokyo', () => {
+    const tokyo = new Intl.DateTimeFormat(undefined, opts);
+    assert.equal(C.formatTimeRange(ny), tokyo.formatRange(new Date(2026, 9, 21, 3, 0), new Date(2026, 9, 21, 4, 30)));
+  });
+});
+
+test('zoneLabel names a time zone by its city and its name at that time', () => {
+  const longName = (tz, at) =>
+    new Intl.DateTimeFormat(undefined, { timeZone: tz, timeZoneName: 'long' })
+      .formatToParts(at)
+      .find((p) => p.type === 'timeZoneName').value;
+  assert.equal(C.zoneLabel('America/New_York', SUMMER), `New York (${longName('America/New_York', SUMMER)})`);
+  assert.equal(C.zoneLabel('America/New_York', WINTER), `New York (${longName('America/New_York', WINTER)})`);
+  assert.notEqual(C.zoneLabel('America/New_York', SUMMER), C.zoneLabel('America/New_York', WINTER));
+  assert.ok(C.zoneLabel('America/Argentina/Buenos_Aires', SUMMER).startsWith('Buenos Aires ('));
+  assert.ok(C.zoneLabel('Asia/Kolkata', SUMMER).startsWith('Kolkata ('));
+  assert.ok(C.zoneLabel('Asia/Calcutta', SUMMER).startsWith('Kolkata (')); // the old name Intl may use
+  assert.equal(C.zoneLabel('UTC'), 'UTC');
+  assert.equal(C.zoneLabel(''), '');
+  assert.equal(C.zoneLabel('Nowhere/Special'), '');
+  if (/^en/.test(new Intl.DateTimeFormat().resolvedOptions().locale)) {
+    assert.equal(C.zoneLabel('America/New_York', SUMMER), 'New York (Eastern Daylight Time)');
+    assert.equal(C.zoneLabel('America/New_York', WINTER), 'New York (Eastern Standard Time)');
+  }
+});
+
+test('timeZoneOptions lists every zone with its offset, sorted', () => {
+  const offsetOf = (label) => {
+    const m = /^\S.* \(GMT([+−])(\d{2}):(\d{2})\)$/.exec(label);
+    assert.ok(m, label);
+    return (m[1] === '+' ? 1 : -1) * (Number(m[2]) * 60 + Number(m[3]));
+  };
+  const checkSorted = (options) => {
+    for (let i = 1; i < options.length; i += 1) {
+      const a = options[i - 1];
+      const b = options[i];
+      const diff = offsetOf(a.label) - offsetOf(b.label);
+      assert.ok(diff < 0 || (diff === 0 && a.label <= b.label), `${a.label} before ${b.label}`);
+    }
+  };
+
+  for (const zone of ['Asia/Kolkata', 'America/New_York', 'UTC', 'Asia/Kathmandu']) {
+    inZone(zone, () => {
+      const options = C.timeZoneOptions(SUMMER);
+      const ids = options.map((o) => o.id);
+      assert.ok(ids.includes(C.localTimeZone()), zone);
+      assert.ok(ids.includes('UTC'));
+      assert.equal(new Set(ids).size, ids.length);
+      assert.ok(options.every((o) => Object.keys(o).join() === 'id,label'));
+      checkSorted(options);
+    });
+  }
+
+  const label = (now, ...ids) => {
+    const options = C.timeZoneOptions(now);
+    const found = options.find((o) => ids.includes(o.id));
+    return found && found.label;
+  };
+  // City first (so typing a city finds it), then the zone's name, then the offset.
+  const named = (text, city, offset) => text.startsWith(city) && text.endsWith(`(GMT${offset})`);
+  assert.ok(named(label(SUMMER, 'America/New_York'), 'New York', '−04:00'));
+  assert.ok(named(label(WINTER, 'America/New_York'), 'New York', '−05:00'));
+  assert.ok(named(label(SUMMER, 'UTC'), 'UTC', '+00:00'));
+  assert.ok(named(label(SUMMER, 'Asia/Kolkata', 'Asia/Calcutta'), 'Kolkata', '+05:30'));
+  assert.ok(named(label(SUMMER, 'Pacific/Chatham'), 'Chatham', '+12:45'));
+  assert.ok(named(label(WINTER, 'Pacific/Chatham'), 'Chatham', '+13:45'));
+  assert.ok(named(label(SUMMER, 'Australia/Lord_Howe'), 'Lord Howe', '+10:30'));
+  if (/^en/.test(new Intl.DateTimeFormat().resolvedOptions().locale)) {
+    assert.equal(label(SUMMER, 'America/New_York'), 'New York — Eastern Time (GMT−04:00)');
+  }
+
+  // A saved zone the list spells differently is still offered; junk is not.
+  const extra = C.timeZoneOptions(SUMMER, ['Asia/Kolkata', 'Nowhere/Special']).map((o) => o.id);
+  assert.ok(extra.includes('Asia/Kolkata'));
+  assert.ok(!extra.includes('Nowhere/Special'));
+
+  // Browsers that can't list their zones get a shorter list of common ones.
+  const descriptor = Object.getOwnPropertyDescriptor(Intl, 'supportedValuesOf');
+  Object.defineProperty(Intl, 'supportedValuesOf', { ...descriptor, value: undefined });
+  try {
+    inZone('Asia/Kathmandu', () => {
+      const options = C.timeZoneOptions(SUMMER);
+      const ids = options.map((o) => o.id);
+      assert.ok(options.length >= 40 && options.length < 100, String(options.length));
+      for (const id of [
+        'America/New_York',
+        'America/Chicago',
+        'America/Denver',
+        'America/Phoenix',
+        'America/Los_Angeles',
+        'America/Anchorage',
+        'Pacific/Honolulu',
+        'Europe/London',
+        'Asia/Kolkata',
+        'Asia/Tokyo',
+        'Australia/Sydney',
+        'UTC',
+      ]) {
+        assert.ok(ids.includes(id), id);
+      }
+      // The device's own zone is always there.
+      assert.ok(ids.includes(C.localTimeZone()));
+      assert.ok(options.find((o) => o.id === C.localTimeZone()).label.startsWith('Kathmandu'));
+      checkSorted(options);
+    });
+  } finally {
+    Object.defineProperty(Intl, 'supportedValuesOf', descriptor);
+  }
+});
+
+test('a meeting is "now" until its real end time', () => {
+  const info = (dueTime, endTime, now = NOW) => C.dueInfo(meeting({ dueDate: '2026-10-14', dueTime, endTime }), now);
+  const at = (h, m) => new Date(2026, 9, 14, h, m);
+
+  // 9:00-11:00 is still on at 10:00; without an end it would be over.
+  const long = info('09:00', '11:00');
+  assert.equal(long.state, 'now');
+  assert.equal(long.label, 'Happening now');
+  assert.equal(long.minutes, -60);
+  assert.equal(info('09:00', '').state, 'past');
+  assert.equal(info('09:00', '11:00', at(10, 59)).state, 'now');
+  const over = info('09:00', '11:00', at(11, 0));
+  assert.equal(over.state, 'past');
+  assert.equal(over.label, `Earlier today at ${C.formatTime('09:00')}`);
+
+  // A three-hour interview is "now" all the way through.
+  assert.equal(info('07:00', '12:00').state, 'now');
+  assert.equal(info('07:00', '12:00').minutes, -180);
+
+  // A short one ends early.
+  assert.equal(info('09:30', '09:45').state, 'past');
+  assert.equal(info('09:30', '').state, 'now');
+
+  // Before the start, "now" still begins an hour ahead.
+  assert.equal(info('11:00', '12:00').label, 'Starts in 60 minutes');
+  assert.equal(info('11:01', '12:00').state, 'today');
+
+  // The label shows the start; full adds the end.
+  const later = info('14:00', '15:30');
+  assert.equal(later.label, `Today at ${C.formatTime('14:00')}`);
+  const m = meeting({ dueDate: '2026-10-14', dueTime: '14:00', endTime: '15:30' });
+  assert.equal(later.full, `${C.formatDate(C.parseISODate('2026-10-14'), NOW)} at ${C.formatTimeRange(m)}`);
+  assert.ok(!later.full.includes('('));
+  assert.equal(info('14:00', '15:30', at(16, 0)).state, 'past');
+  assert.equal(info('14:00', '15:30', at(15, 29)).state, 'now');
+});
+
+test('dueInfo shows a meeting in another time zone on its local day and time', () => {
+  // 20:00 on Wednesday in New York is 09:00 on Thursday in Tokyo.
+  const ny = meeting({ dueDate: '2026-10-14', dueTime: '20:00', endTime: '21:00', timeZone: 'America/New_York' });
+  inZone('Asia/Tokyo', () => {
+    const now = new Date(2026, 9, 14, 10, 0);
+    const due = C.dueInfo(ny, now);
+    assert.equal(due.days, 1);
+    assert.equal(due.state, 'soon');
+    assert.equal(due.label, `Tomorrow at ${C.formatTime('09:00')}`);
+    assert.equal(due.minutes, 23 * 60);
+    assert.equal(
+      due.full,
+      `${C.formatDate(new Date(2026, 9, 15), now)} at ${C.formatTimeRange(ny)} (${C.formatZoneTime(ny)})`
+    );
+    // The time there is on another date, so it says which.
+    assert.ok(C.formatZoneTime(ny).startsWith(new Date(2026, 9, 14).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })));
+
+    assert.equal(C.dueInfo(ny, new Date(2026, 9, 15, 7, 59)).state, 'today');
+    assert.equal(C.dueInfo(ny, new Date(2026, 9, 15, 8, 0)).label, 'Starts in 60 minutes');
+    assert.equal(C.dueInfo(ny, new Date(2026, 9, 15, 9, 0)).label, 'Starting now');
+    assert.equal(C.dueInfo(ny, new Date(2026, 9, 15, 9, 59)).label, 'Happening now');
+    const after = C.dueInfo(ny, new Date(2026, 9, 15, 10, 0));
+    assert.equal(after.state, 'past');
+    assert.equal(after.days, 0);
+    assert.equal(after.label, `Earlier today at ${C.formatTime('09:00')}`);
+    const nextDay = C.dueInfo(ny, new Date(2026, 9, 16, 8, 0));
+    assert.equal(nextDay.state, 'past');
+    assert.equal(nextDay.label, `Yesterday at ${C.formatTime('09:00')}`);
+  });
+  inZone('America/New_York', () => {
+    // Same clocks: no second time in brackets.
+    const due = C.dueInfo(ny, new Date(2026, 9, 14, 10, 0));
+    assert.equal(due.state, 'today');
+    assert.equal(due.label, `Today at ${C.formatTime('20:00')}`);
+    assert.ok(!due.full.includes('('));
+  });
+
+  // A meeting without a time stays on its date, with the usual full text.
+  const allDay = meeting({ dueDate: '2026-10-15', timeZone: 'Asia/Tokyo' });
+  inZone('America/Los_Angeles', () => {
+    const now = new Date(2026, 9, 14, 10, 0);
+    const due = C.dueInfo(allDay, now);
+    assert.equal(due.days, 1);
+    assert.equal(due.minutes, null);
+    assert.equal(due.full, C.formatDate(new Date(2026, 9, 15), now));
+    assert.equal(C.dueInfo(allDay, new Date(2026, 9, 16, 10, 0)).state, 'past');
+  });
+});
+
+test('meetings in another time zone land on the day they happen here', () => {
+  inZone('Asia/Tokyo', () => {
+    const now = new Date(2026, 9, 15, 7, 0); // Thursday morning in Tokyo
+    // 20:00 on Wednesday in New York is 09:00 on Thursday in Tokyo.
+    const ny = meeting({ id: 'ny', dueDate: '2026-10-14', dueTime: '20:00', timeZone: 'America/New_York' });
+    const early = plan({ id: 'early', dueDate: '2026-10-15', dueTime: '08:30' });
+    const late = plan({ id: 'late', dueDate: '2026-10-15', dueTime: '09:30' });
+    const yesterday = meeting({ id: 'yesterday', dueDate: '2026-10-14', dueTime: '21:00' });
+
+    const groups = C.groupForToday([late, ny, early, yesterday], now);
+    assert.deepEqual(groups.today.map((p) => p.id), ['early', 'ny', 'late']);
+    assert.deepEqual(groups.pastMeetings.map((p) => p.id), ['yesterday']);
+    assert.deepEqual(C.sortPlans([late, yesterday, ny, early], 'deadline').map((p) => p.id), [
+      'yesterday',
+      'early',
+      'ny',
+      'late',
+    ]);
+    assert.equal(C.nextUp([late, ny], now).id, 'ny');
+
+    const stats = C.computeStats([ny, early, late, yesterday], now);
+    assert.equal(stats.dueToday, 3);
+    assert.equal(stats.todayTotal, 3); // yesterday's meeting is over
+    assert.equal(stats.overdue, 0);
+  });
+
+  inZone('America/Los_Angeles', () => {
+    // 07:00 on Thursday in Tokyo is still 15:00 on Wednesday in Los Angeles.
+    const now = new Date(2026, 9, 14, 10, 0);
+    const tokyo = meeting({ id: 'tokyo', dueDate: '2026-10-15', dueTime: '07:00', timeZone: 'Asia/Tokyo' });
+    const groups = C.groupForToday([tokyo], now);
+    assert.deepEqual(groups.today.map((p) => p.id), ['tokyo']);
+    assert.equal(groups.upcoming.length, 0);
+    const stats = C.computeStats([tokyo], now);
+    assert.equal(stats.dueToday, 1);
+    assert.equal(stats.todayTotal, 1);
+    // The next morning it is a past meeting, though its own date is "today" in Tokyo.
+    const nextMorning = new Date(2026, 9, 15, 9, 0);
+    assert.deepEqual(C.groupForToday([tokyo], nextMorning).pastMeetings.map((p) => p.id), ['tokyo']);
+    assert.equal(C.computeStats([tokyo], nextMorning).todayTotal, 0);
+  });
+});
+
+test('meetingICS writes a meeting in its own time zone as the same moment everywhere', () => {
+  const m = meeting({
+    id: 'z',
+    title: 'Interview',
+    company: 'Acme',
+    dueDate: '2026-10-20',
+    dueTime: '14:30',
+    endTime: '15:45',
+    timeZone: 'America/New_York',
+    resume: PDF,
+    coverLetter: LETTER,
+  });
+  const lines = (p) => C.meetingICS(p, NOW).replace(/\r\n /g, '').split('\r\n');
+  const zoneLine = `Time zone: ${C.zoneLabel('America/New_York', C.meetingStart(m))}`;
+
+  for (const zone of ['America/Los_Angeles', 'Asia/Tokyo', 'UTC']) {
+    inZone(zone, () => {
+      const out = lines(m);
+      assert.ok(out.includes('DTSTART:20261020T183000Z'), zone);
+      assert.ok(out.includes('DTEND:20261020T194500Z'), zone);
+      assert.ok(out.includes(`DESCRIPTION:Company: Acme\\n${zoneLine}`), zone);
+      // Documents stay out of the file.
+      const text = out.join('\n');
+      for (const leak of [PDF.id, LETTER.id, PDF.name, LETTER.name]) assert.ok(!text.includes(leak), leak);
+      // Without an end time: an hour.
+      assert.ok(lines({ ...m, endTime: '' }).includes('DTEND:20261020T193000Z'), zone);
+      // Winter in New York.
+      const winter = lines({ ...m, dueDate: '2026-12-01' });
+      assert.ok(winter.includes('DTSTART:20261201T193000Z'), zone);
+      assert.ok(winter.includes('DTEND:20261201T204500Z'), zone);
+    });
+  }
+
+  // Whole-day meetings stay whole days, and still name the zone.
+  const allDay = C.meetingICS({ ...m, dueTime: '', endTime: '' }, NOW);
+  assert.ok(allDay.includes('DTSTART;VALUE=DATE:20261020'));
+  assert.ok(allDay.includes('DTEND;VALUE=DATE:20261021'));
+  assert.ok(allDay.replace(/\r\n /g, '').includes('Time zone: New York'));
+  assert.ok(!allDay.includes('VALARM'));
+
+  // Without a zone: as before, the device's time and no zone line.
+  inZone('America/Los_Angeles', () => {
+    const local = lines({ ...m, timeZone: '' });
+    assert.ok(local.includes('DTSTART:20261020T213000Z'));
+    assert.ok(local.includes('DTEND:20261020T224500Z'));
+    assert.ok(!local.join('\n').includes('Time zone'));
+  });
+});
+
+test('older copies of a meeting keep its time zone, end time and documents', () => {
+  const local = [
+    meeting({
+      id: 'm',
+      dueDate: '2026-10-20',
+      dueTime: '14:00',
+      endTime: '15:00',
+      timeZone: 'Asia/Kolkata',
+      resume: PDF,
+      coverLetter: LETTER,
+    }),
+  ];
+  const later = new Date(2026, 9, 14, 11, 0).toISOString();
+  // Written by a version without meetings (no kind)...
+  const ancient = { title: 'Renamed', dueDate: '2026-10-20', dueTime: '14:00', updatedAt: later };
+  // ...and by one with meetings but without time zones.
+  const before = { ...ancient, kind: 'meeting', company: 'Acme' };
+
+  for (const data of [ancient, before]) {
+    const result = C.applyRemoteChanges(local, [{ id: 'm', data }], new Set(), NOW);
+    const m = result[0];
+    assert.equal(m.title, 'Renamed');
+    assert.equal(m.kind, 'meeting');
+    assert.equal(m.timeZone, 'Asia/Kolkata');
+    assert.equal(m.endTime, '15:00');
+    assert.deepEqual(m.resume, PDF);
+    assert.deepEqual(m.coverLetter, LETTER);
+    // Getting the same copy again is not a change.
+    assert.equal(C.applyRemoteChanges(result, [{ id: 'm', data }], new Set(), NOW), result);
+
+    const [imported] = C.importData([{ ...data, id: 'm' }], NOW, local);
+    assert.equal(imported.timeZone, 'Asia/Kolkata');
+    assert.deepEqual(imported.resume, PDF);
+  }
+
+  // An older copy that moved the start past the end loses the end time only.
+  const moved = C.applyRemoteChanges(local, [{ id: 'm', data: { ...before, dueTime: '16:00' } }], new Set(), NOW)[0];
+  assert.equal(moved.endTime, '');
+  assert.equal(moved.timeZone, 'Asia/Kolkata');
+  assert.deepEqual(moved.resume, PDF);
+
+  // A current copy says what it means: cleared fields stay cleared.
+  const cleared = { ...local[0], timeZone: '', endTime: '', resume: null, coverLetter: null, updatedAt: later };
+  const [c] = C.applyRemoteChanges(local, [{ id: 'm', data: cleared }], new Set(), NOW);
+  assert.deepEqual([c.timeZone, c.endTime, c.resume, c.coverLetter], ['', '', null, null]);
+
+  // Turning it into a plan clears them too.
+  const [p] = C.applyRemoteChanges(local, [{ id: 'm', data: { ...before, kind: 'plan' } }], new Set(), NOW);
+  assert.deepEqual([p.kind, p.timeZone, p.endTime, p.resume, p.coverLetter], ['plan', '', '', null, null]);
+
+  // Nothing to keep without a local meeting.
+  assert.equal(C.keepMeetingDetails(before, undefined), before);
+  assert.equal(C.keepMeetingDetails(before, plan({ id: 'm' })), before);
+  assert.equal(C.keepMeetingDetails(null, local[0]), null);
+  assert.equal(C.keepMeetingDetails(cleared, local[0]), cleared);
+});
+
+test('the sample meeting has a time zone and an end time', () => {
+  const m = C.samplePlans(NOW).find(C.isMeeting);
+  assert.equal(m.timeZone, C.localTimeZone());
+  assert.equal(m.dueTime, '14:00');
+  assert.equal(m.endTime, '15:00');
+  assert.equal(C.meetingEnd(m) - C.meetingStart(m), 60 * 60 * 1000);
+  assert.equal(C.zoneDiffers(m), false);
+  assert.equal(m.resume, null);
+  assert.equal(m.coverLetter, null);
+});
