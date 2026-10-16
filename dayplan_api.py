@@ -1258,6 +1258,8 @@ def api_notify(conn, environ, body):
     except dayplan_mail.MailError as err:
         with conn:
             conn.execute('UPDATE mail_log SET recipients = 0 WHERE rowid = ?', (reservation,))
+        # What the server said goes to the error log (on the Web tab), not to the page.
+        log_mail_error(err)
         # Trying again is offered unless the error says it can't help
         # (getattr: an older dayplan_mail's errors don't say).
         raise ApiError(502, str(err), {'retry': bool(getattr(err, 'retry', True))})
@@ -1277,6 +1279,21 @@ def api_notify(conn, environ, body):
     if not sent:
         raise ApiError(502, 'Gmail refused every recipient.', {'retry': True})
     return 200, {'sent': sent, 'failed': failed, 'recipients': len(recipients), 'kind': kind}, []
+
+
+def log_mail_error(err):
+    """Writes why an email wasn't sent, in the email server's own words, to the
+    error log. The words never hold the password (see dayplan_mail._detail)."""
+    detail = getattr(err, 'detail', '')
+    print('Meeting email not sent: {}{}'.format(err, ' ({})'.format(detail) if detail else ''), file=sys.stderr)
+
+
+def print_mail_error(err):
+    """For the console commands: the plain message, then what the server said."""
+    print(err, file=sys.stderr)
+    detail = getattr(err, 'detail', '')
+    if detail:
+        print('What the email server said: {}'.format(detail), file=sys.stderr)
 
 
 def api_account(conn, environ, body):
@@ -1495,7 +1512,7 @@ def setup_email():
     try:
         result = dayplan_mail.send(config, [message])
     except dayplan_mail.MailError as err:
-        print(err, file=sys.stderr)
+        print_mail_error(err)
         print('Nothing was saved.', file=sys.stderr)
         return 1
     if not result['sent']:
@@ -1524,7 +1541,7 @@ def send_test_email(address):
     try:
         result = dayplan_mail.send(config, [message])
     except dayplan_mail.MailError as err:
-        print(err, file=sys.stderr)
+        print_mail_error(err)
         return 1
     if not result['sent']:
         print('Gmail did not accept the test email to {}.'.format(address), file=sys.stderr)

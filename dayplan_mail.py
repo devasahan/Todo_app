@@ -17,6 +17,7 @@ error message from here ever contains it.
 This module only writes and sends the emails. Who gets them, and when, is
 decided in dayplan_api.py.
 """
+import base64
 import copy
 import html
 import io
@@ -156,11 +157,17 @@ class MailError(Exception):
     retry: False when trying again right away can't help (Gmail refused the
     sign-in, or the account has reached Gmail's daily sending limit), so the
     app shouldn't offer "Try again".
+
+    detail: what the email server (or Python) actually said, e.g.
+    "SMTPServerDisconnected: Connection unexpectedly closed", for the admin's
+    console and the error log, never for the page. The password is taken
+    out of it (see _detail).
     """
 
-    def __init__(self, message, retry=True):
+    def __init__(self, message, retry=True, detail=''):
         super().__init__(message)
         self.retry = bool(retry)
+        self.detail = detail
 
 
 # ------------------------------------------------------------------ settings
@@ -997,9 +1004,53 @@ def test_message(config, recipient, site_url=''):
 
 # ------------------------------------------------------------------- sending
 
+def _detail(error, config):
+    """What went wrong in the server's (or Python's) own words, on one line:
+    the error's type, then the reply code and text, e.g. "SMTPAuthenticationError:
+    535 5.7.8 Username and Password not accepted". For the admin's console and
+    the error log only. The password is taken out, as typed and as smtplib
+    sends it (base64, alone or in the "\0user\0password" sign-in), in case a
+    server repeats what it was sent."""
+    code = getattr(error, 'smtp_code', None)
+    reply = getattr(error, 'smtp_error', None)
+    if reply is None:
+        text = str(error)
+    elif isinstance(reply, bytes):
+        text = reply.decode('utf-8', 'replace')
+    else:
+        text = str(reply)
+    if isinstance(code, int) and code > 0:
+        text = '{} {}'.format(code, text)
+    text = '{}: {}'.format(type(error).__name__, text) if text.strip() else type(error).__name__
+    username = str(config.get('username') or '')
+    password = str(config.get('password') or '')
+    if password:
+        hidden = []
+        for value in (password, '\0{}\0{}'.format(username, password)):
+            try:
+                hidden.append(base64.b64encode(value.encode('utf-8')).decode('ascii'))
+            except UnicodeError:
+                pass
+        hidden.append(password)
+        for secret in sorted(hidden, key=len, reverse=True):
+            text = re.sub(re.escape(secret), '[password]', text, flags=re.IGNORECASE)
+    text = _one_line(text, 300)
+    # Collapsing spaces can't rebuild the password, but check once more.
+    if password and password.lower() in text.lower():
+        text = type(error).__name__
+    return text
+
+
 def _failure(stage, error, config):
-    """A MailError for the admin, from what went wrong at which stage. It never
-    repeats the server's own words (or anything else that could hold the password)."""
+    """A MailError for the admin, from what went wrong at which stage. Its
+    message never repeats the server's own words (or anything else that could
+    hold the password); those are in its detail, without the password."""
+    failure = _failure_message(stage, error, config)
+    failure.detail = _detail(error, config)
+    return failure
+
+
+def _failure_message(stage, error, config):
     host = _one_line(str(config.get('host') or DEFAULT_HOST), 100)
     port = config.get('port') or DEFAULT_PORT
     if isinstance(error, smtplib.SMTPAuthenticationError):
@@ -1029,6 +1080,18 @@ def _failure(stage, error, config):
                 'Run {} to save them again.'.format(SETUP_COMMAND),
                 retry=False,
             )
+        if isinstance(error, smtplib.SMTPServerDisconnected):
+            # What Google tends to do with a sign-in from a place it doesn't know yet.
+            return MailError(
+                '{} closed the connection while Dayplan was signing in. Google sometimes blocks a sign-in '
+                'from a new place: look in that Gmail inbox for a security alert from Google, confirm that '
+                'it was you, then run {} again.'.format(host, SETUP_COMMAND)
+            )
+        if isinstance(error, smtplib.SMTPNotSupportedError) or type(error) is smtplib.SMTPException:
+            # No AUTH offered, or no sign-in method smtplib knows.
+            return MailError(
+                '{} did not offer a way to sign in on this connection. Please try again in a few minutes.'.format(host)
+            )
         return MailError('Could not sign in to the email server {}. Run {} to check the settings.'.format(
             host, SETUP_COMMAND
         ))
@@ -1056,6 +1119,13 @@ def _refused(code, reply, config):
             _one_line(str(config.get('host') or DEFAULT_HOST), 100)
         ))
     return None
+
+
+def _with_detail(failure, error, config):
+    """`failure` (a MailError, or None) with the server's own words as its detail."""
+    if failure is not None:
+        failure.detail = _detail(error, config)
+    return failure
 
 
 def _label(msg):
@@ -1116,15 +1186,15 @@ def send(config, messages, timeout=20):
                 except smtplib.SMTPRecipientsRefused as error:
                     # Usually about this address; a 421 or the sending limit is about the account.
                     for code, reply in getattr(error, 'recipients', {}).values():
-                        stopped = stopped or _refused(code, reply, config)
+                        stopped = stopped or _with_detail(_refused(code, reply, config), error, config)
                 except smtplib.SMTPSenderRefused as error:
                     # The server won't send anything from this account just now.
-                    stopped = _refused(error.smtp_code, error.smtp_error, config) or MailError(
+                    stopped = _with_detail(_refused(error.smtp_code, error.smtp_error, config) or MailError(
                         'The email server {} would not send emails from this account just now. '
                         'Please try again in a few minutes.'.format(_one_line(config['host'], 100))
-                    )
+                    ), error, config)
                 except smtplib.SMTPResponseException as error:  # SMTPDataError, say: the server rejected this email
-                    stopped = _refused(error.smtp_code, error.smtp_error, config)
+                    stopped = _with_detail(_refused(error.smtp_code, error.smtp_error, config), error, config)
                 except smtplib.SMTPNotSupportedError:
                     pass  # an address the server can't take (no SMTPUTF8): only this one fails
                 except OSError as error:  # smtplib's other errors are OSErrors too

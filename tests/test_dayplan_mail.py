@@ -1,4 +1,5 @@
 """Tests for dayplan_mail.py. Run with: python3 -m unittest discover -s tests"""
+import base64
 import email
 import email.errors
 import email.policy
@@ -1144,14 +1145,56 @@ class Send(unittest.TestCase):
             self.assertNotIn('login', [entry[0] for entry in log])  # the password is never sent unencrypted
 
     def test_other_sign_in_problems(self):
-        for error, retry in ((smtplib.SMTPException('No suitable authentication method found.'), True),
-                             (UnicodeEncodeError('ascii', PASSWORD + 'é', 16, 17, 'ordinal not in range(128)'), False)):
+        for error, words, retry in (
+            (smtplib.SMTPServerDisconnected('Connection unexpectedly closed'), 'security alert from Google', True),
+            (smtplib.SMTPNotSupportedError('SMTP AUTH extension not supported by server.'), 'did not offer a way to sign in', True),
+            (smtplib.SMTPException('No suitable authentication method found.'), 'did not offer a way to sign in', True),
+            (UnicodeEncodeError('ascii', PASSWORD + 'é', 16, 17, 'ordinal not in range(128)'), 'setup-email', False),
+        ):
             fake, log = fake_smtp(login=error)
             with self.assertRaises(MailError) as caught:
                 self.send(fake)
-            self.assertIn('setup-email', str(caught.exception))
+            self.assertIn(words, str(caught.exception))
             self.assertSafe(caught.exception)
             self.assertEqual(caught.exception.retry, retry)
+            self.assertTrue(caught.exception.detail.startswith(type(error).__name__), caught.exception.detail)
+            self.assertNotIn(PASSWORD, caught.exception.detail)
+
+    def test_details_give_the_servers_own_words(self):
+        """For the console and the error log: what the server said, never the password."""
+        for step, error, detail in (
+            ('login', smtplib.SMTPAuthenticationError(535, b'5.7.8 Username and Password not accepted.'),
+             'SMTPAuthenticationError: 535 5.7.8 Username and Password not accepted.'),
+            ('login', smtplib.SMTPServerDisconnected('Connection unexpectedly closed'),
+             'SMTPServerDisconnected: Connection unexpectedly closed'),
+            ('login', smtplib.SMTPNotSupportedError('SMTP AUTH extension not supported by server.'),
+             'SMTPNotSupportedError: SMTP AUTH extension not supported by server.'),
+            ('connect', ConnectionRefusedError(111, 'Connection refused'), 'ConnectionRefusedError: [Errno 111] Connection refused'),
+            ('starttls', ssl.SSLError(1, 'certificate verify failed'), 'SSLError: certificate verify failed'),
+        ):
+            fake, log = fake_smtp(**{step: error})
+            with self.assertRaises(MailError) as caught:
+                self.send(fake)
+            self.assertEqual(caught.exception.detail, detail)
+            self.assertNotIn(detail.split(': ', 1)[-1], str(caught.exception))  # the message stays plain English
+
+    def test_details_never_hold_the_password(self):
+        # A server that repeats what it was sent: the password as typed, in
+        # capitals, and base64 (alone, and in the PLAIN sign-in string).
+        alone = base64.b64encode(PASSWORD.encode()).decode()
+        plain = base64.b64encode('\0{}\0{}'.format(CONFIG['username'], PASSWORD).encode()).decode()
+        reply = '5.7.8 Not accepted: {} {} {} {}'.format(PASSWORD, PASSWORD.upper(), alone, plain).encode()
+        for step, error in (('login', smtplib.SMTPAuthenticationError(535, reply)),
+                            ('login', smtplib.SMTPServerDisconnected(reply.decode())),
+                            ('starttls', ssl.SSLError(reply.decode()))):
+            fake, log = fake_smtp(**{step: error})
+            with self.assertRaises(MailError) as caught:
+                self.send(fake)
+            detail = caught.exception.detail
+            for secret in (PASSWORD, alone, plain):
+                self.assertNotIn(secret.lower(), detail.lower())
+            self.assertIn('[password]', detail)
+            self.assertLessEqual(len(detail), 300)
 
     def test_nothing_to_send(self):
         fake, log = fake_smtp(connect=AssertionError('should not connect'))
@@ -1290,6 +1333,8 @@ class Send(unittest.TestCase):
         self.assertTrue(caught.exception.retry)
         self.assertQuiet(caught.exception)
         self.assertNotIn('not allowed', str(caught.exception))
+        # The server's words are in the detail, without the password.
+        self.assertIn('553 5.7.1 Sender [password] not allowed', caught.exception.detail)
 
     def test_one_refused_recipient_or_message(self):
         for step, reply in (('rcpt', (550, b'5.1.1 The email account that you tried to reach does not exist.')),

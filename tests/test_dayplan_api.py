@@ -1644,6 +1644,9 @@ class MeetingEmails(ApiTestCase):
         self.assertIn('setup-email', res['error'])
         self.assertIs(res['retry'], False)  # the app password has to be fixed first
         self.assertNotIn(APP_PASSWORD, log.getvalue())
+        # Gmail's own words are in the error log, never in the answer.
+        self.assertIn('SMTPAuthenticationError: 535 5.7.8 Username and Password not accepted', log.getvalue())
+        self.assertNotIn('5.7.8', json.dumps(res))
         self.assertIsNone(self.notice())  # nobody was told, so the next email is still the first
         self.gmail.login_error = None
 
@@ -1906,6 +1909,20 @@ class CommandLineEmail(ApiTestCase):
         self.assertEqual(self.run_main('setup-email', inputs=[SENDER, "Sam's interviews"])[0], 0)
         self.assertEqual(self.saved()['from_name'], "Sam's interviews")
 
+    def test_setup_email_says_what_gmail_said(self):
+        # Gmail closing the connection at sign-in, echoing the password for good measure.
+        self.gmail.login_error = smtplib.SMTPServerDisconnected('Connection unexpectedly closed ' + APP_PASSWORD)
+        code, out, err = self.run_main('setup-email', inputs=[SENDER, ''])  # run_main checks the password isn't shown
+        self.assertEqual(code, 1)
+        self.assertIn('security alert from Google', err)
+        self.assertIn('What the email server said: SMTPServerDisconnected: Connection unexpectedly closed [password]', err)
+        self.assertIn('Nothing was saved', err)
+        self.gmail.login_error = smtplib.SMTPNotSupportedError('SMTP AUTH extension not supported by server.')
+        code, out, err = self.run_main('setup-email', inputs=[SENDER, ''])
+        self.assertIn('did not offer a way to sign in', err)
+        self.assertIn('What the email server said: SMTPNotSupportedError: SMTP AUTH extension not supported by server.', err)
+        self.assertFalse(dayplan_api.mail_config_path().exists())
+
     def test_setup_email_refuses_bad_answers(self):
         for inputs, password in [
             (['not-an-email', ''], self.SPACED),
@@ -1935,6 +1952,7 @@ class CommandLineEmail(ApiTestCase):
         code, out, err = self.run_main('test-email', 'friend@example.com')
         self.assertEqual(code, 1)
         self.assertIn('app password', err)
+        self.assertIn('What the email server said: SMTPAuthenticationError: 535 5.7.8', err)
 
         code, out, err = self.run_main('email-off')
         self.assertEqual(code, 0)
