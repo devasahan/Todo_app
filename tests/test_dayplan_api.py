@@ -3,6 +3,9 @@ import io
 import json
 import os
 import re
+import smtplib
+import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -16,6 +19,7 @@ from wsgiref.util import setup_testing_defaults
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import dayplan_api  # noqa: E402
+import dayplan_mail  # noqa: E402
 from dayplan_wsgi import application  # noqa: E402
 
 EMAIL = 'me@example.com'
@@ -29,6 +33,12 @@ MEETING = {
 }
 # A tiny but real-looking PDF file.
 PDF = b'%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n'
+# The Gmail account that sends meeting emails, and a made-up app password for
+# it. The password must never show up in an answer, an email or the output.
+SENDER = 'dayplan.sender@gmail.com'
+APP_PASSWORD = 'wxyzqrstuvklmnop'
+# zoneinfo and its time zone data (Python 3.9+; most systems have the data).
+HAS_ZONES = dayplan_mail.ZoneInfo is not None and dayplan_mail.valid_zone('America/New_York')
 _clock = [0]
 
 
@@ -39,6 +49,11 @@ def stamp(offset=None):
         offset = _clock[0]
     base = datetime(2026, 10, 14, 9, 0, tzinfo=timezone.utc) + timedelta(seconds=offset)
     return base.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+
+
+def public(email, admin=False, notify=True, zone=''):
+    """An account as the API describes it to the app."""
+    return {'email': email, 'admin': admin, 'notify': notify, 'timeZone': zone}
 
 
 def sync_part(res):
@@ -108,14 +123,86 @@ class Client:
         return self.post('/api/files', data, content_type='application/pdf', headers=headers, **kwargs)
 
 
+def text_of(msg):
+    """An email's plain-text part."""
+    return msg.get_body(('plain',)).get_content()
+
+
+def html_of(msg):
+    return msg.get_body(('html',)).get_content()
+
+
+def calendar_of(msg):
+    """An email's calendar file (.ics) as text, or None without one."""
+    for part in msg.iter_attachments():
+        if part.get_content_type() == 'text/calendar':
+            return part.get_payload(decode=True).decode('utf-8')
+    return None
+
+
+class FakeGmail:
+    """Stands in for smtplib.SMTP: keeps the emails instead of sending them."""
+
+    def __init__(self):
+        self.messages = []  # the emails Gmail took
+        self.connections = []  # (host, port) of each connection
+        self.logins = []  # (username, password) of each sign-in
+        self.refuse = set()  # addresses Gmail refuses
+        self.login_error = None  # raised when signing in, e.g. for a wrong app password
+        self.on_send = None  # called with each email before it is taken
+
+    def __call__(self, host, port, timeout=None):
+        self.connections.append((host, port))
+        return FakeGmailConnection(self)
+
+    def to(self):
+        """Who the emails went to, in the order they went."""
+        return [msg['To'] for msg in self.messages]
+
+
+class FakeGmailConnection:
+    def __init__(self, server):
+        self.server = server
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def ehlo(self):
+        pass
+
+    def starttls(self, context=None):
+        pass
+
+    def login(self, username, password):
+        if self.server.login_error:
+            raise self.server.login_error
+        self.server.logins.append((username, password))
+
+    def send_message(self, msg):
+        if self.server.on_send:
+            self.server.on_send(msg)
+        if msg['To'] in self.server.refuse:
+            raise smtplib.SMTPRecipientsRefused({msg['To']: (550, b'5.1.1 No such user')})
+        self.server.messages.append(msg)
+
+
 class ApiTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.gmail = FakeGmail()
         patches = [
-            mock.patch.dict(os.environ, {'DAYPLAN_DB': os.path.join(self.tmp.name, 'data', 'db.sqlite3')}),
+            mock.patch.dict(os.environ, {
+                'DAYPLAN_DB': os.path.join(self.tmp.name, 'data', 'db.sqlite3'),
+                'DAYPLAN_MAIL': os.path.join(self.tmp.name, 'data', 'mail.json'),
+            }),
             mock.patch.object(dayplan_api, 'PBKDF2_ITERATIONS', 1000),  # keep tests fast
             # Every test client shares one address; tests of the per-address limit lower it.
             mock.patch.object(dayplan_api, 'MAX_PASSWORD_CHECKS_PER_ADDRESS', 1000),
+            # No test ever reaches the real Gmail.
+            mock.patch.object(dayplan_mail.smtplib, 'SMTP', self.gmail),
         ]
         for patch in patches:
             patch.start()
@@ -132,7 +219,9 @@ class ApiTestCase(unittest.TestCase):
 
     def member(self, email, password=PASSWORD, admin=False):
         """An approved, signed-in second account (view-only unless `admin`)."""
-        dayplan_api.set_password(dayplan_api.connect(), email, password, admin=admin)
+        conn = dayplan_api.connect()
+        dayplan_api.set_password(conn, email, password, admin=admin)
+        conn.close()
         client = Client()
         self.assertEqual(client.post('/api/login', {'email': email, 'password': password})['status'], 200)
         return client
@@ -173,7 +262,7 @@ class Accounts(ApiTestCase):
         self.assertEqual(anon.get('/api/me')['json'], {'user': None, 'signup': True, 'first': True})
         client = self.signed_in()
         me = client.get('/api/me')['json']
-        self.assertEqual(me['user'], {'email': EMAIL, 'admin': True})
+        self.assertEqual(me['user'], public(EMAIL, admin=True))
         self.assertEqual(me['pending'], 0)
         self.assertEqual(Client().get('/api/me')['json'], {'user': None, 'signup': True, 'first': False})
 
@@ -203,7 +292,7 @@ class Accounts(ApiTestCase):
         self.assertEqual(res['json']['pending'], 0)
         res = friend.post('/api/login', {'email': 'friend@example.com', 'password': PASSWORD})
         self.assertEqual(res['status'], 200)
-        self.assertEqual(res['json']['user'], {'email': 'friend@example.com', 'admin': False})
+        self.assertEqual(res['json']['user'], public('friend@example.com', admin=False))
         self.assertNotIn('pending', friend.get('/api/me')['json'])
 
     def test_sign_up_does_not_reveal_existing_accounts(self):
@@ -215,7 +304,7 @@ class Accounts(ApiTestCase):
         self.assertNotIn('set_cookie', existing)
         # The existing account is untouched: same password, still the admin.
         res = Client().post('/api/login', {'email': EMAIL, 'password': PASSWORD})
-        self.assertEqual(res['json']['user'], {'email': EMAIL, 'admin': True})
+        self.assertEqual(res['json']['user'], public(EMAIL, admin=True))
         self.assertEqual(Client().post('/api/login', {'email': EMAIL, 'password': 'attacker password'})['status'], 401)
 
     def test_site_wide_limit_on_password_checks(self):
@@ -267,7 +356,7 @@ class Accounts(ApiTestCase):
         cookie = res['set_cookie']
         for flag in ('HttpOnly', 'SameSite=Lax', 'Secure', 'Path=/'):
             self.assertIn(flag, cookie)
-        self.assertEqual(client.get('/api/me')['json']['user'], {'email': EMAIL, 'admin': True})
+        self.assertEqual(client.get('/api/me')['json']['user'], public(EMAIL, admin=True))
 
         self.assertEqual(client.post('/api/logout')['status'], 200)
         self.assertIsNone(client.get('/api/me')['json']['user'])
@@ -1167,9 +1256,10 @@ class Upgrade(ApiTestCase):
         owner = Client()
         res = owner.post('/api/login', {'email': EMAIL, 'password': PASSWORD})
         self.assertEqual(res['status'], 200)
-        self.assertEqual(res['json']['user'], {'email': EMAIL, 'admin': True})
-        res = Client().post('/api/login', {'email': 'second@example.com', 'password': PASSWORD})
-        self.assertEqual(res['json']['user'], {'email': 'second@example.com', 'admin': False})
+        self.assertEqual(res['json']['user'], public(EMAIL, admin=True))
+        second = Client()
+        res = second.post('/api/login', {'email': 'second@example.com', 'password': PASSWORD})
+        self.assertEqual(res['json']['user'], public('second@example.com', admin=False))
         dayplan_api.connect()  # running the upgrade again changes nothing
         self.assertEqual(owner.get('/api/admin/users')['status'], 200)
         # Old plans got their times, so an older copy can't overwrite them.
@@ -1181,6 +1271,59 @@ class Upgrade(ApiTestCase):
         # The database got a place for uploaded files too.
         doc = owner.upload()['json']
         self.assertEqual(owner.get('/api/files/' + doc['id'])['body'], PDF)
+        # ...and for meeting emails, which everyone gets until they turn them off.
+        self.assertEqual(owner.get('/api/me')['json']['mail'], {'ready': False, 'sender': '', 'recipients': 1, 'viewers': 1})
+        dayplan_mail.save_config(dayplan_api.mail_config_path(), {'username': SENDER, 'password': APP_PASSWORD})
+        meeting = self.plan('m1', 'Interview', kind='meeting', dueDate='2026-10-22')
+        self.assertEqual(owner.post('/api/sync', {'cursor': 0, 'changes': [meeting]})['status'], 200)
+        res = owner.post('/api/notify', {'id': 'm1'})
+        self.assertEqual(res['json'], {'sent': 1, 'failed': 0, 'recipients': 1, 'kind': 'new'})
+        self.assertEqual(self.gmail.to(), ['second@example.com'])
+        res = second.post('/api/account', {'notify': False, 'timeZone': 'UTC'})
+        self.assertEqual(res['json']['user'], public('second@example.com', notify=False, zone='UTC'))
+
+    def test_database_from_before_meeting_emails(self):
+        """Accounts get the email settings (on, no time zone yet); nothing else changes."""
+        path = Path(os.environ['DAYPLAN_DB'])
+        path.parent.mkdir(parents=True)
+        old = sqlite3.connect(str(path))
+        old.executescript('''
+            CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+                                rev INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                                status TEXT NOT NULL DEFAULT 'active', is_admin INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id)
+                                   ON DELETE CASCADE, expires_at INTEGER NOT NULL);
+            CREATE TABLE plans (user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, id TEXT NOT NULL,
+                                data TEXT, rev INTEGER NOT NULL, updated_at TEXT NOT NULL DEFAULT '',
+                                PRIMARY KEY (user_id, id));
+        ''')
+        for email, status, admin in ((EMAIL, 'active', 1), ('viewer@example.com', 'active', 0),
+                                     ('waiting@example.com', 'pending', 0)):
+            old.execute(
+                'INSERT INTO users (email, password_hash, created_at, status, is_admin) VALUES (?, ?, 1, ?, ?)',
+                (email, dayplan_api.hash_password(PASSWORD), status, admin),
+            )
+        old.commit()
+        old.close()
+
+        conn = dayplan_api.connect()
+        rows = conn.execute('SELECT email, status, is_admin, notify, time_zone FROM users ORDER BY id').fetchall()
+        self.assertEqual([tuple(row) for row in rows], [
+            (EMAIL, 'active', 1, 1, ''),
+            ('viewer@example.com', 'active', 0, 1, ''),
+            ('waiting@example.com', 'pending', 0, 1, ''),
+        ])
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        self.assertLessEqual({'notices', 'mail_log'}, tables)
+        conn.close()
+        dayplan_api.connect().close()  # running the upgrade again changes nothing
+
+        viewer = Client()
+        res = viewer.post('/api/login', {'email': 'viewer@example.com', 'password': PASSWORD})
+        self.assertEqual(res['json']['user'], public('viewer@example.com'))
+        owner = Client()
+        owner.post('/api/login', {'email': EMAIL, 'password': PASSWORD})
+        self.assertEqual(owner.get('/api/me')['json']['mail']['recipients'], 1)
 
 
 class CommandLine(ApiTestCase):
@@ -1206,10 +1349,6 @@ class CommandLine(ApiTestCase):
         self.assertEqual(Client().post('/api/login', {'email': 'new@example.com', 'password': PASSWORD})['status'], 200)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class CommandLineApprovals(ApiTestCase):
     def test_approve_and_make_admin(self):
         self.signed_in()
@@ -1219,7 +1358,7 @@ class CommandLineApprovals(ApiTestCase):
             self.assertEqual(dayplan_api.main(['x', 'approve', 'nobody@example.com']), 1)
             self.assertEqual(dayplan_api.main(['x', 'make-admin', 'waiting@example.com']), 0)
         res = Client().post('/api/login', {'email': 'waiting@example.com', 'password': PASSWORD})
-        self.assertEqual(res['json']['user'], {'email': 'waiting@example.com', 'admin': True})
+        self.assertEqual(res['json']['user'], public('waiting@example.com', admin=True))
 
 
 class CommandLineRecovery(ApiTestCase):
@@ -1229,7 +1368,7 @@ class CommandLineRecovery(ApiTestCase):
         with mock.patch('getpass.getpass', side_effect=[PASSWORD, PASSWORD]), mock.patch('sys.stdout', new=io.StringIO()):
             self.assertEqual(dayplan_api.main(['x', 'make-admin', 'owner@example.com']), 0)
         res = Client().post('/api/login', {'email': 'owner@example.com', 'password': PASSWORD})
-        self.assertEqual(res['json']['user'], {'email': 'owner@example.com', 'admin': True})
+        self.assertEqual(res['json']['user'], public('owner@example.com', admin=True))
 
     def test_new_epoch(self):
         client = self.signed_in()
@@ -1238,3 +1377,489 @@ class CommandLineRecovery(ApiTestCase):
             self.assertEqual(dayplan_api.main(['x', 'new-epoch']), 0)
         res = client.post('/api/sync', {'epoch': epoch, 'cursor': 0, 'changes': []})['json']
         self.assertTrue(res['reset'])
+
+
+class MeetingEmails(ApiTestCase):
+    """The admin emails approved accounts about a meeting (POST /api/notify)."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.signed_in()
+        self.friend = self.member('friend@example.com')
+        self.zoe = self.member('zoe@example.com')
+        dayplan_mail.save_config(dayplan_api.mail_config_path(), {'username': SENDER, 'password': APP_PASSWORD})
+        # Every answer in these tests is checked for the app password.
+        request = Client.request
+
+        def checked(client, *args, **kwargs):
+            res = request(client, *args, **kwargs)
+            self.assertNotIn(APP_PASSWORD.encode(), res['body'])
+            return res
+
+        patch = mock.patch.object(Client, 'request', checked)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def meeting(self, plan_id='m1', at=None, **fields):
+        """Thu, Oct 22, 2026, 2-3 PM in New York, with notes that never go in an email."""
+        fields = {
+            'kind': 'meeting', 'company': 'Acme', 'dueDate': '2026-10-22', 'dueTime': '14:00', 'endTime': '15:00',
+            'timeZone': 'America/New_York', 'meetingUrl': 'https://zoom.us/j/123', 'description': 'Private notes',
+            **fields,
+        }
+        return self.plan(plan_id, 'Interview with Acme', at=at, **fields)
+
+    def save(self, *changes, client=None):
+        res = (client or self.admin).post('/api/sync', {'cursor': 0, 'changes': list(changes)})
+        self.assertEqual(res['status'], 200, res['json'])
+
+    def notify(self, plan_id='m1', status=200, client=None, **body):
+        res = (client or self.admin).post('/api/notify', {'id': plan_id, **body})
+        self.assertEqual(res['status'], status, res['json'])
+        return res['json']
+
+    def notice(self, plan_id='m1'):
+        """What people were last emailed about a meeting: (snapshot, sequence, cancelled), or None."""
+        conn = dayplan_api.connect()
+        row = conn.execute('SELECT snapshot, sequence, cancelled FROM notices WHERE plan_id = ?', (plan_id,)).fetchone()
+        conn.close()
+        return None if row is None else (json.loads(row['snapshot']), row['sequence'], row['cancelled'])
+
+    def mail_log(self):
+        conn = dayplan_api.connect()
+        rows = [tuple(row) for row in conn.execute('SELECT at, recipients FROM mail_log ORDER BY rowid')]
+        conn.close()
+        return rows
+
+    def age_mail_log(self, seconds):
+        conn = dayplan_api.connect()
+        with conn:
+            conn.execute('UPDATE mail_log SET at = at - ?', (seconds,))
+        conn.close()
+
+    def last(self):
+        return self.gmail.messages[-1]
+
+    def test_only_the_admin_sends_them(self):
+        self.save(self.meeting())
+        res = self.friend.post('/api/notify', {'id': 'm1'})
+        self.assertEqual((res['status'], res['json']), (403, {'error': 'Only the admin can do that.'}))
+        self.assertEqual(Client().post('/api/notify', {'id': 'm1'})['status'], 401)
+        self.assertEqual(self.admin.post('/api/notify', {'id': 'm1'}, origin='https://evil.example')['status'], 403)
+        res = self.admin.get('/api/notify')
+        self.assertEqual((res['status'], dict(res['headers'])['Allow']), (405, 'POST'))
+        self.assertEqual(self.gmail.connections, [])
+        self.assertIsNone(self.notice())
+
+    def test_email_must_be_set_up(self):
+        dayplan_mail.delete_config(dayplan_api.mail_config_path())
+        self.save(self.meeting())
+        res = self.notify(status=409)
+        self.assertTrue(res['notConfigured'])
+        self.assertIn('setup-email', res['error'])
+        self.assertEqual(self.gmail.connections, [])
+        # Set up from a console: it works straight away, without a reload.
+        dayplan_mail.save_config(dayplan_api.mail_config_path(), {'username': SENDER, 'password': APP_PASSWORD})
+        self.assertEqual(self.notify()['sent'], 2)
+
+    def test_the_change_must_reach_the_server_first(self):
+        meeting = self.meeting()
+        self.save(meeting)
+        res = self.notify(updatedAt=stamp(), status=409)
+        self.assertEqual(res, {'error': "This change hasn't reached the server yet.", 'notSaved': True})
+        self.assertEqual(self.gmail.connections, [])
+        self.assertEqual(self.notify(updatedAt=meeting['data']['updatedAt'])['sent'], 2)
+        # An older version: another device saved a newer one, which is what's sent.
+        self.assertEqual(self.notify(updatedAt=stamp(0))['sent'], 2)
+
+    def test_only_saved_meetings(self):
+        self.save(self.plan('p1', 'Update CV', kind='plan'), self.plan('p2', 'Old plan'), self.meeting('gone'))
+        self.save(self.deleted('gone'))
+        self.assertEqual(self.notify('nowhere', status=404)['error'], "This meeting isn't saved on the server yet.")
+        self.assertEqual(self.notify('gone', status=409)['error'], 'This meeting was deleted.')
+        self.notify('p1', status=400)
+        self.notify('p2', status=400)  # from before meetings: no kind at all
+        for body in [
+            {}, {'id': 5}, {'id': ''}, {'id': 'x' * 101}, {'id': 'm1', 'cancel': 'yes'}, {'id': 'm1', 'cancel': None},
+            {'id': 'm1', 'updatedAt': 'yesterday'}, {'id': 'm1', 'updatedAt': None},
+        ]:
+            self.assertEqual(self.admin.post('/api/notify', body)['status'], 400, body)
+        self.assertEqual(self.gmail.connections, [])
+
+    def test_who_gets_them(self):
+        self.member('boss@example.com', admin=True)  # another admin plans: no emails
+        self.assertEqual(self.member('quiet@example.com').post('/api/account', {'notify': False})['status'], 200)
+        Client().post('/api/register', {'email': 'waiting@example.com', 'password': PASSWORD})  # not approved
+        self.member('off@example.com')
+        self.admin.post('/api/admin/users', {'email': 'off@example.com', 'action': 'disable'})
+        self.save(self.meeting())
+
+        self.assertEqual(self.notify(), {'sent': 2, 'failed': 0, 'recipients': 2, 'kind': 'new'})
+        self.assertEqual(self.gmail.to(), ['friend@example.com', 'zoe@example.com'])
+        self.assertEqual(self.gmail.connections, [('smtp.gmail.com', 587)])  # one connection for everyone
+        self.assertEqual(self.gmail.logins, [(SENDER, APP_PASSWORD)])
+        everyone = {EMAIL, 'friend@example.com', 'zoe@example.com', 'boss@example.com', 'quiet@example.com',
+                    'waiting@example.com', 'off@example.com'}
+        for msg in self.gmail.messages:
+            # Each person gets their own email, and can't see who else got one.
+            self.assertEqual(msg.get_all('To'), [msg['To']])
+            self.assertIsNone(msg['Cc'])
+            self.assertIsNone(msg['Bcc'])
+            raw = msg.as_string()
+            for other in everyone - {msg['To']}:
+                self.assertNotIn(other, raw)
+            self.assertIn(SENDER, msg['From'])
+            self.assertNotIn(APP_PASSWORD, raw)
+            content = text_of(msg) + html_of(msg)
+            self.assertIn('https://dayplan.example.com/', content)  # the link back to the site
+            self.assertIn('https://zoom.us/j/123', content)
+            self.assertNotIn('Private notes', content)
+            self.assertIn('UID:m1@dayplan', calendar_of(msg))
+
+    def test_an_address_that_cannot_be_emailed_safely_is_skipped(self):
+        # Accounts made from the console aren't checked as closely as sign-ups.
+        conn = dayplan_api.connect()
+        dayplan_api.set_password(conn, 'odd,one@example.com', PASSWORD)
+        conn.close()
+        self.save(self.meeting())
+        self.assertEqual(self.notify(), {'sent': 2, 'failed': 1, 'recipients': 3, 'kind': 'new'})
+        self.assertEqual(self.gmail.to(), ['friend@example.com', 'zoe@example.com'])
+
+    def test_what_each_email_says_follows_what_people_were_told(self):
+        first = self.meeting()
+        self.save(first)
+        self.assertEqual(self.notify(updatedAt=first['data']['updatedAt'])['kind'], 'new')
+        self.assertEqual(self.notice()[1:], (0, 0))
+        self.assertIn('SEQUENCE:0', calendar_of(self.last()))
+        self.assertEqual(self.notify()['kind'], 'reminder')  # nothing new: the same details again
+        # Notes, steps and tags aren't in the emails, so there's still nothing new to tell.
+        self.save(self.meeting(description='New notes', tags=['prep']))
+        self.assertEqual(self.notify()['kind'], 'reminder')
+
+        # Moved by two hours: a change, with what it was before.
+        self.save(self.meeting(dueTime='16:00', endTime='17:00'))
+        self.assertEqual(self.notify()['kind'], 'changed')
+        text = text_of(self.last())
+        self.assertIn('What changed', text)
+        self.assertIn('2:00', text)
+        self.assertIn('4:00', text)
+        self.assertIn('SEQUENCE:3', calendar_of(self.last()))
+        self.assertEqual(self.notify()['kind'], 'reminder')
+
+        # Deleted, and the deletion reached the server first: the cancellation
+        # says what people were told last.
+        self.save(self.deleted('m1'))
+        self.assertEqual(self.notify(cancel=True)['kind'], 'cancelled')
+        msg = self.last()
+        self.assertIn('cancelled', msg['Subject'].lower())
+        self.assertIn('Acme', msg['Subject'])
+        self.assertIn('4:00', text_of(msg))
+        self.assertIsNone(calendar_of(msg))
+        snapshot, sequence, cancelled = self.notice()
+        self.assertEqual((snapshot['dueTime'], sequence, cancelled), ('16:00', 5, 1))
+        self.assertNotIn('description', snapshot)
+
+        # Brought back (undo, say): it's back on.
+        self.save(self.meeting(dueTime='16:00', endTime='17:00'))
+        self.assertEqual(self.notify()['kind'], 'restored')
+        self.assertEqual(self.notice()[1:], (6, 0))
+        self.assertIn('SEQUENCE:6', calendar_of(self.last()))
+        self.assertEqual(self.notify()['kind'], 'reminder')
+        self.assertEqual(len(self.gmail.messages), 2 * 8)
+
+    def test_cancelling(self):
+        # Deleted before anyone was emailed about it: there's nobody to tell.
+        self.save(self.meeting('m2'))
+        self.save(self.deleted('m2'))
+        res = self.notify('m2', cancel=True, status=409)
+        self.assertIn('never emailed', res['error'])
+        self.assertIsNone(self.notice('m2'))
+        self.notify('nowhere', cancel=True, status=409)
+
+        # Cancelled while the meeting is still saved: that's the one described.
+        self.save(self.meeting('m3', company='Globex'))
+        self.assertEqual(self.notify('m3', cancel=True)['kind'], 'cancelled')
+        self.assertIn('Globex', self.last()['Subject'])
+        self.assertEqual(self.notice('m3')[1:], (0, 1))
+
+        # Turned into a plain plan after people were told: cancelled as they were told.
+        self.save(self.meeting('m4', company='Initech'))
+        self.notify('m4')
+        self.save(self.meeting('m4', company='Initech', kind='plan'))
+        self.notify('m4', status=400)
+        self.assertEqual(self.notify('m4', cancel=True)['kind'], 'cancelled')
+        self.assertIn('Initech', self.last()['Subject'])
+        self.assertEqual(self.notice('m4')[1:], (1, 1))
+
+    def test_gmail_problems(self):
+        self.save(self.meeting())
+        self.gmail.login_error = smtplib.SMTPAuthenticationError(535, b'5.7.8 Username and Password not accepted')
+        with mock.patch('sys.stderr', new=io.StringIO()) as log:
+            res = self.notify(status=502)
+        self.assertIn('app password', res['error'])
+        self.assertIn('setup-email', res['error'])
+        self.assertNotIn(APP_PASSWORD, log.getvalue())
+        self.assertIsNone(self.notice())  # nobody was told, so the next email is still the first
+        self.gmail.login_error = None
+
+        # One address refused: the others still get theirs.
+        self.gmail.refuse = {'zoe@example.com'}
+        self.assertEqual(self.notify(), {'sent': 1, 'failed': 1, 'recipients': 2, 'kind': 'new'})
+        self.assertEqual(self.gmail.to(), ['friend@example.com'])
+        self.assertEqual(self.notice()[1:], (0, 0))
+
+        # Every address refused: an error, and what people were told is left as it was.
+        self.gmail.refuse = {'friend@example.com', 'zoe@example.com'}
+        self.save(self.meeting(dueTime='09:00'))
+        self.assertEqual(self.notify(status=502), {'error': 'Gmail refused every recipient.'})
+        snapshot, sequence, _ = self.notice()
+        self.assertEqual((snapshot['dueTime'], sequence), ('14:00', 0))
+        # Every round counts for the hour; only emails that went out count for the day.
+        self.assertEqual([sent for _, sent in self.mail_log()], [0, 1, 0])
+
+    def test_limits(self):
+        self.save(self.meeting())
+        with mock.patch.object(dayplan_api, 'MAX_NOTIFY_PER_HOUR', 2):
+            self.notify()
+            self.notify()
+            res = self.notify(status=429)
+            self.assertIn('last hour', res['error'])
+            self.assertEqual(len(self.gmail.messages), 4)  # nothing more went out
+            self.age_mail_log(3601)
+            self.notify()
+        with mock.patch.object(dayplan_api, 'MAX_MAIL_RECIPIENTS_PER_DAY', 7):
+            # 6 emails in the last day (3 rounds to 2 people): 2 more would pass 7.
+            res = self.notify(status=429)
+            self.assertIn('a day', res['error'])
+            self.assertEqual(len(self.gmail.messages), 6)
+            self.age_mail_log(24 * 3600)
+            self.notify()
+        self.assertEqual([sent for _, sent in self.mail_log()], [2])  # older rounds are cleared
+
+    def test_the_database_is_free_while_emails_are_sent(self):
+        self.save(self.meeting())
+        writes = []
+
+        def write_meanwhile(msg):
+            other = sqlite3.connect(os.environ['DAYPLAN_DB'], timeout=0)  # fails at once if locked
+            try:
+                with other:
+                    other.execute('BEGIN IMMEDIATE')
+                    other.execute("INSERT INTO settings (key, value) VALUES (?, '')", ('test ' + msg['To'],))
+            finally:
+                other.close()
+            writes.append(msg['To'])
+
+        self.gmail.on_send = write_meanwhile
+        self.assertEqual(self.notify()['sent'], 2)
+        self.assertEqual(writes, ['friend@example.com', 'zoe@example.com'])
+
+    @unittest.skipUnless(HAS_ZONES, 'needs zoneinfo and time zone data')
+    def test_times_on_each_persons_own_clock(self):
+        self.assertEqual(self.friend.post('/api/account', {'timeZone': 'Europe/London'})['status'], 200)
+        self.save(self.meeting())
+        self.notify()
+        texts = {msg['To']: text_of(msg) for msg in self.gmail.messages}
+        self.assertIn('Your time: Thu, Oct 22, 7:00 – 8:00 PM BST', texts['friend@example.com'])
+        self.assertNotIn('Your time', texts['zoe@example.com'])  # no time zone known
+
+    def test_nobody_to_email(self):
+        for email in ('friend@example.com', 'zoe@example.com'):
+            self.admin.post('/api/admin/users', {'email': email, 'action': 'disable'})
+        self.save(self.meeting())
+        self.assertEqual(self.notify(), {'sent': 0, 'failed': 0, 'recipients': 0, 'kind': 'new'})
+        self.assertEqual(self.gmail.connections, [])
+        self.assertIsNone(self.notice())
+        self.assertEqual(self.mail_log(), [])
+
+    def test_the_admin_sees_whether_email_is_ready(self):
+        mail = {'ready': True, 'sender': SENDER, 'recipients': 2, 'viewers': 2}
+        self.assertEqual(self.admin.get('/api/me')['json']['mail'], mail)
+        overview = self.admin.get('/api/admin/users')['json']
+        self.assertEqual(overview['mail'], mail)
+        self.assertEqual(
+            {u['email']: u['notify'] for u in overview['users']},
+            {EMAIL: True, 'friend@example.com': True, 'zoe@example.com': True},
+        )
+        # Only the admin is told.
+        self.assertNotIn('mail', self.friend.get('/api/me')['json'])
+        self.assertNotIn('mail', Client().get('/api/me')['json'])
+
+        self.assertEqual(self.zoe.post('/api/account', {'notify': False})['status'], 200)
+        overview = self.admin.get('/api/admin/users')['json']
+        self.assertEqual(overview['mail'], {**mail, 'recipients': 1})
+        self.assertFalse({u['email']: u['notify'] for u in overview['users']}['zoe@example.com'])
+        dayplan_mail.delete_config(dayplan_api.mail_config_path())
+        self.assertEqual(self.admin.get('/api/me')['json']['mail'], {**mail, 'ready': False, 'sender': '', 'recipients': 1})
+
+    def test_deleting_an_account_clears_its_notices(self):
+        boss = self.member('boss@example.com', admin=True)
+        self.save(self.meeting('b1'), client=boss)
+        self.assertEqual(self.notify('b1', client=boss)['kind'], 'new')
+        self.save(self.meeting())
+        self.notify()
+        res = self.admin.post('/api/admin/users', {'email': 'boss@example.com', 'action': 'delete'})
+        self.assertEqual(res['status'], 200)
+        conn = dayplan_api.connect()
+        self.assertEqual([row[0] for row in conn.execute('SELECT plan_id FROM notices')], ['m1'])
+        conn.close()
+
+    def test_link_to_the_site(self):
+        site_url = dayplan_api.site_url
+        self.assertEqual(
+            site_url({'HTTP_HOST': 'dayplan.pythonanywhere.com', 'HTTP_X_FORWARDED_PROTO': 'https',
+                      'wsgi.url_scheme': 'http'}),
+            'https://dayplan.pythonanywhere.com/',
+        )
+        self.assertEqual(
+            site_url({'HTTP_HOST': 'example.com', 'wsgi.url_scheme': 'http', 'SCRIPT_NAME': '//planner//app/'}),
+            'http://example.com/planner/app/',
+        )
+
+    def test_settings_file_sits_next_to_the_database(self):
+        self.assertEqual(str(dayplan_api.mail_config_path()), os.environ['DAYPLAN_MAIL'])
+        with mock.patch.dict(os.environ, {'DAYPLAN_MAIL': ''}):
+            self.assertEqual(dayplan_api.mail_config_path(), Path(os.environ['DAYPLAN_DB']).parent / 'mail.json')
+
+
+class AccountSettings(ApiTestCase):
+    """Each approved account's own email settings (POST /api/account)."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = self.signed_in()
+        self.friend = self.member('friend@example.com')
+
+    def test_turning_emails_off_and_on(self):
+        res = self.friend.post('/api/account', {'notify': False})
+        self.assertEqual((res['status'], res['json']), (200, {'user': public('friend@example.com', notify=False)}))
+        self.assertEqual(self.friend.get('/api/me')['json']['user'], public('friend@example.com', notify=False))
+        self.assertEqual(self.admin.get('/api/me')['json']['mail']['recipients'], 0)
+        res = self.friend.post('/api/account', {'notify': True})
+        self.assertEqual(res['json']['user'], public('friend@example.com'))
+        self.assertEqual(self.admin.get('/api/me')['json']['mail']['recipients'], 1)
+
+    def test_time_zone(self):
+        res = self.friend.post('/api/account', {'timeZone': 'Europe/London'})
+        self.assertEqual(res['json']['user'], public('friend@example.com', zone='Europe/London'))
+        # One setting at a time leaves the other one alone.
+        self.friend.post('/api/account', {'notify': False})
+        me = self.friend.get('/api/me')['json']['user']
+        self.assertEqual(me, public('friend@example.com', notify=False, zone='Europe/London'))
+        res = self.friend.post('/api/account', {'timeZone': '', 'notify': True})
+        self.assertEqual(res['json']['user'], public('friend@example.com'))
+        res = self.admin.post('/api/account', {'timeZone': 'UTC'})
+        self.assertEqual(res['json']['user'], public(EMAIL, admin=True, zone='UTC'))
+
+    def test_bad_requests(self):
+        bad = [
+            {}, {'notify': 'no'}, {'notify': 0}, {'notify': None}, {'timeZone': 5}, {'timeZone': None},
+            {'timeZone': 'not a zone'}, {'timeZone': '../../etc/passwd'}, {'timeZone': '/etc/localtime'},
+            {'timeZone': 'Europe/' + 'X' * 64}, {'notify': False, 'timeZone': 'Nowhere at all'},
+        ]
+        if HAS_ZONES:
+            bad.append({'timeZone': 'Mars/Olympus_Mons'})
+        for body in bad:
+            self.assertEqual(self.friend.post('/api/account', body)['status'], 400, body)
+        self.assertEqual(self.friend.get('/api/me')['json']['user'], public('friend@example.com'))  # nothing changed
+        self.assertEqual(Client().post('/api/account', {'notify': False})['status'], 401)
+        self.assertEqual(self.friend.post('/api/account', {'notify': False}, origin='https://evil.example')['status'], 403)
+        self.assertEqual(self.friend.get('/api/account')['status'], 405)
+        self.admin.post('/api/admin/users', {'email': 'friend@example.com', 'action': 'disable'})
+        self.assertEqual(self.friend.post('/api/account', {'notify': False})['status'], 401)
+
+
+class CommandLineEmail(ApiTestCase):
+    SPACED = 'wxyz qrst uvkl mnop'  # the app password as Google shows it
+
+    def run_main(self, *args, inputs=(), password=SPACED):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch('builtins.input', side_effect=list(inputs)), \
+                mock.patch('getpass.getpass', return_value=password), \
+                mock.patch('sys.stdout', new=out), mock.patch('sys.stderr', new=err):
+            code = dayplan_api.main(['x'] + list(args))
+        for text in (out.getvalue(), err.getvalue()):
+            self.assertNotIn(APP_PASSWORD, text)
+            self.assertNotIn(self.SPACED, text)
+        return code, out.getvalue(), err.getvalue()
+
+    def saved(self):
+        return dayplan_mail.load_config(dayplan_api.mail_config_path())
+
+    def test_setup_email_saves_only_after_a_test_email_went_out(self):
+        path = dayplan_api.mail_config_path()
+        self.gmail.login_error = smtplib.SMTPAuthenticationError(535, b'5.7.8 Username and Password not accepted')
+        code, out, err = self.run_main('setup-email', inputs=[SENDER, ''])
+        self.assertEqual(code, 1)
+        self.assertIn('app password', err)
+        self.assertIn('Nothing was saved', err)
+        self.assertFalse(path.exists())
+        self.gmail.login_error = None
+
+        self.gmail.refuse = {SENDER}
+        self.assertEqual(self.run_main('setup-email', inputs=[SENDER, ''])[0], 1)
+        self.assertFalse(path.exists())
+        self.gmail.refuse = set()
+
+        code, out, err = self.run_main('setup-email', inputs=['  ' + SENDER + ' ', ''])
+        self.assertEqual((code, err), (0, ''))
+        self.assertEqual(self.gmail.to(), [SENDER])
+        self.assertEqual(self.gmail.logins[-1], (SENDER, APP_PASSWORD))  # without the spaces
+        self.assertEqual(self.saved(), {
+            'host': 'smtp.gmail.com', 'port': 587, 'username': SENDER, 'password': APP_PASSWORD, 'from_name': 'Dayplan',
+        })
+        self.assertEqual(stat.S_IMODE(os.stat(str(path)).st_mode), 0o600)
+        self.assertIn(str(path), out)
+        self.assertIn('emails are on', out)
+
+        # Run again to change the sender's name.
+        self.assertEqual(self.run_main('setup-email', inputs=[SENDER, "Sam's interviews"])[0], 0)
+        self.assertEqual(self.saved()['from_name'], "Sam's interviews")
+
+    def test_setup_email_refuses_bad_answers(self):
+        for inputs, password in [
+            (['not-an-email', ''], self.SPACED),
+            (['bad<address>@gmail.com', ''], self.SPACED),
+            ([SENDER, ''], '   '),
+            ([SENDER, 'x' * 61], self.SPACED),
+            ([SENDER, 'Line\x1bbreak'], self.SPACED),
+        ]:
+            code, out, err = self.run_main('setup-email', inputs=inputs, password=password)
+            self.assertEqual(code, 1, inputs)
+            self.assertIn('Nothing was saved', err)
+        self.assertFalse(dayplan_api.mail_config_path().exists())
+        self.assertEqual(self.gmail.connections, [])
+
+    def test_test_email_and_email_off(self):
+        code, out, err = self.run_main('test-email', 'friend@example.com')
+        self.assertEqual(code, 1)
+        self.assertIn('setup-email', err)
+        dayplan_mail.save_config(dayplan_api.mail_config_path(), {'username': SENDER, 'password': APP_PASSWORD})
+
+        code, out, err = self.run_main('test-email', 'friend@example.com')
+        self.assertEqual(code, 0)
+        self.assertIn('friend@example.com', out)
+        self.assertEqual(self.gmail.to(), ['friend@example.com'])
+        self.assertEqual(self.run_main('test-email', 'not an address')[0], 1)
+        self.gmail.login_error = smtplib.SMTPAuthenticationError(535, b'5.7.8 Username and Password not accepted')
+        code, out, err = self.run_main('test-email', 'friend@example.com')
+        self.assertEqual(code, 1)
+        self.assertIn('app password', err)
+
+        code, out, err = self.run_main('email-off')
+        self.assertEqual(code, 0)
+        self.assertIn('off', out)
+        self.assertFalse(dayplan_api.mail_config_path().exists())
+        code, out, err = self.run_main('email-off')
+        self.assertEqual(code, 0)
+        self.assertIn('nothing to turn off', out)
+
+    def test_usage_lists_the_email_commands(self):
+        code, out, err = self.run_main('help')
+        self.assertEqual(code, 1)
+        for command in ('setup-email', 'test-email EMAIL', 'email-off'):
+            self.assertIn(command, out)
+
+
+if __name__ == '__main__':
+    unittest.main()

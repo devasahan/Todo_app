@@ -15,17 +15,29 @@ admin's meetings (not their other plans) and change nothing.
 An admin can attach PDFs to a meeting (a resume, a cover letter). They are
 stored in the same database, and whoever can see the meeting can open them.
 
+Once email is set up (`setup-email` below), the admin can email approved
+accounts when a meeting is added, changed or cancelled. Each account can turn
+these emails off. The emails go out through Gmail (see dayplan_mail.py);
+the Gmail address and app password are kept in ../dayplan-data/mail.json,
+never in the database or the code.
+
 From a console:
 
     python3 ~/Todo_app/dayplan_api.py list-users
     python3 ~/Todo_app/dayplan_api.py approve someone@example.com
     python3 ~/Todo_app/dayplan_api.py set-password someone@example.com
     python3 ~/Todo_app/dayplan_api.py make-admin someone@example.com
+    python3 ~/Todo_app/dayplan_api.py setup-email
+    python3 ~/Todo_app/dayplan_api.py test-email someone@example.com
+    python3 ~/Todo_app/dayplan_api.py email-off
 
 `set-password` resets a forgotten password (and signs that account out
 everywhere); `add-user` creates an active account; `make-admin` makes an
 account the admin, creating it first if needed. After restoring the
 database file from a backup, run `new-epoch` so every browser resyncs.
+`setup-email` asks for the Gmail address and app password, sends a test
+email, and turns meeting emails on if it went through; `email-off` turns
+them off and deletes the saved password.
 """
 import calendar
 import getpass
@@ -43,6 +55,8 @@ import unicodedata
 from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
+
+import dayplan_mail
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT.parent / 'dayplan-data' / 'dayplan.sqlite3'
@@ -79,6 +93,10 @@ UNUSED_FILE_SECONDS = 24 * 3600
 # A file no plan has mentioned for this long is deleted. Until then a deleted
 # meeting that comes back (undo, a backup, another device) still has its PDFs.
 KEEP_UNUSED_SECONDS = 30 * 24 * 3600
+# Meeting emails go out through Gmail, which blocks an account that sends too
+# much (about 500 emails a day). Dayplan stays well below that.
+MAX_NOTIFY_PER_HOUR = 30  # rounds of emails (one meeting, everyone who gets them)
+MAX_MAIL_RECIPIENTS_PER_DAY = 400  # emails sent in the last 24 hours
 VIEW_ONLY = 'This account can view the meeting schedule but not change it.'
 WRONG_OR_WAITING = (
     'Wrong email or password. (If you asked for an account recently, '
@@ -109,7 +127,9 @@ CREATE TABLE IF NOT EXISTS users (
     rev INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
-    is_admin INTEGER NOT NULL DEFAULT 0
+    is_admin INTEGER NOT NULL DEFAULT 0,
+    notify INTEGER NOT NULL DEFAULT 1,  -- emails about the admin's meetings (approved accounts that aren't admins)
+    time_zone TEXT NOT NULL DEFAULT ''  -- the account's IANA time zone, for times in those emails ('' if unknown)
 );
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
@@ -148,20 +168,42 @@ CREATE TABLE IF NOT EXISTS files (
     unused_since INTEGER  -- when no plan mentioned it any more (NULL while in use)
 );
 CREATE INDEX IF NOT EXISTS files_by_user ON files (user_id);
+-- What people were last emailed about each meeting, so the next email can
+-- say whether it is new, changed, cancelled or back on.
+CREATE TABLE IF NOT EXISTS notices (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,  -- the admin whose meeting it is
+    plan_id TEXT NOT NULL,
+    snapshot TEXT NOT NULL,  -- JSON: the meeting's key details as emailed (dayplan_mail.snapshot)
+    sequence INTEGER NOT NULL DEFAULT 0,  -- the calendar file's SEQUENCE in that email
+    cancelled INTEGER NOT NULL DEFAULT 0,  -- whether that email said it was cancelled
+    sent_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, plan_id)
+);
+-- Rounds of meeting emails in the last day, for the limits above.
+CREATE TABLE IF NOT EXISTS mail_log (
+    at INTEGER NOT NULL,
+    recipients INTEGER NOT NULL  -- emails sent
+);
 """
 
 
 class ApiError(Exception):
-    def __init__(self, status, message):
+    def __init__(self, status, message, extra=None):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.extra = extra or {}  # more fields for the answer next to "error", e.g. {"notSaved": true}
 
 
 # ------------------------------------------------------------------ storage
 
 def db_path():
     return Path(os.environ.get('DAYPLAN_DB') or DEFAULT_DB)
+
+
+def mail_config_path():
+    """Where the email settings (Gmail address and app password) are kept: next to the database."""
+    return Path(os.environ.get('DAYPLAN_MAIL') or db_path().parent / 'mail.json')
 
 
 def connect():
@@ -190,6 +232,12 @@ def migrate(conn):
                 conn.execute('ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0')
                 # Whoever created the site's first account is its admin.
                 conn.execute('UPDATE users SET is_admin = 1 WHERE id = (SELECT MIN(id) FROM users)')
+        # Meeting emails: everyone gets them until they turn them off.
+        users = columns_of(conn, 'users')
+        for column, definition in (('notify', 'INTEGER NOT NULL DEFAULT 1'), ('time_zone', "TEXT NOT NULL DEFAULT ''")):
+            if column not in users:
+                with conn:
+                    conn.execute('ALTER TABLE users ADD COLUMN {} {}'.format(column, definition))
         if 'updated_at' not in columns_of(conn, 'plans'):
             with conn:
                 conn.execute("ALTER TABLE plans ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
@@ -404,14 +452,21 @@ def current_user(conn, environ):
     if not token:
         return None
     return conn.execute(
-        'SELECT users.id, users.email, users.is_admin FROM sessions JOIN users ON users.id = sessions.user_id '
+        'SELECT users.id, users.email, users.is_admin, users.notify, users.time_zone '
+        'FROM sessions JOIN users ON users.id = sessions.user_id '
         "WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND users.status = 'active'",
         (token_digest(token), int(time.time())),
     ).fetchone()
 
 
 def public_user(user):
-    return {'email': user['email'], 'admin': bool(user['is_admin'])}
+    """What the app may know about an account: never its password or sessions."""
+    return {
+        'email': user['email'],
+        'admin': bool(user['is_admin']),
+        'notify': bool(user['notify']),  # wants emails about meetings
+        'timeZone': user['time_zone'],  # '' until the browser has said
+    }
 
 
 def client_ip(environ):
@@ -443,6 +498,7 @@ def api_me(conn, environ, body):
     }
     if user and user['is_admin']:
         payload['pending'] = count_pending(conn)
+        payload['mail'] = mail_status(conn)
     return 200, payload, []
 
 
@@ -477,7 +533,8 @@ def api_register(conn, environ, body):
 
     if user_id is not None:
         token = create_session(conn, user_id)
-        return 201, {'user': {'email': email, 'admin': True}}, [session_cookie(environ, token, SESSION_SECONDS)]
+        user = conn.execute('SELECT email, is_admin, notify, time_zone FROM users WHERE id = ?', (user_id,)).fetchone()
+        return 201, {'user': public_user(user)}, [session_cookie(environ, token, SESSION_SECONDS)]
     return 202, {'pending': True, 'message': REQUEST_SENT}, []
 
 
@@ -497,7 +554,7 @@ def api_login(conn, environ, body):
     reserve_password_check(conn, ip)
 
     user = conn.execute(
-        'SELECT id, email, password_hash, status, is_admin FROM users WHERE email = ?', (email,)
+        'SELECT id, email, password_hash, status, is_admin, notify, time_zone FROM users WHERE email = ?', (email,)
     ).fetchone()
     if user is None:
         burn_password_check(password)
@@ -913,7 +970,7 @@ def require_admin(conn, environ):
 
 def admin_overview(conn):
     rows = conn.execute(
-        'SELECT users.email, users.status, users.is_admin, users.created_at, '
+        'SELECT users.email, users.status, users.is_admin, users.notify, users.created_at, '
         '(SELECT COUNT(*) FROM plans WHERE plans.user_id = users.id AND plans.data IS NOT NULL) AS plans '
         'FROM users ORDER BY users.created_at, users.id'
     ).fetchall()
@@ -922,12 +979,18 @@ def admin_overview(conn):
             'email': row['email'],
             'status': row['status'],
             'admin': bool(row['is_admin']),
+            'notify': bool(row['notify']),
             'createdAt': row['created_at'],
             'plans': row['plans'],
         }
         for row in rows
     ]
-    return {'users': users, 'signup': get_setting(conn, 'signup', '1') == '1', 'pending': count_pending(conn)}
+    return {
+        'users': users,
+        'signup': get_setting(conn, 'signup', '1') == '1',
+        'pending': count_pending(conn),
+        'mail': mail_status(conn),
+    }
 
 
 def api_admin_users(conn, environ, body):
@@ -957,6 +1020,7 @@ def api_admin_update_user(conn, environ, body):
         else:
             conn.execute('DELETE FROM plans WHERE user_id = ?', (target['id'],))
             conn.execute('DELETE FROM files WHERE user_id = ?', (target['id'],))
+            conn.execute('DELETE FROM notices WHERE user_id = ?', (target['id'],))
             conn.execute('DELETE FROM sessions WHERE user_id = ?', (target['id'],))
             conn.execute('DELETE FROM users WHERE id = ?', (target['id'],))
     return 200, admin_overview(conn), []
@@ -975,8 +1039,243 @@ def api_admin_settings(conn, environ, body):
     return 200, admin_overview(conn), []
 
 
+# ------------------------------------------------------------ meeting emails
+
+def mail_recipients(conn):
+    """Who gets meeting emails, as (email, time zone): approved accounts that
+    aren't admins and haven't turned the emails off."""
+    rows = conn.execute(
+        "SELECT email, time_zone FROM users WHERE status = 'active' AND is_admin = 0 AND notify = 1 ORDER BY email"
+    ).fetchall()
+    return [(row['email'], row['time_zone']) for row in rows]
+
+
+def mail_status(conn):
+    """For the admin: whether email is set up, the address it is sent from,
+    and how many people would get a meeting email. Never the password."""
+    config = dayplan_mail.load_config(mail_config_path())
+    viewers = conn.execute("SELECT COUNT(*) FROM users WHERE status = 'active' AND is_admin = 0").fetchone()[0]
+    return {
+        'ready': config is not None,
+        'sender': config['username'] if config else '',
+        'recipients': len(mail_recipients(conn)),  # approved accounts with emails on
+        'viewers': viewers,  # every approved account that isn't an admin
+    }
+
+
+def site_url(environ):
+    """This site's address, e.g. https://dayplan.pythonanywhere.com/, for the link in emails.
+
+    The host is the one the browser asked for; for a POST, check_same_origin
+    has already made sure it matches the page that sent the request.
+    """
+    scheme = 'https' if is_https(environ) else 'http'
+    host = environ.get('HTTP_HOST') or environ.get('SERVER_NAME') or ''
+    path = '/'.join(part for part in (environ.get('SCRIPT_NAME') or '').split('/') if part)
+    return '{}://{}/{}'.format(scheme, host, path + '/' if path else '')
+
+
+def reserve_emails(conn, count):
+    """Counts a round of `count` meeting emails against the hourly and daily
+    limits, or refuses it (429).
+
+    Checked and recorded in one locked step, so two requests at once can't
+    both squeeze in; the lock is let go before anything is sent. Returns the
+    mail_log row, which is set to the number actually sent afterwards. A
+    round that sends nothing still counts for the hour, so a wrong password
+    can't make Dayplan sign in to Gmail over and over.
+    """
+    now = int(time.time())
+    with conn:
+        conn.execute('BEGIN IMMEDIATE')
+        conn.execute('DELETE FROM mail_log WHERE at <= ?', (now - 24 * 3600,))
+        rounds = conn.execute('SELECT COUNT(*) FROM mail_log WHERE at > ?', (now - 3600,)).fetchone()[0]
+        if rounds >= MAX_NOTIFY_PER_HOUR:
+            raise ApiError(429, (
+                'Dayplan has sent {} rounds of meeting emails in the last hour, the most it sends, '
+                "so Gmail doesn't block the account. Please try again later."
+            ).format(MAX_NOTIFY_PER_HOUR))
+        sent = conn.execute('SELECT COALESCE(SUM(recipients), 0) FROM mail_log').fetchone()[0]
+        if sent + count > MAX_MAIL_RECIPIENTS_PER_DAY:
+            raise ApiError(429, (
+                'This would pass the limit of {} meeting emails a day, '
+                "which keeps Gmail from blocking the account. Please try again tomorrow."
+            ).format(MAX_MAIL_RECIPIENTS_PER_DAY))
+        return conn.execute('INSERT INTO mail_log (at, recipients) VALUES (?, ?)', (now, count)).lastrowid
+
+
+def plan_data(row):
+    """A stored plan as a dict, or None for a deletion or a row that can't be read."""
+    if row is None or row['data'] is None:
+        return None
+    try:
+        data = json.loads(row['data'])
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def api_notify(conn, environ, body):
+    """Emails everyone who gets meeting emails about one of the admin's meetings.
+
+    Request:  {"id": "<plan id>", "updatedAt": "<the version the admin sees>" (optional),
+               "cancel": true (optional: tell them it's cancelled)}
+    Response: {"sent": <emails sent>, "failed": <emails not sent>,
+               "recipients": <people who get meeting emails>,
+               "kind": "new" | "changed" | "cancelled" | "restored" | "reminder"}
+
+    The meeting is the one saved on the server, so the browser syncs its
+    change first; if the server's copy is older than `updatedAt`, the answer
+    is 409 with "notSaved": true and nothing is sent. The server works out
+    what to say from what people were last emailed about it (see notices).
+    A cancellation uses the meeting while it's still saved, or else what the
+    last email said, once the deletion has reached the server.
+
+    Each person gets their own email, so nobody sees who else got it. If
+    email isn't set up, the answer is 409 with "notConfigured": true. If
+    Gmail can't be reached or refuses every email, it is 502 and people's
+    last-emailed details are left as they were. Nobody to email is a 200
+    with "sent": 0.
+    """
+    user = require_admin(conn, environ)
+    plan_id = body.get('id')
+    cancel = body.get('cancel', False)
+    if not is_text(plan_id, 100) or not isinstance(cancel, bool):
+        raise ApiError(400, 'Invalid request.')
+    seen = None
+    if 'updatedAt' in body:
+        seen = canonical_stamp(body['updatedAt'])
+        if not seen:
+            raise ApiError(400, 'Invalid request.')
+
+    row = conn.execute(
+        'SELECT data, updated_at FROM plans WHERE user_id = ? AND id = ?', (user['id'], plan_id)
+    ).fetchone()
+    notice = conn.execute(
+        'SELECT snapshot, sequence, cancelled FROM notices WHERE user_id = ? AND plan_id = ?', (user['id'], plan_id)
+    ).fetchone()
+    data = plan_data(row)
+    live = data if data is not None and data.get('kind') == 'meeting' else None
+    previous = None
+    if notice is not None:
+        try:
+            previous = json.loads(notice['snapshot'])
+        except ValueError:
+            pass
+        if not isinstance(previous, dict):
+            previous = None
+
+    if cancel:
+        meeting = live if live is not None else previous
+        if meeting is None:
+            raise ApiError(409, "There's nothing to cancel: people were never emailed about this meeting.")
+    else:
+        if row is None:
+            raise ApiError(404, "This meeting isn't saved on the server yet.")
+        if row['data'] is None:
+            raise ApiError(409, 'This meeting was deleted.')
+        if seen and row['updated_at'] < seen:
+            raise ApiError(409, "This change hasn't reached the server yet.", {'notSaved': True})
+        if live is None:
+            raise ApiError(400, 'Emails can only be sent about meetings.')
+        meeting = live
+    meeting = {**meeting, 'id': plan_id}  # the calendar file's UID comes from it
+    snapshot = dayplan_mail.snapshot(meeting)
+
+    changes = []
+    if cancel:
+        kind = 'cancelled'
+    elif notice is None:
+        kind = 'new'
+    elif notice['cancelled']:
+        kind = 'restored'
+    else:
+        changes = dayplan_mail.changed_fields(previous, snapshot)
+        kind = 'changed' if changes else 'reminder'
+    sequence = notice['sequence'] + 1 if notice is not None else 0
+
+    config = dayplan_mail.load_config(mail_config_path())
+    if config is None:
+        raise ApiError(409, (
+            "Email isn't set up yet. Run {} in a PythonAnywhere console.".format(dayplan_mail.SETUP_COMMAND)
+        ), {'notConfigured': True})
+    recipients = mail_recipients(conn)
+    if not recipients:
+        return 200, {'sent': 0, 'failed': 0, 'recipients': 0, 'kind': kind}, []
+
+    site = site_url(environ)
+    messages, rejected = [], 0
+    for email, zone in recipients:
+        try:
+            messages.append(dayplan_mail.compose(
+                meeting, kind, recipient=email, recipient_zone=zone, site_url=site, config=config,
+                changes=changes, previous=previous if kind == 'changed' else None, sequence=sequence,
+            ))
+        except ValueError:
+            rejected += 1  # an address that can't be emailed safely
+    if not messages:
+        raise ApiError(502, 'Gmail refused every recipient.')
+
+    reservation = reserve_emails(conn, len(messages))
+    # No transaction is open here: sending can take a while, and the
+    # database must stay free for everyone else meanwhile.
+    try:
+        result = dayplan_mail.send(config, messages)
+    except dayplan_mail.MailError as err:
+        with conn:
+            conn.execute('UPDATE mail_log SET recipients = 0 WHERE rowid = ?', (reservation,))
+        raise ApiError(502, str(err))
+    sent = len(result['sent'])
+    failed = len(result['failed']) + rejected
+    with conn:
+        conn.execute('UPDATE mail_log SET recipients = ? WHERE rowid = ?', (sent, reservation))
+        if sent:
+            conn.execute(
+                'INSERT INTO notices (user_id, plan_id, snapshot, sequence, cancelled, sent_at) '
+                'VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (user_id, plan_id) DO UPDATE SET '
+                'snapshot = excluded.snapshot, sequence = excluded.sequence, '
+                'cancelled = excluded.cancelled, sent_at = excluded.sent_at',
+                (user['id'], plan_id, json.dumps(snapshot, separators=(',', ':')), sequence,
+                 1 if cancel else 0, int(time.time())),
+            )
+    if not sent:
+        raise ApiError(502, 'Gmail refused every recipient.')
+    return 200, {'sent': sent, 'failed': failed, 'recipients': len(recipients), 'kind': kind}, []
+
+
+def api_account(conn, environ, body):
+    """Changes the signed-in account's own email settings (any approved account).
+
+    Request:  {"notify": true | false, "timeZone": "Europe/London" or ""} (either or both)
+    Response: {"user": {"email", "admin", "notify", "timeZone"}}
+
+    notify: whether it gets an email when a meeting is added, changed or
+    cancelled. timeZone: where it is, so those emails also give each time
+    on its own clocks ('' when unknown).
+    """
+    user = current_user(conn, environ)
+    if user is None:
+        raise ApiError(401, 'Please sign in again.')
+    if 'notify' not in body and 'timeZone' not in body:
+        raise ApiError(400, 'Invalid request.')
+    if 'notify' in body and not isinstance(body['notify'], bool):
+        raise ApiError(400, 'Invalid request.')
+    zone = body.get('timeZone', '')
+    if not isinstance(zone, str) or (zone and not dayplan_mail.valid_zone(zone)):
+        raise ApiError(400, 'Unknown time zone.')
+    with conn:
+        # Only what was sent, so two changes at once don't undo each other.
+        if 'notify' in body:
+            conn.execute('UPDATE users SET notify = ? WHERE id = ?', (1 if body['notify'] else 0, user['id']))
+        if 'timeZone' in body:
+            conn.execute('UPDATE users SET time_zone = ? WHERE id = ?', (zone, user['id']))
+    user = conn.execute('SELECT email, is_admin, notify, time_zone FROM users WHERE id = ?', (user['id'],)).fetchone()
+    return 200, {'user': public_user(user)}, []
+
+
 ROUTES = {
     '/api/me': {'GET': api_me},
+    '/api/account': {'POST': api_account},
     '/api/register': {'POST': api_register},
     '/api/login': {'POST': api_login},
     '/api/logout': {'POST': api_logout},
@@ -985,6 +1284,7 @@ ROUTES = {
     '/api/admin/users': {'GET': api_admin_users, 'POST': api_admin_update_user},
     '/api/admin/settings': {'POST': api_admin_settings},
     '/api/files': {'POST': api_upload_file},
+    '/api/notify': {'POST': api_notify},
 }
 # Paths with a part that changes. Each named part of the pattern is passed
 # to the endpoint as a keyword argument.
@@ -1085,7 +1385,7 @@ def handle(environ, start_response):
         replaced = {name.lower() for name, _ in extra}
         headers = [header for header in headers if header[0].lower() not in replaced] + list(extra)
     except ApiError as err:
-        status, payload = err.status, {'error': err.message}
+        status, payload = err.status, {'error': err.message, **err.extra}
     except Exception:  # never leak details; the traceback goes to the error log
         traceback.print_exc(file=sys.stderr)
         status, payload = 500, {'error': 'Something went wrong on the server.'}
@@ -1100,7 +1400,7 @@ def handle(environ, start_response):
 STATUS_TEXT = {
     200: 'OK', 201: 'Created', 202: 'Accepted', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden',
     404: 'Not Found', 405: 'Method Not Allowed', 409: 'Conflict', 413: 'Payload Too Large',
-    415: 'Unsupported Media Type', 429: 'Too Many Requests', 500: 'Internal Server Error',
+    415: 'Unsupported Media Type', 429: 'Too Many Requests', 500: 'Internal Server Error', 502: 'Bad Gateway',
 }
 
 
@@ -1118,6 +1418,85 @@ def read_new_password(email):
     return password
 
 
+MAX_SENDER_NAME = 60
+
+
+def setup_email():
+    """Asks for the Gmail address and app password that send meeting emails,
+    sends a test email with them, and saves them only if Gmail took it.
+
+    The settings are read again for every request, so the site needs no
+    reload. The password is never shown, not even while it is typed.
+    """
+    print('Meeting emails are sent through a Gmail account, signed in with an app password')
+    print('(2-Step Verification must be on for that account). See "Email notifications" in the README.')
+    username = input('Gmail address that sends the emails: ').strip()
+    if not EMAIL_RE.match(username):
+        print('That does not look like an email address. Nothing was saved.', file=sys.stderr)
+        return 1
+    # Google shows the app password in groups of four ("abcd efgh ijkl mnop").
+    password = ''.join(getpass.getpass('App password (16 letters, from myaccount.google.com/apppasswords): ').split())
+    if not password:
+        print('No app password was typed. Nothing was saved.', file=sys.stderr)
+        return 1
+    from_name = input('Name shown as the sender [Dayplan]: ').strip() or 'Dayplan'
+    if len(from_name) > MAX_SENDER_NAME or not from_name.isprintable():
+        print('Use a name of at most {} characters. Nothing was saved.'.format(MAX_SENDER_NAME), file=sys.stderr)
+        return 1
+    config = {
+        'host': dayplan_mail.DEFAULT_HOST,
+        'port': dayplan_mail.DEFAULT_PORT,
+        'username': username,
+        'password': password,
+        'from_name': from_name,
+    }
+    try:
+        message = dayplan_mail.test_message(config, username)
+    except ValueError:
+        print('That does not look like an email address. Nothing was saved.', file=sys.stderr)
+        return 1
+    print('Sending a test email to {}...'.format(username))
+    try:
+        result = dayplan_mail.send(config, [message])
+    except dayplan_mail.MailError as err:
+        print(err, file=sys.stderr)
+        print('Nothing was saved.', file=sys.stderr)
+        return 1
+    if not result['sent']:
+        print('Gmail did not accept the test email to {}. Nothing was saved.'.format(username), file=sys.stderr)
+        return 1
+    path = mail_config_path()
+    dayplan_mail.save_config(path, config)
+    print('The test email was sent to {}.'.format(username))
+    print('Saved in {} (only your account can read it).'.format(path))
+    print('Meeting emails are on. There is nothing to reload: the site reads this file for each email.')
+    return 0
+
+
+def send_test_email(address):
+    """Sends a test email to `address` with the saved settings."""
+    config = dayplan_mail.load_config(mail_config_path())
+    if config is None:
+        print("Email isn't set up yet. Run {} first.".format(dayplan_mail.SETUP_COMMAND), file=sys.stderr)
+        return 1
+    address = address.strip()
+    try:
+        message = dayplan_mail.test_message(config, address)
+    except ValueError:
+        print('That does not look like an email address.', file=sys.stderr)
+        return 1
+    try:
+        result = dayplan_mail.send(config, [message])
+    except dayplan_mail.MailError as err:
+        print(err, file=sys.stderr)
+        return 1
+    if not result['sent']:
+        print('Gmail did not accept the test email to {}.'.format(address), file=sys.stderr)
+        return 1
+    print('A test email was sent to {} from {}.'.format(address, config['username']))
+    return 0
+
+
 def main(argv):
     usage = (
         'Usage:\n'
@@ -1126,8 +1505,23 @@ def main(argv):
         '  python3 dayplan_api.py set-password EMAIL     (existing account)\n'
         '  python3 dayplan_api.py add-user EMAIL         (new, active account)\n'
         '  python3 dayplan_api.py make-admin EMAIL       (creates the account if needed)\n'
-        '  python3 dayplan_api.py new-epoch              (after restoring the database file)'
+        '  python3 dayplan_api.py new-epoch              (after restoring the database file)\n'
+        '  python3 dayplan_api.py setup-email            (turns meeting emails on, through Gmail)\n'
+        '  python3 dayplan_api.py test-email EMAIL       (sends a test email)\n'
+        '  python3 dayplan_api.py email-off              (turns meeting emails off, deletes the saved password)'
     )
+    if len(argv) == 2 and argv[1] == 'setup-email':
+        return setup_email()
+    if len(argv) == 3 and argv[1] == 'test-email':
+        return send_test_email(argv[2])
+    if len(argv) == 2 and argv[1] == 'email-off':
+        path = mail_config_path()
+        if dayplan_mail.delete_config(path):
+            print('Meeting emails are off. The saved Gmail address and app password were deleted from {}.'.format(path))
+            print('You can also remove the app password at https://myaccount.google.com/apppasswords.')
+        else:
+            print('Email was not set up, so there was nothing to turn off.')
+        return 0
     if len(argv) == 2 and argv[1] == 'new-epoch':
         conn = connect()
         with conn:

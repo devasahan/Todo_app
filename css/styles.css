@@ -3273,6 +3273,95 @@ select:hover {
   color: var(--accent);
 }
 
+.status-chip.st-no-email {
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+/* Whether meeting emails are set up (Manage users). */
+.mail-status {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.mail-status.is-off {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+/* ------------------------------------------------------- meeting emails */
+
+/* "Email approved people about this", just above the editor's buttons. */
+.notify-bar {
+  display: grid;
+  gap: 2px;
+  padding: 10px 24px;
+  border-top: 1px solid var(--border);
+}
+
+.check-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  font-size: 13.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.check-row input {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent-bg);
+  cursor: inherit;
+}
+
+.check-row:has(input:disabled) {
+  color: var(--muted);
+  cursor: default;
+}
+
+.notify-bar .field-hint {
+  padding-left: 24px;
+}
+
+/* The viewer's "Email me about meeting changes" in the account menu. */
+.menu-list #email-me {
+  justify-content: flex-start;
+  gap: 10px;
+}
+
+.menu-check {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 4px;
+}
+
+#email-me[aria-checked='true'] .menu-check {
+  border-color: var(--accent-bg);
+  background: var(--accent-bg);
+}
+
+#email-me[aria-checked='true'] .menu-check::after {
+  content: '';
+  width: 8px;
+  height: 4px;
+  border: solid var(--on-accent);
+  border-width: 0 0 2px 2px;
+  transform: translateY(-1px) rotate(-45deg);
+}
+
 /* ------------------------------------------------------------- viewers */
 
 /* Accounts the admin approves only look at the meeting schedule. */

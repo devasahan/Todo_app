@@ -1199,6 +1199,43 @@
     return `${slug}${parseISODate(plan.dueDate) ? `-${plan.dueDate}` : ''}.ics`;
   }
 
+  /* -------------------------------------------------------- notifications */
+
+  // The details of a meeting that approved people are emailed about, in the order the
+  // email lists them. dayplan_mail.py keeps the same list (NOTIFY_FIELDS).
+  const NOTIFY_FIELDS = [
+    'title',
+    'company',
+    'dueDate',
+    'dueTime',
+    'endTime',
+    'timeZone',
+    'meetingUrl',
+    'jobUrl',
+    'resume',
+    'coverLetter',
+  ];
+  const NOTIFY_URLS = new Set(['meetingUrl', 'jobUrl']);
+  const NOTIFY_FILES = new Set(['resume', 'coverLetter']);
+
+  // What a detail is compared by: a link as cleanUrl sees it, a document by
+  // its file id only (the same file under a new name isn't news), and
+  // anything else as trimmed text.
+  function notifyValue(field, value) {
+    if (NOTIFY_URLS.has(field)) return cleanUrl(value);
+    if (NOTIFY_FILES.has(field)) return value && typeof value === 'object' ? String(value.id ?? '') : null;
+    return String(value ?? '').trim();
+  }
+
+  // The details approved people would be told about, in NOTIFY_FIELDS order, that
+  // differ between two versions of a meeting. A missing `before` counts as
+  // a meeting with nothing filled in.
+  function notifyChanges(before, after) {
+    const a = before && typeof before === 'object' ? before : {};
+    const b = after && typeof after === 'object' ? after : {};
+    return NOTIFY_FIELDS.filter((field) => notifyValue(field, a[field]) !== notifyValue(field, b[field]));
+  }
+
   /* ------------------------------------------------------------------ sync */
 
   // Ids of plans that were added, changed or removed between two snapshots.
@@ -1422,6 +1459,8 @@
     monthGrid,
     meetingICS,
     icsFileName,
+    NOTIFY_FIELDS,
+    notifyChanges,
     changedPlanIds,
     fromOlderVersion,
     keepMeetingDetails,

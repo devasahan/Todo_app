@@ -222,20 +222,20 @@
     }
   }
 
+  // Returns a function that brings the plan back (also offered as Undo).
   function deletePlan(id) {
     const index = state.plans.findIndex((p) => p.id === id);
-    if (index < 0) return;
+    if (index < 0) return () => {};
     const plan = state.plans[index];
     setPlans(state.plans.filter((p) => p.id !== id));
-    toast(`Deleted “${truncate(plan.title)}”`, {
-      action: 'Undo',
-      onAction: () => {
-        if (findPlan(id)) return;
-        const plans = [...state.plans];
-        plans.splice(Math.min(index, plans.length), 0, undeleted(plan));
-        setPlans(plans);
-      },
-    });
+    const undo = () => {
+      if (findPlan(id)) return;
+      const plans = [...state.plans];
+      plans.splice(Math.min(index, plans.length), 0, undeleted(plan));
+      setPlans(plans);
+    };
+    toast(`Deleted “${truncate(plan.title)}”`, { action: 'Undo', onAction: undo });
+    return undo;
   }
 
   function setView(view) {
@@ -1190,7 +1190,8 @@
       const message = date
         ? `Moved “${truncate(plan.title)}” to ${C.formatDate(C.parseISODate(date))}`
         : `Removed the deadline from “${truncate(plan.title)}”`;
-      toast(message, { action: 'Undo', onAction: () => updatePlan(id, previous) });
+      const email = C.isMeeting(plan) && date && canEmailPeople() ? { action2: 'Email people', onAction2: () => notifyPeople(id) } : {};
+      toast(message, { action: 'Undo', onAction: () => updatePlan(id, previous), ...email });
     });
 
     view.addEventListener('dragend', endDrag);
@@ -1209,6 +1210,7 @@
     tags: [],
     checklist: [],
     snapshot: '',
+    notifyTouched: false, // the admin ticked or unticked "Email approved people" themselves
   };
   const field = (name) => editor.form.elements.namedItem(name);
   const isMeetingForm = () => field('kind').value === 'meeting';
@@ -1300,6 +1302,8 @@
     editor.original = editorValues(); // to save only what the user changes
     // A meeting saved before time zones existed: saving it stores the zone shown.
     if (plan && C.isMeeting(plan)) editor.original.timeZone = plan.timeZone || '';
+    editor.notifyTouched = false;
+    if (sync.admin) refreshAccountInfo({ maxAge: 30 * 1000 }); // who'd get an email
     applyKind();
     editor.dialog.showModal();
     if (!plan && meeting) {
@@ -1344,7 +1348,41 @@
     }
     updateTitlePlaceholder();
     updateIcsButton();
+    updateNotifyBox();
   }
+
+  // "Email approved people about this": admin only, for meetings, once email
+  // is set up on the server. It ticks itself for a new meeting and when a
+  // detail people rely on changes (date, time, links…), not for notes or
+  // steps, until the admin ticks or unticks it.
+  function updateNotifyBox() {
+    const row = $('#notify-row');
+    const mail = sync.admin ? sync.mail : null;
+    row.hidden = !(mail && isMeetingForm());
+    if (row.hidden) return;
+    const box = $('#notify-people');
+    const ready = mail.ready && mail.recipients > 0;
+    box.disabled = !ready;
+    if (!ready) box.checked = false;
+    else if (!editor.notifyTouched) {
+      const wasMeeting = editor.id && editor.original?.kind === 'meeting';
+      box.checked = !wasMeeting || C.notifyChanges(editor.original, editorValues()).length > 0;
+    }
+    const people = `${mail.recipients} ${mail.recipients === 1 ? 'person' : 'people'}`;
+    let hint;
+    if (!mail.ready) hint = "Email isn't set up yet: see “Email notifications” in the README.";
+    else if (!mail.recipients) {
+      hint = mail.viewers
+        ? 'Everyone you approved has turned these emails off.'
+        : 'No one to email yet. People you approve in Manage users get these emails.';
+    } else if (editor.id && editor.original?.kind === 'meeting') {
+      hint = `Goes to ${people}. Deleting the meeting with this ticked tells them it's cancelled.`;
+    } else hint = `Goes to ${people} when you save.`;
+    $('#notify-hint').textContent = hint;
+  }
+
+  // The email box counts only while it's shown and ready.
+  const notifyWanted = () => !$('#notify-row').hidden && !$('#notify-people').disabled && $('#notify-people').checked;
 
   function updateTitlePlaceholder() {
     const company = oneLine(field('company').value);
@@ -1448,6 +1486,7 @@
     $('#docs-hint').textContent = available
       ? 'PDF, up to 10 MB. People you approve can open these too.'
       : 'Attaching PDFs works on your Dayplan website, signed in as the admin.';
+    if (editor.original) updateNotifyBox();
   }
 
   // Uploads a PDF and attaches it to the meeting being edited (saved with the meeting).
@@ -1706,16 +1745,18 @@
       values.dueTime = local.time;
     }
     const point = centerOf(editor.form.querySelector('[type="submit"]'));
+    const notify = values.kind === 'meeting' && notifyWanted();
     editor.dialog.close();
 
     if (!editor.id) {
       const plan = addPlan(values);
       if (values.status === 'done') celebrate(point);
-      if (C.isMeeting(plan) && plan.dueDate) {
-        toast(`Added “${truncate(plan.title)}” for ${C.dueInfo(plan).full}`, {
-          action: 'Add to my calendar',
-          onAction: () => downloadICS(findPlan(plan.id) || plan),
-        });
+      const addToCalendar = { action: 'Add to my calendar', onAction: () => downloadICS(findPlan(plan.id) || plan) };
+      if (notify) {
+        toast(`Added “${truncate(plan.title)}”. Emailing people…`);
+        notifyPeople(plan.id, { done: plan.dueDate ? addToCalendar : null });
+      } else if (C.isMeeting(plan) && plan.dueDate) {
+        toast(`Added “${truncate(plan.title)}” for ${C.dueInfo(plan).full}`, addToCalendar);
       } else {
         toast(`Added “${truncate(plan.title)}”`);
       }
@@ -1746,7 +1787,10 @@
       }
     }
     const newStatus = values.status !== editor.original.status && values.status !== before.status ? values.status : '';
-    if (!Object.keys(changes).length && !newStatus) return;
+    if (!Object.keys(changes).length && !newStatus) {
+      if (notify) notifyPeople(editor.id); // nothing changed: send the details again
+      return;
+    }
 
     const now = new Date();
     let plans = state.plans;
@@ -1758,6 +1802,10 @@
     if (newStatus) plans = placeAtTop(plans, editor.id, newStatus);
     setPlans(plans);
     if (newStatus === 'done') celebrate(point);
+    if (notify) {
+      toast('Saved. Emailing people…');
+      notifyPeople(editor.id); // sent once this change has reached the server
+    }
   }
 
   function setupEditor() {
@@ -1789,9 +1837,21 @@
 
     $('#editor-delete').addEventListener('click', () => {
       const id = editor.id;
+      const plan = findPlan(id);
+      // A meeting deleted with "Email approved people" ticked: tell them it's cancelled.
+      const cancel = Boolean(plan && C.isMeeting(plan) && notifyWanted());
       editor.dialog.close();
-      deletePlan(id);
+      if (cancel) cancelMeeting(plan);
+      else deletePlan(id);
     });
+
+    // Runs after the fields' own handlers, so it sees their final values.
+    for (const type of ['input', 'change']) {
+      form.addEventListener(type, (e) => {
+        if (e.target.id === 'notify-people') editor.notifyTouched = true;
+        else updateNotifyBox();
+      });
+    }
 
     $('.quick-dates', form).addEventListener('click', (e) => {
       const btn = e.target.closest('[data-due]');
@@ -1808,6 +1868,7 @@
       }
       updateIcsButton();
       updateZoneHint();
+      updateNotifyBox();
     });
 
     form.addEventListener('change', (e) => {
@@ -2125,22 +2186,27 @@
     }
   }
 
-  function toast(message, { action = '', onAction = null } = {}) {
+  // Up to two buttons, e.g. Undo and Email people.
+  function toast(message, { action = '', onAction = null, action2 = '', onAction2 = null } = {}) {
     const el = $('#toast');
-    const btn = $('#toast-action');
     $('#toast-text').textContent = message;
-    btn.hidden = !action;
-    btn.textContent = action;
-    btn.onclick = action
-      ? () => {
-          hideToast();
-          onAction();
-        }
-      : null;
+    for (const [btn, label, handler] of [
+      [$('#toast-action'), action, onAction],
+      [$('#toast-action-2'), action2, onAction2],
+    ]) {
+      btn.hidden = !label;
+      btn.textContent = label;
+      btn.onclick = label
+        ? () => {
+            hideToast();
+            handler();
+          }
+        : null;
+    }
     el.hidden = false;
     raiseToast(el);
     requestAnimationFrame(() => el.classList.add('show'));
-    toastDuration = action ? 7000 : 3500;
+    toastDuration = action2 ? 9000 : action ? 7000 : 3500;
     clearTimeout(toastTimer);
     toastTimer = setTimeout(hideToast, toastDuration);
   }
@@ -2400,6 +2466,11 @@
     admin: false,
     pendingUsers: 0, // sign-up requests waiting for the admin
     notifiedPending: 0,
+    // Meeting emails: whether this account wants them, the time zone the server
+    // has for it, and (admin only) {ready, sender, recipients, viewers}, or null.
+    notify: true,
+    zone: '',
+    mail: null,
     epoch: '', // id of the server database this browser synced with
     cursor: 0, // last server revision this browser has seen
     pending: new Set(), // plan ids changed here and not yet sent
@@ -2453,6 +2524,9 @@
     sync.admin = false;
     sync.pendingUsers = 0;
     sync.notifiedPending = 0;
+    sync.notify = true;
+    sync.zone = '';
+    sync.mail = null;
     sync.epoch = '';
     sync.cursor = 0;
     sync.pending.clear();
@@ -2541,10 +2615,10 @@
 
   const REQUEST_TIMEOUT_MS = 30000;
 
-  async function api(path, body) {
+  async function api(path, body, { timeout = REQUEST_TIMEOUT_MS } = {}) {
     // A request that hangs (weak mobile signal) becomes a retryable error.
     const controller = typeof AbortController === 'function' ? new AbortController() : null;
-    const timer = controller ? setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS) : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeout) : null;
     let response;
     try {
       response = await fetch(path, {
@@ -2574,6 +2648,7 @@
       }
       const err = new Error(message);
       err.status = response.status;
+      err.data = data || {};
       throw err;
     }
     return data;
@@ -2935,6 +3010,7 @@
     closeEditingDialogs();
     sync.admin = false;
     sync.pendingUsers = 0;
+    sync.mail = null;
     saveSyncState();
     loadScheduleCache();
     updateAccountUI();
@@ -2967,6 +3043,7 @@
     }
     setSyncStatus(sync.status);
     updateAdminBadge();
+    updateEmailMe();
     updateGate();
   }
 
@@ -3146,6 +3223,7 @@
       sync.first = false;
       const brought = state.plans.length;
       await startSession(result.user.email, result.user.admin);
+      refreshAccountInfo();
       let message = `Signed in as ${result.user.email}.`;
       if (signup) message = `Account created. You're the admin of this site, and your plans are saved to ${result.user.email}.`;
       else if (!sync.admin) message = `Signed in as ${result.user.email}. You can view the meeting schedule.`;
@@ -3209,6 +3287,10 @@
         openAdmin();
         return;
       }
+      if (item.dataset.account === 'email-me') {
+        toggleEmailMe();
+        return;
+      }
       const waitingBefore = sync.notifiedPending;
       await syncNow();
       if (!sync.user) return; // signed out meanwhile: keep that notice visible
@@ -3238,6 +3320,206 @@
     setupAdmin();
     updateAccountUI();
     connectToServer();
+  }
+
+  /* ---- meeting emails */
+
+  // The admin can email the people who view the schedule (set up on the server).
+  const canEmailPeople = () => Boolean(sync.admin && sync.mail && sync.mail.ready && sync.mail.recipients > 0);
+  const peopleCount = (n) => `${n} ${n === 1 ? 'person' : 'people'}`;
+  const NOTIFY_TIMEOUT_MS = 90 * 1000; // Gmail can take a while with many people
+  let notifyChain = Promise.resolve(); // one email request at a time, in order
+
+  // Sends local changes until this plan's latest version is on the server.
+  async function syncedUp(id) {
+    for (let i = 0; i < 4 && (sync.pending.has(id) || sync.inflight.has(id)); i++) await syncNow();
+    if (sync.pending.has(id) || sync.inflight.has(id)) {
+      const err = new Error("The change hasn't reached the server yet. Check your connection.");
+      err.notSaved = true;
+      throw err;
+    }
+  }
+
+  /*
+   * Emails everyone who can view the schedule about a meeting, once the
+   * meeting as it is here has reached the server. The server works out what
+   * to say: new, changed, back on, or the same details again. `cancel` says
+   * it's cancelled instead. `done` is an optional toast button for success.
+   */
+  function notifyPeople(id, { cancel = false, done = null, title = '', onCancelled = null } = {}) {
+    const run = () => sendNotice(id, { cancel, done, title, onCancelled });
+    notifyChain = notifyChain.then(run, run);
+    return notifyChain;
+  }
+
+  async function sendNotice(id, { cancel, done, title, onCancelled }) {
+    const user = sync.user;
+    const name = () => truncate((findPlan(id) || {}).title || title || 'the meeting');
+    const retry = () => notifyPeople(id, { cancel, done, title, onCancelled });
+    let result;
+    try {
+      for (let attempt = 0; ; attempt++) {
+        if (!cancel) await syncedUp(id);
+        const plan = findPlan(id);
+        const body = { id, cancel };
+        if (!cancel && plan) body.updatedAt = plan.updatedAt;
+        try {
+          result = await api('api/notify', body, { timeout: NOTIFY_TIMEOUT_MS });
+          break;
+        } catch (err) {
+          // Saved by another tab or device meanwhile: sync and ask again.
+          if (err.status === 409 && err.data.notSaved && attempt < 2) {
+            sync.pending.add(id);
+            continue;
+          }
+          throw err;
+        }
+      }
+    } catch (err) {
+      if (sync.user !== user) return;
+      if (err.status === 401) {
+        signedOutElsewhere();
+        return;
+      }
+      const reason = err.status || err.notSaved ? err.message : "Couldn't reach the server. Check your connection.";
+      const what = cancel ? `The cancellation email for “${name()}” wasn't sent.` : `The email about “${name()}” wasn't sent.`;
+      const notConfigured = Boolean(err.data && err.data.notConfigured);
+      if (notConfigured && sync.mail) sync.mail = { ...sync.mail, ready: false };
+      // Trying again helps unless email isn't set up or this account can't send.
+      if (notConfigured || err.status === 403) toast(`${what} ${reason}`);
+      else toast(`${what} ${reason}`, { action: 'Try again', onAction: retry });
+      return;
+    }
+    if (sync.user !== user) return;
+    if (sync.mail && typeof result.recipients === 'number') sync.mail = { ...sync.mail, recipients: result.recipients };
+    if (!result.sent) {
+      toast(result.recipients ? `No email was sent about “${name()}”.` : `No one to email about “${name()}”: nobody has these emails turned on.`);
+      return;
+    }
+    const people = peopleCount(result.sent);
+    const failed = result.failed ? ` ${peopleCount(result.failed)} couldn't be reached.` : '';
+    if (result.kind === 'cancelled') {
+      if (onCancelled) onCancelled(`${people} ${result.sent === 1 ? 'was' : 'were'} told “${name()}” is cancelled.${failed}`);
+      else toast(`Told ${people} that “${name()}” is cancelled.${failed}`);
+      return;
+    }
+    const message = {
+      new: `Emailed ${people} about “${name()}”.`,
+      changed: `Emailed ${people} about the change to “${name()}”.`,
+      restored: `Emailed ${people} that “${name()}” is back on.`,
+      reminder: `Emailed the details of “${name()}” to ${people}.`,
+    }[result.kind] || `Emailed ${people} about “${name()}”.`;
+    toast(message + failed, done || {});
+  }
+
+  // Deletes a meeting and tells people it's cancelled. The request goes out
+  // before the deletion is synced, while the server still has the meeting.
+  function cancelMeeting(plan) {
+    const undo = deletePlan(plan.id);
+    toast(`Deleted “${truncate(plan.title)}”. Emailing people…`, { action: 'Undo', onAction: undo });
+    notifyPeople(plan.id, {
+      cancel: true,
+      title: plan.title,
+      onCancelled: (told) => {
+        const back = () => {
+          toast(`“${truncate(plan.title)}” is back. People still think it's cancelled.`, {
+            action: 'Email people',
+            onAction: () => notifyPeople(plan.id),
+          });
+        };
+        if (findPlan(plan.id)) back(); // undone while the email was being sent
+        else {
+          toast(`Deleted “${truncate(plan.title)}”. ${told}`, {
+            action: 'Undo',
+            onAction: () => {
+              undo();
+              back();
+            },
+          });
+        }
+      },
+    });
+  }
+
+  // What the server knows about this account's emails (and, for the admin,
+  // whether email is set up and who would get one).
+  function applyAccountInfo(me) {
+    if (!me || !me.user || me.user.email !== sync.user) return;
+    sync.notify = me.user.notify !== false;
+    sync.zone = typeof me.user.timeZone === 'string' ? me.user.timeZone : '';
+    sync.mail = sync.admin && me.mail && typeof me.mail === 'object' ? me.mail : null;
+    updateEmailMe();
+    if (editor.dialog.open) updateNotifyBox();
+    shareTimeZone();
+  }
+
+  let accountInfoAt = 0;
+  let accountInfoRequest = null;
+
+  function refreshAccountInfo({ maxAge = 0 } = {}) {
+    if (!sync.user || !sync.available) return Promise.resolve();
+    if (accountInfoRequest) return accountInfoRequest;
+    if (maxAge && Date.now() - accountInfoAt < maxAge) return Promise.resolve();
+    accountInfoRequest = api('api/me')
+      .then((me) => {
+        accountInfoAt = Date.now();
+        applyAccountInfo(me);
+      })
+      .catch(() => {
+        /* the next sync or reload tries again */
+      })
+      .finally(() => {
+        accountInfoRequest = null;
+      });
+    return accountInfoRequest;
+  }
+
+  // Emails show meeting times in each person's own time zone too.
+  let sharingZone = '';
+  function shareTimeZone() {
+    const zone = C.localTimeZone();
+    if (!zone || zone === sync.zone || zone === sharingZone || !sync.user) return;
+    sharingZone = zone;
+    const user = sync.user;
+    api('api/account', { timeZone: zone })
+      .then(() => {
+        if (sync.user === user) sync.zone = zone;
+      })
+      .catch(() => {
+        /* not important: tried again on the next visit */
+      })
+      .finally(() => {
+        sharingZone = '';
+      });
+  }
+
+  // "Email me about meeting changes", in the account menu of people who view the schedule.
+  function updateEmailMe() {
+    const item = $('#email-me');
+    item.hidden = !viewing();
+    item.setAttribute('aria-checked', String(sync.notify));
+  }
+
+  async function toggleEmailMe() {
+    const wanted = !sync.notify;
+    const user = sync.user;
+    sync.notify = wanted;
+    updateEmailMe();
+    try {
+      await api('api/account', { notify: wanted });
+      if (sync.user !== user) return;
+      toast(
+        wanted
+          ? "You'll get an email when a meeting is added, changed or cancelled."
+          : 'Meeting emails are off. You can still see every meeting here.'
+      );
+    } catch (err) {
+      if (sync.user !== user) return;
+      sync.notify = !wanted;
+      updateEmailMe();
+      if (err.status === 401) signedOutElsewhere();
+      else toast(err.status ? err.message : "Couldn't reach the server. Check your connection and try again.");
+    }
   }
 
   /* ---- admin: approve and manage accounts */
@@ -3287,7 +3569,21 @@
     $('#admin-signup').disabled = false;
     sync.notifiedPending = data.pending; // no "people are waiting" toast while looking at them
     setPendingUsers(data.pending, { fromOverview: true });
+    if (data.mail && typeof data.mail === 'object') sync.mail = data.mail;
+    renderAdminMail();
     renderAdminUsers();
+  }
+
+  // Whether meeting emails are set up, and where they come from.
+  function renderAdminMail() {
+    const line = $('#admin-mail');
+    const mail = sync.mail;
+    line.hidden = !mail;
+    if (!mail) return;
+    line.classList.toggle('is-off', !mail.ready);
+    line.textContent = mail.ready
+      ? `Meeting emails are sent from ${mail.sender}. ${mail.recipients ? `${peopleCount(mail.recipients)} ${mail.recipients === 1 ? 'gets' : 'get'} them.` : 'No one gets them yet.'}`
+      : 'Meeting emails are off. To email people when you add or change a meeting, set up Gmail as described under “Email notifications” in the README.';
   }
 
   // After the list re-renders, keep keyboard focus near where it was.
@@ -3328,6 +3624,7 @@
             ${self ? '<span class="status-chip st-you">You</span>' : ''}
             ${u.admin ? '<span class="status-chip st-admin">Admin</span>' : ''}
             ${self ? '' : `<span class="status-chip st-${u.status}">${STATUS_NAMES[u.status]}</span>`}
+            ${!u.admin && u.status === 'active' && u.notify === false ? '<span class="status-chip st-no-email" title="Turned off meeting emails">Emails off</span>' : ''}
           </div>
           ${actions ? `<div class="user-actions">${actions}</div>` : ''}
         </li>`;
@@ -3468,9 +3765,12 @@
       updateAccountUI();
       render();
       if (typeof me.pending === 'number') setPendingUsers(me.pending);
+      applyAccountInfo(me);
       syncNow();
     } else if (serverUser && !sync.user) {
-      await startSession(serverUser, me.user.admin);
+      const session = startSession(serverUser, me.user.admin);
+      applyAccountInfo(me);
+      await session;
     } else if (sync.user) {
       signedOutElsewhere();
     } else {

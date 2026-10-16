@@ -1504,3 +1504,130 @@ test('the sample meeting has a time zone and an end time', () => {
   assert.equal(m.resume, null);
   assert.equal(m.coverLetter, null);
 });
+
+/* --------------------------------------------------------- notifications */
+
+const INTERVIEW = {
+  title: 'Interview with Acme',
+  company: 'Acme',
+  dueDate: '2026-10-20',
+  dueTime: '14:00',
+  endTime: '15:00',
+  timeZone: 'Europe/London',
+  meetingUrl: 'https://zoom.us/j/1',
+  jobUrl: 'https://example.com/jobs/1',
+  resume: PDF,
+  coverLetter: LETTER,
+};
+
+test('notifyChanges finds nothing when no emailed detail changed', () => {
+  const base = meeting({ id: 'm', ...INTERVIEW });
+  assert.deepEqual(C.notifyChanges(base, base), []);
+  assert.deepEqual(C.notifyChanges(base, { ...base }), []);
+  assert.deepEqual(C.notifyChanges({}, {}), []);
+  // Notes, status, tags and steps are not emailed, so they never count.
+  const busy = {
+    ...base,
+    description: 'Bring a notebook.',
+    status: 'done',
+    priority: 'low',
+    tags: ['job-search'],
+    checklist: [{ id: 's', text: 'Research the company', done: true }],
+    order: 7,
+    updatedAt: new Date(2026, 9, 15).toISOString(),
+  };
+  assert.deepEqual(C.notifyChanges(base, busy), []);
+});
+
+test('notifyChanges finds a change to each emailed detail', () => {
+  const base = meeting({ id: 'm', ...INTERVIEW });
+  const edits = {
+    title: 'Second interview with Acme',
+    company: 'Acme Ltd',
+    dueDate: '2026-10-21',
+    dueTime: '13:30',
+    endTime: '16:00',
+    timeZone: 'America/New_York',
+    meetingUrl: 'https://zoom.us/j/2',
+    jobUrl: 'https://example.com/jobs/2',
+    resume: { ...PDF, id: 'b'.repeat(32) },
+    coverLetter: null,
+  };
+  assert.deepEqual(C.NOTIFY_FIELDS, Object.keys(edits));
+  for (const [field, value] of Object.entries(edits)) {
+    assert.deepEqual(C.notifyChanges(base, { ...base, [field]: value }), [field], field);
+  }
+  // Every detail at once, listed in NOTIFY_FIELDS order.
+  assert.deepEqual(C.notifyChanges(base, { ...base, ...edits }), C.NOTIFY_FIELDS);
+});
+
+test('notifyChanges ignores spaces around text and treats missing as empty', () => {
+  const padded = {
+    ...INTERVIEW,
+    title: '  Interview with Acme \n',
+    company: '\tAcme ',
+    dueDate: ' 2026-10-20',
+    dueTime: '14:00 ',
+    timeZone: ' Europe/London ',
+  };
+  assert.deepEqual(C.notifyChanges(INTERVIEW, padded), []);
+  assert.deepEqual(C.notifyChanges({ endTime: '' }, { endTime: undefined }), []);
+  assert.deepEqual(C.notifyChanges({ endTime: null }, {}), []);
+  assert.deepEqual(C.notifyChanges({ title: '   ' }, { title: '' }), []);
+  // Spaces inside the text, and letter case, still count.
+  assert.deepEqual(C.notifyChanges({ title: 'Acme  interview' }, { title: 'Acme interview' }), ['title']);
+  assert.deepEqual(C.notifyChanges({ company: 'Acme' }, { company: 'ACME' }), ['company']);
+});
+
+test('notifyChanges compares links as cleanUrl sees them', () => {
+  const base = { meetingUrl: 'https://zoom.us/j/1', jobUrl: 'https://example.com/jobs/1' };
+  // Typed or pasted differently, but the same address.
+  assert.deepEqual(C.notifyChanges(base, { meetingUrl: '  zoom.us/j/1 ', jobUrl: 'HTTPS://Example.com/jobs/1' }), []);
+  // A link cleanUrl refuses is no link at all.
+  for (const bad of ['javascript:alert(1)', 'data:text/html,hi', 'not a link', 'http://localhost/x', 42, null]) {
+    assert.deepEqual(C.notifyChanges({ meetingUrl: '' }, { meetingUrl: bad }), [], String(bad));
+    assert.deepEqual(C.notifyChanges({ jobUrl: bad }, {}), [], String(bad));
+  }
+  // So a refused link in place of a real one means the link is gone.
+  assert.deepEqual(C.notifyChanges(base, { ...base, meetingUrl: 'javascript:alert(1)' }), ['meetingUrl']);
+  assert.deepEqual(C.notifyChanges(base, { ...base, jobUrl: 'https://example.com/jobs/1?ref=2' }), ['jobUrl']);
+  assert.deepEqual(C.notifyChanges({}, { jobUrl: 'example.com/jobs/1' }), ['jobUrl']);
+});
+
+test('notifyChanges compares documents by file id only', () => {
+  const base = { resume: PDF, coverLetter: LETTER };
+  // The same file under a new name or size isn't news.
+  const renamed = { resume: { ...PDF, name: 'CV final.pdf', size: 1 }, coverLetter: { id: LETTER.id } };
+  assert.deepEqual(C.notifyChanges(base, renamed), []);
+  assert.deepEqual(C.notifyChanges({ resume: null }, { resume: undefined }), []);
+  // Added, removed or replaced.
+  assert.deepEqual(C.notifyChanges({}, base), ['resume', 'coverLetter']);
+  assert.deepEqual(C.notifyChanges({ ...base, resume: null }, base), ['resume']);
+  assert.deepEqual(C.notifyChanges(base, { ...base, resume: undefined }), ['resume']);
+  assert.deepEqual(C.notifyChanges(base, { ...base, coverLetter: null }), ['coverLetter']);
+  assert.deepEqual(C.notifyChanges(base, { ...base, coverLetter: { ...LETTER, id: 'c'.repeat(32) } }), ['coverLetter']);
+  assert.deepEqual(C.notifyChanges(base, { resume: LETTER, coverLetter: PDF }), ['resume', 'coverLetter']);
+});
+
+test('notifyChanges lists changes in NOTIFY_FIELDS order and copes with a missing version', () => {
+  // Keys in a different order than NOTIFY_FIELDS.
+  const after = { coverLetter: LETTER, jobUrl: 'example.com/jobs/1', title: 'Interview', dueDate: '2026-10-20' };
+  const expected = ['title', 'dueDate', 'jobUrl', 'coverLetter'];
+  assert.deepEqual(C.notifyChanges({}, after), expected);
+  for (const missing of [undefined, null, 'meeting', 42]) {
+    assert.deepEqual(C.notifyChanges(missing, after), expected, String(missing));
+    assert.deepEqual(C.notifyChanges(after, missing), expected, String(missing));
+  }
+  assert.deepEqual(C.notifyChanges(undefined, undefined), []);
+  assert.deepEqual(C.notifyChanges(null, {}), []);
+  // A new meeting lists every detail it has, and nothing it leaves empty.
+  const fresh = meeting({ ...INTERVIEW, endTime: '', timeZone: '', coverLetter: null });
+  assert.deepEqual(
+    C.notifyChanges(undefined, fresh),
+    C.NOTIFY_FIELDS.filter((f) => !['endTime', 'timeZone', 'coverLetter'].includes(f))
+  );
+  // Always a new array, so a caller can't change NOTIFY_FIELDS by accident.
+  const all = C.notifyChanges({}, INTERVIEW);
+  assert.deepEqual(all, C.NOTIFY_FIELDS);
+  assert.notEqual(all, C.NOTIFY_FIELDS);
+});

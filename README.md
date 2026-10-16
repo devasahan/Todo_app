@@ -106,7 +106,84 @@ you approve gets a read-only **Meetings** calendar of your meetings: company, da
 time with the time zone (and their own local time), the meeting link (**Join**), the job description
 link, the resume and cover letter PDFs, notes and prep steps, and **Add to my calendar**.
 They can't see your other plans, and they can't add, change or delete anything; the server refuses
-it, not just the screen. Whatever you change shows up for them within a minute.
+it, not just the screen. Whatever you change shows up for them within a minute, and once you've
+set up email (below) they can also get an email when you add, change or cancel a meeting.
+
+### Email notifications (free, through Gmail)
+
+Dayplan can email the people you've approved when you add, change or cancel a meeting. It costs
+nothing: PythonAnywhere's free plan can send email through Gmail, and Gmail sends up to about 500
+emails a day. Setting it up takes about five minutes.
+
+**1. Make a new Gmail account just for Dayplan**, for example `yourname.dayplan@gmail.com`, at
+[accounts.google.com/signup](https://accounts.google.com/signup). Use a separate account, not your own
+Gmail. The password from step 3 is stored on PythonAnywhere, and with a separate account your own
+mailbox stays safe even if that password ever got out.
+
+**2. Turn on 2-Step Verification** for the new account: open
+[myaccount.google.com/security](https://myaccount.google.com/security) (signed in as the new account)
+and switch on **2-Step Verification**. Google requires it for app passwords.
+
+**3. Create an app password.** Open
+[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords), type a name such as
+`Dayplan` and click **Create**. Google shows a 16-letter password once; keep that page open for the
+next step. **Never send this password to anyone**: don't paste it in a chat, an email or the code.
+It goes only into the console in the next step.
+
+**4. Give it to Dayplan.** In a PythonAnywhere **Bash** console, run:
+
+```bash
+python3 ~/Todo_app/dayplan_api.py setup-email
+```
+
+Type the new Gmail address, then paste the app password. Nothing shows while you paste; that's
+normal. Press Enter, and Enter again to keep `Dayplan` as the sender name. Dayplan sends a test email
+to the new Gmail address. When it says the test was sent, emails are on, and there's nothing to
+reload. If the test fails, nothing is saved, and the message says what went wrong.
+
+The app password is saved in `/home/yourname/dayplan-data/mail.json`, which only your
+PythonAnywhere account can read. It's outside the code, so it never goes to GitHub.
+
+**Sending emails.** The meeting editor has a box at the bottom: **Email approved people about
+this**.
+- It ticks itself for a new meeting, and when you change the date, time, time zone, company, title,
+  links or documents.
+- It stays unticked when you only change notes, steps, tags or priority.
+- You can tick or untick it yourself before saving. Ticking it on a meeting you didn't change
+  sends the details again.
+- To tell people a meeting is cancelled, tick the box, then press **Delete**.
+- After you drag a meeting to another day on the calendar, the message at the bottom of the
+  screen offers **Email people**.
+
+Each email:
+- says whether the meeting is new, changed (with what was there before), cancelled or back on;
+- gives the time in the meeting's time zone and in the reader's own time zone;
+- has the meeting link, the job description link and a calendar file to add it to their
+  calendar;
+- doesn't include your notes or steps.
+
+**People can turn these emails off** in their account menu: **Email me about meeting changes**.
+**Manage users** shows *Emails off* next to anyone who has turned them off, and the top of that
+dialog says whether email is set up.
+
+**Limits.** Dayplan sends at most 400 emails a day and 30 rounds of emails an hour, staying below
+Gmail's limit, so the Gmail account can't be blocked by mistake.
+
+**If an email doesn't arrive:**
+- *Gmail didn't accept the sign-in* (error 535): the app password is wrong, or was removed.
+  Changing the Gmail account's password removes app passwords. Create a new app password and run
+  `setup-email` again.
+- *Couldn't reach Gmail*: now and then Google changes its server addresses and PythonAnywhere's
+  free plan can't reach them for a while. Try again later.
+- It's in spam: ask people to mark the first email as *Not spam*, or add the address to their
+  contacts.
+
+Other email commands:
+
+```bash
+python3 ~/Todo_app/dayplan_api.py test-email friend@example.com   # send a test email
+python3 ~/Todo_app/dayplan_api.py email-off                       # stop emails, delete the saved password
+```
 
 **If you see "Something went wrong".** On the **Web** tab, open the **error log** link in the
 **Log files** section. The last lines say what failed. A misspelled username in step 4 is the most
@@ -130,7 +207,7 @@ version.
 Updating never touches your plans: they're stored outside the code, in
 `/home/yourname/dayplan-data/`.
 
-**Forgot a password?** The app can't send emails, so passwords are reset from a Bash console. Run
+**Forgot a password?** Passwords aren't reset by email: they're reset from a Bash console. Run
 the line below, type a new password twice, and sign in with it (or give it to the person who
 forgot theirs). This also signs that account out on every other device.
 
@@ -301,6 +378,8 @@ How it's protected:
   meetings (a fixed list of meeting fields), never other plans or anyone else's data.
 - New accounts can't sign in until the admin approves them, and at most 50 requests can wait at
   once, so strangers can't fill up the database.
+- Only the admin can send meeting emails, each person gets their own copy (nobody sees who else
+  got it), and the Gmail app password is kept in `dayplan-data`, never in the code or the page.
 
 ## Project layout
 
@@ -312,7 +391,8 @@ js/core.js          Pure logic: plan model, quick-add parser, deadlines, sorting
 js/app.js           UI: rendering, drag & drop, editor, storage, sign-in and sync
 dayplan_wsgi.py     Serves the app on PythonAnywhere (only index.html, css/ and js/)
 dayplan_api.py      Accounts and plan sync (/api/...), stored in SQLite; also a small CLI
-tests/              Unit tests for js/core.js, dayplan_wsgi.py and dayplan_api.py
+dayplan_mail.py     Meeting emails: writes them and sends them through Gmail
+tests/              Unit tests for js/core.js and the Python files
 ```
 
 `js/core.js` doesn't touch the page at all, so all the rules (date parsing, what counts as
@@ -320,7 +400,7 @@ overdue, streaks and so on) are covered by fast unit tests:
 
 ```bash
 npm test               # app logic, with Node's built-in test runner (Node 18+)
-npm run test:server    # dayplan_wsgi.py and dayplan_api.py, with Python's unittest (Python 3.8+)
+npm run test:server    # the Python files, with Python's unittest (Python 3.8+)
 ```
 
 No dependencies need to be installed: the server side uses only Python's standard library.

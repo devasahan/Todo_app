@@ -120,6 +120,10 @@
                 <button type="button" role="menuitem" data-account="admin" id="admin-item" hidden>
                   Manage users <span class="menu-count" id="admin-count" hidden></span>
                 </button>
+                <button type="button" role="menuitemcheckbox" aria-checked="true" data-account="email-me" id="email-me" hidden>
+                  <span class="menu-check" aria-hidden="true"></span>
+                  Email me about meeting changes
+                </button>
                 <button type="button" role="menuitem" data-account="sync">Sync now</button>
                 <button type="button" role="menuitem" data-account="sign-out">Sign out</button>
               </div>
@@ -364,6 +368,15 @@
           <p class="meta" id="editor-meta"></p>
         </div>
 
+        <!-- Admin only: email the people who can view the schedule about this meeting. -->
+        <div class="notify-bar" id="notify-row" hidden>
+          <label class="check-row">
+            <input type="checkbox" id="notify-people" aria-describedby="notify-hint" />
+            <span>Email approved people about this</span>
+          </label>
+          <span class="field-hint" id="notify-hint"></span>
+        </div>
+
         <footer class="modal-foot">
           <button type="button" class="btn danger" id="editor-delete">Delete</button>
           <span class="spacer"></span>
@@ -408,6 +421,7 @@
             <span class="muted">Anyone can ask for an account. Nobody can sign in until you approve them.</span>
           </span>
         </label>
+        <p class="mail-status" id="admin-mail" hidden></p>
         <p class="field-error" id="admin-error" role="alert" hidden></p>
         <ul class="user-list" id="admin-users" aria-live="polite"></ul>
         <p class="hint">
@@ -440,6 +454,7 @@
     <div id="toast" class="toast" role="status" aria-live="polite" popover="manual" hidden>
       <span id="toast-text"></span>
       <button type="button" id="toast-action" class="toast-action" hidden></button>
+      <button type="button" id="toast-action-2" class="toast-action" hidden></button>
     </div>
     <canvas id="confetti" class="confetti" aria-hidden="true"></canvas>
 
