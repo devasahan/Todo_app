@@ -1914,13 +1914,13 @@ class CommandLineEmail(ApiTestCase):
         self.gmail.login_error = smtplib.SMTPServerDisconnected('Connection unexpectedly closed ' + APP_PASSWORD)
         code, out, err = self.run_main('setup-email', inputs=[SENDER, ''])  # run_main checks the password isn't shown
         self.assertEqual(code, 1)
-        self.assertIn('security alert from Google', err)
-        self.assertIn('What the email server said: SMTPServerDisconnected: Connection unexpectedly closed [password]', err)
+        self.assertIn('closed the connection while Dayplan was signing in', err)
+        self.assertIn('Details: SMTPServerDisconnected (the rest is left out: it repeated the password)', err)
         self.assertIn('Nothing was saved', err)
         self.gmail.login_error = smtplib.SMTPNotSupportedError('SMTP AUTH extension not supported by server.')
         code, out, err = self.run_main('setup-email', inputs=[SENDER, ''])
         self.assertIn('did not offer a way to sign in', err)
-        self.assertIn('What the email server said: SMTPNotSupportedError: SMTP AUTH extension not supported by server.', err)
+        self.assertIn('Details: SMTPNotSupportedError: SMTP AUTH extension not supported by server.', err)
         self.assertFalse(dayplan_api.mail_config_path().exists())
 
     def test_setup_email_refuses_bad_answers(self):
@@ -1952,7 +1952,7 @@ class CommandLineEmail(ApiTestCase):
         code, out, err = self.run_main('test-email', 'friend@example.com')
         self.assertEqual(code, 1)
         self.assertIn('app password', err)
-        self.assertIn('What the email server said: SMTPAuthenticationError: 535 5.7.8', err)
+        self.assertIn('Details: SMTPAuthenticationError: 535 5.7.8', err)
 
         code, out, err = self.run_main('email-off')
         self.assertEqual(code, 0)

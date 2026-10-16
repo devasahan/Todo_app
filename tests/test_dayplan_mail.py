@@ -1057,6 +1057,7 @@ class Send(unittest.TestCase):
         """A MailError that never mentions the password, nor where it came from."""
         self.assertNotIn(PASSWORD, str(error))
         self.assertIsNone(error.__cause__)
+        self.assertIsNone(error.__context__)  # smtplib's error, whose words could hold the password, isn't kept
         self.assertTrue(error.__suppress_context__)
 
     def test_sends_one_email_per_recipient(self):
@@ -1145,10 +1146,18 @@ class Send(unittest.TestCase):
             self.assertNotIn('login', [entry[0] for entry in log])  # the password is never sent unencrypted
 
     def test_other_sign_in_problems(self):
+        timed_out = smtplib.SMTPServerDisconnected('Connection unexpectedly closed: timed out')
+        timed_out.__context__ = socket.timeout('timed out')  # how smtplib reports a reply that never came
         for error, words, retry in (
-            (smtplib.SMTPServerDisconnected('Connection unexpectedly closed'), 'security alert from Google', True),
-            (smtplib.SMTPNotSupportedError('SMTP AUTH extension not supported by server.'), 'did not offer a way to sign in', True),
-            (smtplib.SMTPException('No suitable authentication method found.'), 'did not offer a way to sign in', True),
+            (smtplib.SMTPServerDisconnected('Connection unexpectedly closed'), 'closed the connection while', True),
+            (timed_out, 'did not answer in time', True),
+            (smtplib.SMTPAuthenticationError(454, b'4.7.0 Too many login attempts, please try again later.'),
+             'not taking sign-ins just now', True),
+            (smtplib.SMTPAuthenticationError(534, b'5.7.14 <https://accounts.google.com/signin/continue?x> Please log in'),
+             'Google blocked the sign-in from this server', False),
+            (smtplib.SMTPNotSupportedError('SMTP AUTH extension not supported by server.'), 'smtp.gmail.com, port 587', False),
+            (smtplib.SMTPException('No suitable authentication method found.'), 'smtp.gmail.com, port 587', False),
+            (smtplib.SMTPException("Server AUTH mechanism infinite loop. Last response: (334, b'x')"), 'Could not sign in', True),
             (UnicodeEncodeError('ascii', PASSWORD + 'é', 16, 17, 'ordinal not in range(128)'), 'setup-email', False),
         ):
             fake, log = fake_smtp(login=error)
@@ -1179,22 +1188,56 @@ class Send(unittest.TestCase):
             self.assertNotIn(detail.split(': ', 1)[-1], str(caught.exception))  # the message stays plain English
 
     def test_details_never_hold_the_password(self):
-        # A server that repeats what it was sent: the password as typed, in
-        # capitals, and base64 (alone, and in the PLAIN sign-in string).
+        # A server that repeats what it was sent, in every form it could: the
+        # reply text is then left out, keeping only the type and code.
         alone = base64.b64encode(PASSWORD.encode()).decode()
         plain = base64.b64encode('\0{}\0{}'.format(CONFIG['username'], PASSWORD).encode()).decode()
-        reply = '5.7.8 Not accepted: {} {} {} {}'.format(PASSWORD, PASSWORD.upper(), alone, plain).encode()
-        for step, error in (('login', smtplib.SMTPAuthenticationError(535, reply)),
-                            ('login', smtplib.SMTPServerDisconnected(reply.decode())),
-                            ('starttls', ssl.SSLError(reply.decode()))):
-            fake, log = fake_smtp(**{step: error})
-            with self.assertRaises(MailError) as caught:
-                self.send(fake)
-            detail = caught.exception.detail
-            for secret in (PASSWORD, alone, plain):
-                self.assertNotIn(secret.lower(), detail.lower())
-            self.assertIn('[password]', detail)
-            self.assertLessEqual(len(detail), 300)
+        echoes = [
+            PASSWORD, PASSWORD.upper(), alone, plain, alone.rstrip('='), plain.rstrip('='),
+            alone[:12] + ' 5.7.8 ' + alone[12:],  # split over two reply lines
+            plain[36:],  # the tail of the sign-in: most of the password
+            ' '.join(PASSWORD),  # spaced out
+            PASSWORD[2:12],  # a piece of it
+            base64.b64encode(('x' + PASSWORD).encode()).decode(),  # encoded by the server, starting elsewhere
+        ]
+        for echo in echoes:
+            for step, error in (('login', smtplib.SMTPAuthenticationError(535, ('5.7.8 Not accepted: ' + echo).encode())),
+                                ('login', smtplib.SMTPServerDisconnected('Connection closed ' + echo)),
+                                ('starttls', ssl.SSLError(1, 'failed ' + echo))):
+                fake, log = fake_smtp(**{step: error})
+                with self.assertRaises(MailError) as caught:
+                    self.send(fake)
+                detail = caught.exception.detail
+                self.assertIn('the rest is left out: it repeated the password', detail, echo)
+                self.assertNotIn(echo.lower()[:8], detail.lower())
+        # Without any of it, the reply is kept.
+        fake, log = fake_smtp(login=smtplib.SMTPAuthenticationError(535, b'5.7.8 Username and Password not accepted.'))
+        with self.assertRaises(MailError) as caught:
+            self.send(fake)
+        self.assertEqual(caught.exception.detail, 'SMTPAuthenticationError: 535 5.7.8 Username and Password not accepted.')
+
+    def test_details_with_odd_passwords(self):
+        # Escaped in a repr (a backslash, quotes, a tab), spaces at the ends
+        # (smtplib strips them from a reply), letters outside ASCII.
+        for password in ('pa\\ss\\word', 'it\'s "quoted" ok', 'tab\there now', 'trailing  '):
+            config = dict(CONFIG, password=password)
+            for reply in (repr(password.encode()), repr(password), password.strip()):
+                text = '4.7.0 ' + reply
+                for error in (smtplib.SMTPAuthenticationError(535, text.encode()),
+                              smtplib.SMTPException('Server AUTH mechanism infinite loop. Last response: ' + repr((334, text.encode())))):
+                    detail = dayplan_mail._detail(error, config)
+                    self.assertIn('it repeated the password', detail, (password, reply))
+        error = UnicodeEncodeError('ascii', '\0planner@gmail.com\0Pässwort1', 20, 21, 'ordinal not in range(128)')
+        self.assertEqual(dayplan_mail._detail(error, dict(CONFIG, password='Pässwort1')), 'UnicodeEncodeError')
+
+    def test_a_refused_recipient_detail_uses_that_reply(self):
+        # Its text is a repr of every reply, with escapes; only the one reply is used.
+        config = dict(CONFIG, password='pa\\ss')
+        error = smtplib.SMTPRecipientsRefused({'friend@example.com': (421, b'4.7.0 pa\\ss try later')})
+        failure = dayplan_mail._with_detail(dayplan_mail.MailError('x'), error, config, 421, b'4.7.0 pa\\ss try later')
+        self.assertEqual(failure.detail, 'SMTPRecipientsRefused 421 (the rest is left out: it repeated the password)')
+        failure = dayplan_mail._with_detail(dayplan_mail.MailError('x'), error, CONFIG, 421, b'4.7.0 Try again later')
+        self.assertEqual(failure.detail, 'SMTPRecipientsRefused: 421 4.7.0 Try again later')
 
     def test_nothing_to_send(self):
         fake, log = fake_smtp(connect=AssertionError('should not connect'))
@@ -1333,8 +1376,8 @@ class Send(unittest.TestCase):
         self.assertTrue(caught.exception.retry)
         self.assertQuiet(caught.exception)
         self.assertNotIn('not allowed', str(caught.exception))
-        # The server's words are in the detail, without the password.
-        self.assertIn('553 5.7.1 Sender [password] not allowed', caught.exception.detail)
+        # It repeated the password, so only the type and code are kept.
+        self.assertEqual(caught.exception.detail, 'SMTPSenderRefused 553 (the rest is left out: it repeated the password)')
 
     def test_one_refused_recipient_or_message(self):
         for step, reply in (('rcpt', (550, b'5.1.1 The email account that you tried to reach does not exist.')),

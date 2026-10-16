@@ -1004,41 +1004,84 @@ def test_message(config, recipient, site_url=''):
 
 # ------------------------------------------------------------------- sending
 
-def _detail(error, config):
-    """What went wrong in the server's (or Python's) own words, on one line:
-    the error's type, then the reply code and text, e.g. "SMTPAuthenticationError:
-    535 5.7.8 Username and Password not accepted". For the admin's console and
-    the error log only. The password is taken out, as typed and as smtplib
-    sends it (base64, alone or in the "\0user\0password" sign-in), in case a
-    server repeats what it was sent."""
-    code = getattr(error, 'smtp_code', None)
-    reply = getattr(error, 'smtp_error', None)
+def _repeats_password(text, config):
+    """True when `text` holds the password, or a piece of it, in any form a
+    server could repeat it in: as typed (any case, spaces dropped, escaped in
+    a Python repr) or as smtplib sends it, in base64, alone or inside the
+    "\0user\0password" sign-in, whole or in part."""
+    password = str(config.get('password') or '')
+    if not password:
+        return False
+    username = str(config.get('username') or '')
+    # Also compared without backslashes, quotes and spaces, so escaping (even
+    # twice, a repr inside a repr) or spacing can't hide it.
+    def bare(value):
+        return re.sub(r'[\\\s\'"]', '', value).lower()
+
+    seen = (text.lower(), ''.join(text.split()).lower(), bare(text))
+    forms = set()
+    for value in (password, password.strip(), ''.join(password.split())):
+        if value:
+            forms.update((value, repr(value)[1:-1], repr(value.encode('utf-8'))[2:-1]))
+    forms.update({bare(form) for form in forms} - {''})
+    if any(form.lower() in here for form in forms for here in seen):
+        return True
+    # Any 8 characters of it in a row (a 16-letter app password won't match by chance).
+    lowered = password.lower()
+    if len(lowered) >= 8 and any(lowered[i:i + 8] in here for i in range(len(lowered) - 7) for here in seen):
+        return True
+    encoded = [
+        base64.b64encode(value.encode('utf-8')).decode('ascii').rstrip('=')
+        for value in (password, '\0{}\0{}'.format(username, password))
+    ]
+    if any(whole in text for whole in encoded if len(whole) >= 4):  # however short the password
+        return True
+    size = min(6, len(lowered))
+    pieces = {lowered[i:i + size] for i in range(len(lowered) - size + 1)}
+    for token in re.findall(r'[A-Za-z0-9+/]{8,}', text):
+        if any(token in whole for whole in encoded):
+            return True
+        # Base64 the server made itself, starting anywhere: decode and look inside.
+        for skip in range(4):
+            chunk = token[skip:]
+            chunk = chunk[:len(chunk) // 4 * 4]
+            if len(chunk) < 8:
+                break
+            try:
+                decoded = base64.b64decode(chunk, validate=True).decode('utf-8', 'ignore').lower()
+            except ValueError:
+                continue
+            if any(piece in decoded for piece in pieces):
+                return True
+    return False
+
+
+def _detail(error, config, code=None, reply=None):
+    """What went wrong in the error's own words, on one line: its type, then
+    the server's reply code and text, e.g. "SMTPAuthenticationError: 535 5.7.8
+    Username and Password not accepted" (or the reply given as code and
+    reply). For the admin's console and the error log only. If the words hold
+    the password in any form (see _repeats_password), only the type and code
+    are kept, so nothing of it can be read or worked out."""
+    name = type(error).__name__
+    if isinstance(error, UnicodeError):
+        return name  # its message would quote a character of the password
+    if code is None and reply is None:
+        code = getattr(error, 'smtp_code', None)
+        reply = getattr(error, 'smtp_error', None)
     if reply is None:
         text = str(error)
     elif isinstance(reply, bytes):
         text = reply.decode('utf-8', 'replace')
     else:
         text = str(reply)
-    if isinstance(code, int) and code > 0:
-        text = '{} {}'.format(code, text)
-    text = '{}: {}'.format(type(error).__name__, text) if text.strip() else type(error).__name__
-    username = str(config.get('username') or '')
-    password = str(config.get('password') or '')
-    if password:
-        hidden = []
-        for value in (password, '\0{}\0{}'.format(username, password)):
-            try:
-                hidden.append(base64.b64encode(value.encode('utf-8')).decode('ascii'))
-            except UnicodeError:
-                pass
-        hidden.append(password)
-        for secret in sorted(hidden, key=len, reverse=True):
-            text = re.sub(re.escape(secret), '[password]', text, flags=re.IGNORECASE)
-    text = _one_line(text, 300)
-    # Collapsing spaces can't rebuild the password, but check once more.
-    if password and password.lower() in text.lower():
-        text = type(error).__name__
-    return text
+    head = '{} {}'.format(name, code) if isinstance(code, int) and code > 0 else name
+    if _repeats_password(text, config):
+        return "{} (the rest is left out: it repeated the password)".format(head)
+    words = _one_line(text, 280)
+    if not words:
+        return head
+    return '{}: {}'.format(name, '{} {}'.format(code, words) if head != name else words)
 
 
 def _failure(stage, error, config):
@@ -1050,10 +1093,34 @@ def _failure(stage, error, config):
     return failure
 
 
+def _timed_out(error):
+    """smtplib reports a timeout while waiting for a reply as "Connection
+    unexpectedly closed: timed out", with the timeout as its context."""
+    timeouts = (socket.timeout, TimeoutError)
+    return isinstance(error, timeouts) or isinstance(error.__context__, timeouts) or (
+        isinstance(error, smtplib.SMTPServerDisconnected) and 'timed out' in str(error)
+    )
+
+
 def _failure_message(stage, error, config):
     host = _one_line(str(config.get('host') or DEFAULT_HOST), 100)
     port = config.get('port') or DEFAULT_PORT
     if isinstance(error, smtplib.SMTPAuthenticationError):
+        code = error.smtp_code if isinstance(error.smtp_code, int) else 0
+        reply = error.smtp_error if isinstance(error.smtp_error, bytes) else str(error.smtp_error).encode('utf-8', 'replace')
+        if 400 <= code < 500:  # e.g. 454 "Too many login attempts": temporary
+            return MailError(
+                '{} is not taking sign-ins just now (for example after too many attempts). '
+                'Please try again in a few minutes.'.format(host)
+            )
+        if b'5.7.14' in reply:  # Google wants this sign-in confirmed first
+            return MailError(
+                'Google blocked the sign-in from this server. Sign in to that Gmail account in a web browser, '
+                'look for a security alert from Google and confirm that it was you, then run {} again.'.format(
+                    SETUP_COMMAND
+                ),
+                retry=False,
+            )
         return MailError(
             '{} did not accept the email address and password. Dayplan needs a Gmail app password, '
             'not the normal Gmail password: turn on 2-Step Verification for the Google account, create an '
@@ -1061,7 +1128,7 @@ def _failure_message(stage, error, config):
             'console to save it.'.format(host, SETUP_COMMAND),
             retry=False,
         )
-    if isinstance(error, (socket.timeout, TimeoutError)):
+    if _timed_out(error):
         return MailError('The email server {} did not answer in time. Please try again in a few minutes.'.format(host))
     if stage == 'connect':
         return MailError(
@@ -1081,16 +1148,17 @@ def _failure_message(stage, error, config):
                 retry=False,
             )
         if isinstance(error, smtplib.SMTPServerDisconnected):
-            # What Google tends to do with a sign-in from a place it doesn't know yet.
             return MailError(
-                '{} closed the connection while Dayplan was signing in. Google sometimes blocks a sign-in '
-                'from a new place: look in that Gmail inbox for a security alert from Google, confirm that '
-                'it was you, then run {} again.'.format(host, SETUP_COMMAND)
+                '{} closed the connection while Dayplan was signing in. Please try again in a few minutes. '
+                'If it keeps happening, look in that Gmail inbox for a security alert from Google and confirm '
+                'that it was you.'.format(host)
             )
-        if isinstance(error, smtplib.SMTPNotSupportedError) or type(error) is smtplib.SMTPException:
-            # No AUTH offered, or no sign-in method smtplib knows.
+        if isinstance(error, smtplib.SMTPNotSupportedError) or str(error).startswith('No suitable authentication'):
+            # A server that isn't Gmail's, or the wrong port: trying again won't help.
             return MailError(
-                '{} did not offer a way to sign in on this connection. Please try again in a few minutes.'.format(host)
+                '{} did not offer a way to sign in. The email server should be smtp.gmail.com, port 587: '
+                'run {} again.'.format(host, SETUP_COMMAND),
+                retry=False,
             )
         return MailError('Could not sign in to the email server {}. Run {} to check the settings.'.format(
             host, SETUP_COMMAND
@@ -1121,10 +1189,10 @@ def _refused(code, reply, config):
     return None
 
 
-def _with_detail(failure, error, config):
+def _with_detail(failure, error, config, code=None, reply=None):
     """`failure` (a MailError, or None) with the server's own words as its detail."""
     if failure is not None:
-        failure.detail = _detail(error, config)
+        failure.detail = _detail(error, config, code, reply)
     return failure
 
 
@@ -1166,6 +1234,7 @@ def send(config, messages, timeout=20):
         raise MailError(NOT_SET_UP, retry=False)
     stage = 'connect'
     stopped = None  # the MailError that stopped the batch, when the rest couldn't go
+    failure = None  # the MailError when nothing could be sent at all
     finished = False
     try:
         with smtplib.SMTP(config['host'], config['port'], timeout=timeout) as smtp:
@@ -1186,7 +1255,8 @@ def send(config, messages, timeout=20):
                 except smtplib.SMTPRecipientsRefused as error:
                     # Usually about this address; a 421 or the sending limit is about the account.
                     for code, reply in getattr(error, 'recipients', {}).values():
-                        stopped = stopped or _with_detail(_refused(code, reply, config), error, config)
+                        # The reply itself, not the error's text: that is a repr of every reply.
+                        stopped = stopped or _with_detail(_refused(code, reply, config), error, config, code, reply)
                 except smtplib.SMTPSenderRefused as error:
                     # The server won't send anything from this account just now.
                     stopped = _with_detail(_refused(error.smtp_code, error.smtp_error, config) or MailError(
@@ -1213,8 +1283,12 @@ def send(config, messages, timeout=20):
             finished = True
     except (OSError, ValueError) as error:  # socket, TLS and smtplib errors are all OSErrors
         if not finished:
-            raise _failure(stage, error, config) from None
-        # Everything was handed over; only saying goodbye failed.
+            failure = _failure(stage, error, config)
+        # Otherwise everything was handed over; only saying goodbye failed.
+    if failure is not None:
+        # Raised out here so it carries no trace of smtplib's error, whose
+        # words could hold the password (see _detail).
+        raise failure from None
     if stopped is not None and not result['sent']:
         # Raised out here, after the connection is closed: closing a
         # connection the server already dropped must not hide why.

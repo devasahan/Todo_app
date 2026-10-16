@@ -1289,11 +1289,12 @@ def log_mail_error(err):
 
 
 def print_mail_error(err):
-    """For the console commands: the plain message, then what the server said."""
+    """For the console commands: the plain message, then the error in its own
+    words (what the email server said, say), which never hold the password."""
     print(err, file=sys.stderr)
     detail = getattr(err, 'detail', '')
     if detail:
-        print('What the email server said: {}'.format(detail), file=sys.stderr)
+        print('Details: {}'.format(detail), file=sys.stderr)
 
 
 def api_account(conn, environ, body):
