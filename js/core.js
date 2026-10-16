@@ -1229,11 +1229,16 @@
 
   // The details approved people would be told about, in NOTIFY_FIELDS order, that
   // differ between two versions of a meeting. A missing `before` counts as
-  // a meeting with nothing filled in.
+  // a meeting with nothing filled in. The time zone only matters once the
+  // meeting has a time: for a date alone it changes nothing people see.
+  // (dayplan_mail.changed_fields follows the same rules.)
   function notifyChanges(before, after) {
     const a = before && typeof before === 'object' ? before : {};
     const b = after && typeof after === 'object' ? after : {};
-    return NOTIFY_FIELDS.filter((field) => notifyValue(field, a[field]) !== notifyValue(field, b[field]));
+    const timed = Boolean(notifyValue('dueTime', a.dueTime) || notifyValue('dueTime', b.dueTime));
+    return NOTIFY_FIELDS.filter(
+      (field) => (field !== 'timeZone' || timed) && notifyValue(field, a[field]) !== notifyValue(field, b[field])
+    );
   }
 
   /* ------------------------------------------------------------------ sync */

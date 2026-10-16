@@ -1,13 +1,17 @@
 """Tests for dayplan_mail.py. Run with: python3 -m unittest discover -s tests"""
 import email
+import email.errors
 import email.policy
 import json
 import os
+import random
 import re
+import shutil
 import smtplib
 import socket
 import ssl
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -89,6 +93,80 @@ def unfolded(ics):
 def parsed(msg):
     """The email as a mail server would read it."""
     return email.message_from_bytes(msg.as_bytes(policy=email.policy.SMTP), policy=email.policy.default)
+
+
+class ScriptedSMTP(smtplib.SMTP):
+    """The real smtplib.SMTP, so send_message, sendmail and their handling of
+    each reply run just as they do with Gmail, with the network replaced by
+    scripted replies. replies: {'mail' | 'rcpt' | 'data': {n: reply}} for the
+    n-th email (from 0), where a reply is (code, text) or an exception to
+    raise; anything not scripted is 250 OK."""
+
+    def __init__(self, replies=None):
+        super().__init__()  # no host, so it doesn't connect
+        self.replies = replies or {}
+        self.envelopes = []  # [sender, [recipients]] for each email begun
+        self.delivered = []  # ([recipients], the email as written) for each email taken
+        self.closed = False
+
+    def ehlo(self, name=''):
+        self.ehlo_resp = b'smtp.test'
+        self.does_esmtp = True
+        self.esmtp_features = {'smtputf8': '', '8bitmime': ''}
+        return 250, b'smtp.test'
+
+    def starttls(self, *args, **kwargs):
+        return 220, b'2.0.0 Ready to start TLS'
+
+    def login(self, user, password, **kwargs):
+        return 235, b'2.7.0 Accepted'
+
+    def _reply(self, step):
+        reply = self.replies.get(step, {}).get(len(self.envelopes) - 1, (250, b'2.0.0 OK'))
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+    def mail(self, sender, options=()):
+        self.envelopes.append([sender, []])
+        return self._reply('mail')
+
+    def rcpt(self, recipient, options=()):
+        self.envelopes[-1][1].append(recipient)
+        return self._reply('rcpt')
+
+    def data(self, msg):
+        reply = self._reply('data')
+        if reply[0] == 250:
+            self.delivered.append((list(self.envelopes[-1][1]), msg))
+        return reply
+
+    def rset(self):
+        return 250, b'2.1.5 Flushed'
+
+    def close(self):
+        self.closed = True
+        super().close()
+
+
+def scripted(replies=None):
+    """A stand-in for smtplib.SMTP that makes ScriptedSMTP connections, and the list of them."""
+    servers = []
+
+    def connect(host, port, timeout=None):
+        servers.append(ScriptedSMTP(replies))
+        return servers[-1]
+
+    return connect, servers
+
+
+def written(msg):
+    """(envelope recipients, the email read back) as smtplib would send `msg` to its checked address."""
+    server = ScriptedSMTP()
+    server.ehlo()
+    server.send_message(msg, to_addrs=[dayplan_mail._header_address(msg)])
+    recipients, raw = server.delivered[0]
+    return recipients, email.message_from_string(raw.decode('utf-8'), policy=email.policy.default)
 
 
 # ------------------------------------------------------------------ settings
@@ -193,8 +271,107 @@ class TimeZones(unittest.TestCase):
         with mock.patch.object(dayplan_mail, 'ZoneInfo', None):
             self.assertTrue(dayplan_mail.valid_zone('America/New_York'))
             self.assertTrue(dayplan_mail.valid_zone('UTC'))
+            self.assertTrue(dayplan_mail.valid_zone('Asia/Calcutta'))
             for name in ('', 'bad zone', '../x', '/UTC', 'A' * 65, 'x/y', 'UTC\n'):
                 self.assertFalse(dayplan_mail.valid_zone(name), name)
+
+    # The old names Chrome, Edge and Node report (Intl.supportedValuesOf('timeZone')
+    # with ICU 74-77) that a server without the tz "backward" links can't load.
+    BROWSER_OLD_NAMES = (
+        'Africa/Asmera', 'America/Buenos_Aires', 'America/Catamarca', 'America/Cordoba', 'America/Godthab',
+        'America/Indianapolis', 'America/Jujuy', 'America/Louisville', 'America/Mendoza', 'Asia/Calcutta',
+        'Asia/Katmandu', 'Asia/Rangoon', 'Asia/Saigon', 'Atlantic/Faeroe', 'Europe/Kiev', 'Pacific/Enderbury',
+        'Pacific/Ponape', 'Pacific/Truk',
+    )
+
+    def test_every_old_browser_name_has_a_current_one(self):
+        for name in self.BROWSER_OLD_NAMES:
+            self.assertIn(name, dayplan_mail.ZONE_ALIASES, name)
+        for old, new in dayplan_mail.ZONE_ALIASES.items():
+            self.assertNotEqual(old, new)
+            self.assertTrue(dayplan_mail.ZONE_RE.fullmatch(old) and dayplan_mail.ZONE_RE.fullmatch(new), old)
+
+    @needs_zones
+    def test_old_names_browsers_use(self):
+        moments = [datetime(2026, month, 15, 12, tzinfo=timezone.utc) for month in (1, 4, 7, 10)]
+        for old, new in dayplan_mail.ZONE_ALIASES.items():
+            self.assertTrue(dayplan_mail.valid_zone(old), old)
+            self.assertTrue(dayplan_mail.valid_zone(new), new)
+            try:
+                current = dayplan_mail.ZoneInfo(new)
+            except KeyError:  # time zone data older than the current name
+                continue
+            for moment in moments:  # the old name shows the same clocks as the current one
+                self.assertEqual(
+                    moment.astimezone(dayplan_mail._tz(old)).utcoffset(), moment.astimezone(current).utcoffset(), old,
+                )
+
+    @needs_zones
+    def test_old_names_on_a_server_without_them(self):
+        from zoneinfo import ZoneInfoNotFoundError
+        real = dayplan_mail.ZoneInfo
+
+        def without_old_names(name):
+            if name in dayplan_mail.ZONE_ALIASES:
+                raise ZoneInfoNotFoundError(name)
+            return real(name)
+
+        with mock.patch.object(dayplan_mail, 'ZoneInfo', without_old_names):
+            for old, new in dayplan_mail.ZONE_ALIASES.items():
+                self.assertTrue(dayplan_mail.valid_zone(old), old)
+                self.assertEqual(dayplan_mail._tz(old).key, new, old)
+            self.assertFalse(dayplan_mail.valid_zone('Mars/Base'))
+            msg = compose(meeting(timeZone='Asia/Calcutta', dueTime='10:00', endTime='11:00'), recipient_zone='Europe/Kiev')
+            text = plain(msg)
+            self.assertIn('When: Thu, Oct 22, 2026, 10:00 – 11:00 AM IST (Kolkata time)\n', text)
+            self.assertIn('Your time: Thu, Oct 22, 7:30 – 8:30 AM EEST\n', text)
+            self.assertIn('DTSTART:20261022T043000Z', unfolded(ics_of(msg)))
+
+    @needs_zones
+    def test_current_names_on_a_server_with_older_data(self):
+        from zoneinfo import ZoneInfoNotFoundError
+        real = dayplan_mail.ZoneInfo
+        current = set(dayplan_mail.ZONE_ALIASES.values())
+
+        def only_old_names(name):
+            if name in current:
+                raise ZoneInfoNotFoundError(name)
+            # Stands in for the old name's own file, which this machine may not have.
+            return real(dayplan_mail.ZONE_ALIASES.get(name, name))
+
+        with mock.patch.object(dayplan_mail, 'ZoneInfo', only_old_names):
+            for new in current:
+                self.assertTrue(dayplan_mail.valid_zone(new), new)
+            self.assertIn('(Kyiv time)', plain(compose(meeting(timeZone='Europe/Kyiv'))))
+
+    @needs_zones
+    @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
+    def test_every_zone_a_browser_lists(self):
+        try:
+            out = subprocess.run(
+                ['node', '-e', "console.log(Intl.supportedValuesOf('timeZone').join(' '))"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest('Node.js did not run')
+        names = out.stdout.split()
+        if out.returncode or not names:
+            self.skipTest('this Node.js cannot list its time zones')
+        self.assertEqual([name for name in names if not dayplan_mail.valid_zone(name)], [])
+
+    @needs_zones
+    def test_emails_in_old_zones(self):
+        msg = compose(meeting(timeZone='Asia/Calcutta', dueTime='10:00', endTime='11:00'), recipient_zone='Europe/Kiev')
+        text = plain(msg)
+        self.assertIn('When: Thu, Oct 22, 2026, 10:00 – 11:00 AM IST (Kolkata time)\n', text)
+        self.assertIn('Your time: Thu, Oct 22, 7:30 – 8:30 AM EEST\n', text)
+        self.assertEqual(msg['Subject'], 'New meeting: Acme · Thu, Oct 22, 10:00 AM IST')
+        self.assertIn('DTSTART:20261022T043000Z', unfolded(ics_of(msg)))
+        self.assertIn('(Buenos Aires time)', plain(compose(meeting(timeZone='America/Buenos_Aires'))))
+        self.assertIn('(Indianapolis time)', plain(compose(meeting(timeZone='America/Indianapolis'))))
+        # The city as the app's time zone menu shows it (RENAMED_CITIES in js/core.js).
+        self.assertEqual(dayplan_mail._city('Asia/Saigon'), 'Ho Chi Minh')
+        self.assertEqual(dayplan_mail._city('Pacific/Truk'), 'Truk')
 
 
 # ----------------------------------------------------------------- snapshots
@@ -237,6 +414,22 @@ class Snapshots(unittest.TestCase):
         )
         self.assertEqual(dayplan_mail.changed_fields(before, same), [])
         self.assertEqual(dayplan_mail.changed_fields(dayplan_mail.snapshot(before), same), [])
+
+    def test_time_zone_of_a_date_only_meeting(self):
+        # As notifyChanges in js/core.js: the zone counts only when dueTime is set on either side.
+        before = meeting(dueTime='', endTime='', timeZone='America/New_York')
+        for zone in ('Europe/Paris', '', 'Not/A_Zone'):
+            self.assertEqual(dayplan_mail.changed_fields(before, meeting(dueTime='', endTime='', timeZone=zone)), [])
+        self.assertEqual(dayplan_mail.changed_fields(before, meeting(dueTime='  ', endTime='', timeZone='UTC')), [])
+        self.assertEqual(
+            dayplan_mail.changed_fields(before, meeting(dueDate='2026-10-23', dueTime='', endTime='', timeZone='UTC')),
+            ['dueDate'],
+        )
+        self.assertEqual(dayplan_mail.changed_fields(before, meeting(timeZone='Europe/Paris')),
+                         ['dueTime', 'endTime', 'timeZone'])
+        self.assertEqual(dayplan_mail.changed_fields(meeting(), meeting(dueTime='', endTime='', timeZone='')),
+                         ['dueTime', 'endTime', 'timeZone'])
+        self.assertEqual(dayplan_mail.changed_fields(meeting(), meeting(timeZone='Europe/Paris')), ['timeZone'])
 
     def test_documents_added_or_removed(self):
         self.assertEqual(dayplan_mail.changed_fields(meeting(), meeting(resume=RESUME)), ['resume'])
@@ -532,6 +725,60 @@ class Compose(unittest.TestCase):
         msg = compose(meeting(), 'changed', previous=before)
         self.assertIn('- When: was Thu, Oct 22, 2026, 2:00 – 3:00 PM CDT (Chicago time), now', plain(msg))
 
+    @needs_zones
+    def test_time_zone_change_moves_the_start(self):
+        before = dayplan_mail.snapshot(meeting())
+        msg = compose(meeting(timeZone='America/Chicago'), 'changed', previous=before)
+        self.assertEqual(msg['Subject'], 'Meeting changed: Acme · now Thu, Oct 22, 2:00 PM CDT')
+        msg = compose(meeting(), 'changed', previous=dayplan_mail.snapshot(meeting(dueTime='', endTime='')))
+        self.assertEqual(msg['Subject'], 'Meeting changed: Acme · now Thu, Oct 22, 2:00 PM EDT')
+
+    @needs_zones
+    def test_now_only_when_the_start_people_read_changed(self):
+        before = dayplan_mail.snapshot(meeting())
+        # Toronto keeps New York's clocks: the When line names the new city, but the start is the same.
+        msg = compose(meeting(timeZone='America/Toronto'), 'changed', previous=before)
+        self.assertEqual(msg['Subject'], 'Meeting changed: Acme · Thu, Oct 22, 2:00 PM EDT')
+        self.assertIn(
+            '- When: was Thu, Oct 22, 2026, 2:00 – 3:00 PM EDT (New York time), '
+            'now Thu, Oct 22, 2026, 2:00 – 3:00 PM EDT (Toronto time)\n', plain(msg),
+        )
+        msg = compose(meeting(endTime='16:00'), 'changed', previous=before)  # only the end
+        self.assertEqual(msg['Subject'], 'Meeting changed: Acme · Thu, Oct 22, 2:00 PM EDT')
+        self.assertIn('- When: was Thu, Oct 22, 2026, 2:00 – 3:00 PM EDT (New York time), now', plain(msg))
+        # A date-only meeting moved to the next day did move.
+        msg = compose(meeting(dueDate='2026-10-23', dueTime='', endTime=''), 'changed',
+                      previous=dayplan_mail.snapshot(meeting(dueTime='', endTime='')))
+        self.assertEqual(msg['Subject'], 'Meeting changed: Acme · now Fri, Oct 23')
+
+    @needs_zones
+    def test_changes_nobody_would_see_go_out_as_the_details(self):
+        date_only = {'dueTime': '', 'endTime': ''}
+        cases = [
+            # A date-only meeting's time zone: the date reads the same in every zone.
+            (meeting(**date_only), meeting(timeZone='Europe/Paris', **date_only), ['timeZone']),
+            (meeting(**date_only), meeting(timeZone='Europe/Paris', **date_only), ()),
+            (meeting(**date_only), None, ['timeZone']),
+            # An end time without a start time isn't shown.
+            (meeting(dueTime='', endTime=''), meeting(dueTime='', endTime='16:00'), ['endTime']),
+            # A title that only differs in its spaces.
+            (meeting(title='Interview   with Acme'), meeting(), ['title']),
+            # A link that cleans up the same.
+            (meeting(meetingUrl='zoom.us/j/123'), meeting(), ['meetingUrl']),
+        ]
+        for after, before, changes in cases:
+            previous = dayplan_mail.snapshot(before) if before is not None else None
+            msg = compose(after, 'changed', previous=previous, changes=changes)
+            label = (after.get('timeZone'), changes)
+            self.assertTrue(msg['Subject'].startswith('Meeting details: Acme · Thu, Oct 22'), label)
+            self.assertNotIn('now', msg['Subject'], label)
+            text = plain(msg)
+            self.assertTrue(text.startswith('Meeting details: '), label)
+            self.assertNotIn('What changed', text, label)
+            self.assertNotIn('What changed', html_of(msg), label)
+            self.assertIn('add this meeting to your calendar', text, label)
+            parsed(msg)
+
     def test_folding(self):
         title = 'Entretien d’embauche à Zürich — équipe produit, étape finale ' * 3
         msg = compose(meeting(title=title, company='', meetingUrl='https://example.com/' + 'x' * 150))
@@ -603,6 +850,95 @@ class Injection(unittest.TestCase):
             with self.assertRaises(ValueError, msg=repr(address)):
                 dayplan_mail.test_message(CONFIG, address)
 
+    # Encoded words (RFC 2047) a To header would decode into more addresses.
+    CRAFTED = (
+        'a@=?utf-8?q?x.com=2cv1=40victim.org=2cv2=40victim.net?=',
+        'a@=?utf-8?q?x.com=2Cv1=40victim.org?=',
+        '=?utf-8?q?a=40x.com=2c?=b@example.com',
+        'a@=?utf-8?b?eC5jb20sdkB2aWN0aW0ub3Jn?=.org',
+        '9_%===40=_a=?utf-8?q?' + 'x' * 30 + '=?iso-8859-1?q?@=??b??=..ab}=28=2c',
+        'x' * 28 + '=22-!=5c`=3c中*中@=??b?=0d29.qujd0qujd9',
+    )
+
+    def test_encoded_words_cannot_add_recipients(self):
+        for address in self.CRAFTED:
+            self.assertFalse(dayplan_mail._valid_address(address), address)
+            with self.assertRaises(ValueError, msg=address):
+                compose(meeting(), recipient=address)
+            with self.assertRaises(ValueError, msg=address):
+                dayplan_mail.test_message(CONFIG, address)
+
+    def test_the_to_header_reads_back_as_just_the_address(self):
+        # Even without the "=?" rule, the To header must read back as the one address.
+        with mock.patch.object(dayplan_mail, 'ADDRESS_UNSAFE', re.compile(r'[\x00-\x1f<>(),;:"\[\]\\]')):
+            for address in self.CRAFTED[:4]:
+                with self.assertRaises(ValueError, msg=address):
+                    compose(meeting(), recipient=address)
+
+    def test_ordinary_addresses_still_work(self):
+        for address in ('viewer@example.com', 'a.b+tag@example.co.uk', "o'neil@example.com", 'user@bücher.de',
+                        'josé@example.com', 'a%b!c@example.com', 'x=y?z@example.com', 'a=b@example.com'):
+            for msg in (compose(meeting(), recipient=address), dayplan_mail.test_message(CONFIG, address)):
+                self.assertEqual([one.addr_spec for one in msg['To'].addresses], [address])
+                recipients, mail = written(msg)
+                self.assertEqual(recipients, [address])
+                self.assertEqual([one.addr_spec for one in mail['To'].addresses], [address])
+
+    def test_an_email_that_cannot_be_written_is_a_value_error(self):
+        header_write_error = getattr(email.errors, 'HeaderWriteError', email.errors.HeaderParseError)
+        for error in (IndexError('pop from empty list'), header_write_error('bad header'), AttributeError('x'),
+                      UnicodeEncodeError('ascii', 'é', 0, 1, 'ordinal not in range(128)')):
+            with mock.patch('dayplan_mail.BytesGenerator.flatten', side_effect=error):
+                with self.assertRaises(ValueError, msg=repr(error)):
+                    compose(meeting())
+                with self.assertRaises(ValueError, msg=repr(error)):
+                    dayplan_mail.test_message(CONFIG, 'me@example.com')
+
+    def test_a_to_header_the_parser_trips_over_is_a_value_error(self):
+        real = dayplan_mail.EmailMessage.__setitem__
+
+        def tripping(msg, name, value):
+            if name == 'To':
+                raise IndexError('pop from empty list')
+            return real(msg, name, value)
+
+        with mock.patch.object(dayplan_mail.EmailMessage, '__setitem__', tripping):
+            with self.assertRaises(ValueError):
+                compose(meeting())
+            with self.assertRaises(ValueError):
+                dayplan_mail.test_message(CONFIG, 'me@example.com')
+        broken = mock.MagicMock()
+        broken.__getitem__.side_effect = IndexError('pop from empty list')
+        self.assertEqual(dayplan_mail._header_address(broken), '')
+        self.assertEqual(dayplan_mail._header_address(None), '')
+
+    def test_odd_addresses(self):
+        """Random addresses that pass the check: each one either can't be emailed
+        (ValueError) or makes an email smtplib sends to exactly that address."""
+        rng = random.Random(2047)
+        alphabet = 'abcxyz019.-_+=?%!`{}|~#$&\'*/^@中éßİ\u200b\ufeff'
+        tried = written_ok = 0
+        while tried < 250:
+            address = '{}@{}.{}'.format(
+                ''.join(rng.choice(alphabet) for _ in range(rng.randint(1, 50))),
+                ''.join(rng.choice(alphabet) for _ in range(rng.randint(1, 20))),
+                ''.join(rng.choice(alphabet) for _ in range(rng.randint(1, 8))),
+            )
+            if not dayplan_mail._valid_address(address):
+                continue
+            tried += 1
+            for make in (lambda: compose(meeting(), recipient=address),
+                         lambda: dayplan_mail.test_message(CONFIG, address)):
+                try:
+                    msg = make()
+                except ValueError:
+                    continue
+                recipients, mail = written(msg)
+                self.assertEqual(recipients, [address])
+                self.assertEqual([one.addr_spec for one in mail['To'].addresses], [address])
+                written_ok += 1
+        self.assertGreater(written_ok, 100)  # the test did test something
+
     def test_html_is_escaped(self):
         msg = compose(meeting(title='<script>alert(1)</script>', company='Tom & "Jerry" <b>'))
         page = html_of(msg)
@@ -641,13 +977,27 @@ class TestMessage(unittest.TestCase):
         self.assertNotIn(PASSWORD, msg.as_string())
         self.assertNotIn('Open Dayplan', dayplan_mail.test_message(CONFIG, 'me@example.com').get_content())
 
+    def test_says_emails_are_on_unless_turned_off(self):
+        text = ' '.join(dayplan_mail.test_message(CONFIG, 'me@example.com').get_content().split())
+        self.assertIn(
+            'Approved accounts get an email when you send one about a meeting (added, changed or cancelled), '
+            'unless they turn these emails off in their account menu.', text,
+        )
+        self.assertNotIn('ask for them', text)
+
+    def test_needs_settings(self):
+        with self.assertRaises(MailError) as caught:
+            dayplan_mail.test_message(None, 'me@example.com')
+        self.assertFalse(caught.exception.retry)
+
 
 # ------------------------------------------------------------------- sending
 
 def fake_smtp(connect=None, starttls=None, login=None, refuse=(), on_send=None, on_quit=None):
     """A stand-in for smtplib.SMTP that records every call. Each argument is an
     exception to raise at that step; `refuse` holds recipients the server
-    refuses, and on_send(index, msg) may raise for any message."""
+    refuses, and on_send(index, msg) may raise for any message. Each send is
+    logged with the envelope's recipients (what the server delivers to)."""
     log = []
 
     class FakeSMTP:
@@ -678,11 +1028,14 @@ def fake_smtp(connect=None, starttls=None, login=None, refuse=(), on_send=None, 
             if login:
                 raise login
 
-        def send_message(self, msg):
+        def send_message(self, msg, to_addrs=None):
             index = len([entry for entry in log if entry[0] == 'send'])
-            log.append(('send', msg['To']))
-            if msg['To'] in refuse:
-                raise smtplib.SMTPRecipientsRefused({msg['To']: (550, b'5.1.1 No such user')})
+            if to_addrs is None:  # send() always says who to deliver to
+                raise AssertionError('no envelope recipients')
+            log.append(('send',) + tuple(to_addrs))
+            refused = {address: (550, b'5.1.1 No such user') for address in to_addrs if address in refuse}
+            if refused:
+                raise smtplib.SMTPRecipientsRefused(refused)
             if on_send:
                 on_send(index, msg)
 
@@ -725,12 +1078,12 @@ class Send(unittest.TestCase):
         fake, log = fake_smtp(refuse={'two@example.com'})
         self.assertEqual(self.send(fake), {'sent': ['one@example.com', 'three@example.com'], 'failed': ['two@example.com']})
 
-    def test_other_refusals(self):
+    def test_a_rejected_message_does_not_stop_the_others(self):
         def refuse(index, msg):
             if index == 0:
                 raise smtplib.SMTPDataError(550, b'5.7.1 Message rejected')
             if index == 1:
-                raise smtplib.SMTPSenderRefused(550, b'5.4.5 Daily limit exceeded', 'planner@gmail.com')
+                raise smtplib.SMTPDataError(554, b'5.7.0 Message looks like spam')
         fake, log = fake_smtp(on_send=refuse)
         self.assertEqual(self.send(fake), {'sent': ['three@example.com'], 'failed': ['one@example.com', 'two@example.com']})
 
@@ -760,6 +1113,7 @@ class Send(unittest.TestCase):
         self.assertIn('app password', message)
         self.assertIn('python3 ~/Todo_app/dayplan_api.py setup-email', message)
         self.assertSafe(caught.exception)
+        self.assertFalse(caught.exception.retry)  # trying again can't help
         self.assertNotIn('send', [entry[0] for entry in log])
 
     def test_cannot_connect(self):
@@ -770,6 +1124,7 @@ class Send(unittest.TestCase):
                 self.send(fake)
             self.assertIn('Could not connect to the email server smtp.gmail.com', str(caught.exception))
             self.assertSafe(caught.exception)
+            self.assertTrue(caught.exception.retry)
 
     def test_timeouts(self):
         for step in ('connect', 'starttls', 'login'):
@@ -778,6 +1133,7 @@ class Send(unittest.TestCase):
                 self.send(fake)
             self.assertIn('did not answer in time', str(caught.exception))
             self.assertSafe(caught.exception)
+            self.assertTrue(caught.exception.retry)
 
     def test_no_secure_connection(self):
         for error in (ssl.SSLError('certificate verify failed'), smtplib.SMTPNotSupportedError('no STARTTLS')):
@@ -788,13 +1144,14 @@ class Send(unittest.TestCase):
             self.assertNotIn('login', [entry[0] for entry in log])  # the password is never sent unencrypted
 
     def test_other_sign_in_problems(self):
-        for error in (smtplib.SMTPException('No suitable authentication method found.'),
-                      UnicodeEncodeError('ascii', PASSWORD + 'é', 16, 17, 'ordinal not in range(128)')):
+        for error, retry in ((smtplib.SMTPException('No suitable authentication method found.'), True),
+                             (UnicodeEncodeError('ascii', PASSWORD + 'é', 16, 17, 'ordinal not in range(128)'), False)):
             fake, log = fake_smtp(login=error)
             with self.assertRaises(MailError) as caught:
                 self.send(fake)
             self.assertIn('setup-email', str(caught.exception))
             self.assertSafe(caught.exception)
+            self.assertEqual(caught.exception.retry, retry)
 
     def test_nothing_to_send(self):
         fake, log = fake_smtp(connect=AssertionError('should not connect'))
@@ -807,6 +1164,7 @@ class Send(unittest.TestCase):
             with self.assertRaises(MailError) as caught:
                 dayplan_mail.send(None, self.messages())
         self.assertIn('setup-email', str(caught.exception))
+        self.assertFalse(caught.exception.retry)
         self.assertEqual(log, [])
 
     def test_own_server(self):
@@ -820,6 +1178,145 @@ class Send(unittest.TestCase):
             result = dayplan_mail.send(CONFIG, [dayplan_mail.test_message(CONFIG, 'me@example.com')])
         self.assertEqual(result, {'sent': ['me@example.com'], 'failed': []})
         self.assertEqual(log[0], ('connect', 'smtp.gmail.com', 587, 20))
+
+    def test_mail_error_retry(self):
+        self.assertTrue(MailError('Gmail did not answer.').retry)
+        self.assertFalse(MailError('Gmail refused the sign-in.', retry=False).retry)
+        self.assertEqual(str(MailError('Plain words.', retry=False)), 'Plain words.')
+
+    # ------------------------------------------- what the server delivers to
+
+    def test_each_email_goes_only_to_its_own_address(self):
+        connect, servers = scripted()
+        with mock.patch('dayplan_mail.smtplib.SMTP', connect):
+            result = dayplan_mail.send(CONFIG, self.messages(), timeout=7)
+        self.assertEqual(result, {'sent': self.RECIPIENTS, 'failed': []})
+        self.assertEqual(servers[0].envelopes, [['planner@gmail.com', [address]] for address in self.RECIPIENTS])
+        for (recipients, raw), address in zip(servers[0].delivered, self.RECIPIENTS):
+            self.assertEqual(recipients, [address])
+            mail = email.message_from_bytes(raw, policy=email.policy.default)
+            self.assertEqual([one.addr_spec for one in mail['To'].addresses], [address])
+
+    def test_an_email_whose_to_header_is_not_one_address_is_not_sent(self):
+        messages = self.messages()
+        messages[1].replace_header('To', 'two@example.com, extra@victim.org')  # changed after compose()
+        crafted = email.message.EmailMessage()
+        crafted['From'] = 'planner@gmail.com'
+        crafted['To'] = 'a@=?utf-8?q?x.com=2Cv1=40victim.org=2Cv2=40victim.net?='  # an email not made here
+        crafted.set_content('Hello')
+        empty = email.message.EmailMessage()
+        empty.set_content('No To header')
+        connect, servers = scripted()
+        with mock.patch('dayplan_mail.smtplib.SMTP', connect):
+            result = dayplan_mail.send(CONFIG, messages + [crafted, empty])
+        self.assertEqual(result['sent'], ['one@example.com', 'three@example.com'])
+        self.assertEqual(len(result['failed']), 3)
+        self.assertEqual(
+            [recipients for _, recipients in servers[0].envelopes], [['one@example.com'], ['three@example.com']],
+        )
+
+    def test_an_email_that_breaks_while_being_written_only_fails_itself(self):
+        header_write_error = getattr(email.errors, 'HeaderWriteError', email.errors.HeaderParseError)
+        for error in (IndexError('pop from empty list'), header_write_error('bad header'), TypeError('odd'),
+                      ValueError('bad'), UnicodeEncodeError('ascii', 'é', 0, 1, 'no'),
+                      smtplib.SMTPNotSupportedError('no SMTPUTF8')):
+            def explode(index, msg, error=error):
+                if index == 1:
+                    raise error
+            fake, log = fake_smtp(on_send=explode)
+            self.assertEqual(
+                self.send(fake), {'sent': ['one@example.com', 'three@example.com'], 'failed': ['two@example.com']},
+                repr(error),
+            )
+
+    # ----------------------------------------- refusals from the real smtplib
+
+    LIMIT = (550, b'5.4.5 Daily user sending limit exceeded. For more information, visit\n'
+                  b'5.4.5  https://support.google.com/a/answer/166852 ' + PASSWORD.encode() + b' - gsmtp')
+    BUSY = (421, b'4.7.0 Try again later, closing connection. (MAIL) ' + PASSWORD.encode() + b' - gsmtp')
+
+    def send_scripted(self, replies):
+        connect, servers = scripted(replies)
+        with mock.patch('dayplan_mail.smtplib.SMTP', connect):
+            return dayplan_mail.send(CONFIG, self.messages()), servers[0]
+
+    def assertQuiet(self, error):
+        """A MailError that doesn't repeat any of the server's own words."""
+        self.assertSafe(error)
+        for words in ('gsmtp', 'support.google.com', 'exceeded', '5.4.5', '4.7.0', 'closing connection', 'Try again later'):
+            self.assertNotIn(words, str(error))
+
+    def test_gmail_sending_limit(self):
+        for step in ('mail', 'rcpt', 'data'):
+            with self.assertRaises(MailError, msg=step) as caught:
+                self.send_scripted({step: {0: self.LIMIT}})
+            message = str(caught.exception)
+            self.assertIn("Gmail's daily sending limit", message)
+            self.assertIn('try again tomorrow', message)
+            self.assertFalse(caught.exception.retry)
+            self.assertQuiet(caught.exception)
+        for reply in ((550, b'5.4.5 Daily SMTP relay sending limit exceeded'), (550, b'Daily sending quota exceeded')):
+            with self.assertRaises(MailError) as caught:
+                self.send_scripted({'mail': {0: reply}})
+            self.assertFalse(caught.exception.retry)
+
+    def test_the_sending_limit_stops_the_rest(self):
+        connect, servers = scripted({'mail': {0: self.LIMIT}})
+        with mock.patch('dayplan_mail.smtplib.SMTP', connect), self.assertRaises(MailError):
+            dayplan_mail.send(CONFIG, self.messages())
+        self.assertEqual(len(servers[0].envelopes), 1)  # no use asking about the other two
+        result, server = self.send_scripted({'mail': {1: self.LIMIT}})
+        self.assertEqual(result, {'sent': ['one@example.com'], 'failed': ['two@example.com', 'three@example.com']})
+        self.assertEqual(len(server.envelopes), 2)
+
+    def test_try_again_later(self):
+        # 421: Gmail is closing the connection (too many emails just now, say).
+        for step in ('mail', 'rcpt', 'data'):
+            with self.assertRaises(MailError, msg=step) as caught:
+                self.send_scripted({step: {0: self.BUSY}})
+            message = str(caught.exception)
+            self.assertIn('smtp.gmail.com is not taking emails just now', message)
+            self.assertIn('try again in a few minutes', message)
+            self.assertTrue(caught.exception.retry)
+            self.assertQuiet(caught.exception)
+        result, server = self.send_scripted({'rcpt': {1: self.BUSY}})
+        self.assertEqual(result, {'sent': ['one@example.com'], 'failed': ['two@example.com', 'three@example.com']})
+        self.assertTrue(server.closed)
+
+    def test_the_sender_refused(self):
+        with self.assertRaises(MailError) as caught:
+            self.send_scripted({'mail': {0: (553, b'5.7.1 Sender ' + PASSWORD.encode() + b' not allowed')}})
+        self.assertIn('would not send emails from this account just now', str(caught.exception))
+        self.assertTrue(caught.exception.retry)
+        self.assertQuiet(caught.exception)
+        self.assertNotIn('not allowed', str(caught.exception))
+
+    def test_one_refused_recipient_or_message(self):
+        for step, reply in (('rcpt', (550, b'5.1.1 The email account that you tried to reach does not exist.')),
+                            ('rcpt', (452, b'4.2.2 The email account that you tried to reach is over quota.')),
+                            ('data', (552, b'5.7.0 This message was blocked because its content presents a risk.')),
+                            ('data', (554, b'5.6.0 Message rejected'))):
+            result, server = self.send_scripted({step: {1: reply}})
+            self.assertEqual(
+                result, {'sent': ['one@example.com', 'three@example.com'], 'failed': ['two@example.com']}, reply,
+            )
+            self.assertEqual(len(server.envelopes), 3)
+
+    def test_no_answer_before_the_first_email(self):
+        for error, words in ((socket.timeout('timed out'), 'did not answer in time'),
+                             (smtplib.SMTPServerDisconnected('Connection unexpectedly closed'), 'closed the connection'),
+                             (ConnectionResetError(104, 'Connection reset by peer'), 'closed the connection')):
+            for step in ('mail', 'data'):
+                with self.assertRaises(MailError, msg=(step, error)) as caught:
+                    self.send_scripted({step: {0: error}})
+                self.assertIn(words, str(caught.exception))
+                self.assertIn('try again in a few minutes', str(caught.exception))
+                self.assertTrue(caught.exception.retry)
+                self.assertSafe(caught.exception)
+
+    def test_no_answer_after_some_went(self):
+        result, server = self.send_scripted({'data': {2: socket.timeout('timed out')}})
+        self.assertEqual(result, {'sent': ['one@example.com', 'two@example.com'], 'failed': ['three@example.com']})
 
 
 if __name__ == '__main__':

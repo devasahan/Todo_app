@@ -140,6 +140,11 @@ def calendar_of(msg):
     return None
 
 
+def mail_error(message, retry):
+    """A dayplan_mail.MailError that says whether trying again can help."""
+    return dayplan_mail.MailError(message, retry=retry)
+
+
 class FakeGmail:
     """Stands in for smtplib.SMTP: keeps the emails instead of sending them."""
 
@@ -181,7 +186,7 @@ class FakeGmailConnection:
             raise self.server.login_error
         self.server.logins.append((username, password))
 
-    def send_message(self, msg):
+    def send_message(self, msg, from_addr=None, to_addrs=None, **kwargs):
         if self.server.on_send:
             self.server.on_send(msg)
         if msg['To'] in self.server.refuse:
@@ -264,6 +269,7 @@ class Accounts(ApiTestCase):
         me = client.get('/api/me')['json']
         self.assertEqual(me['user'], public(EMAIL, admin=True))
         self.assertEqual(me['pending'], 0)
+        self.assertIs(me['mailReady'], False)  # email isn't set up in these tests
         self.assertEqual(Client().get('/api/me')['json'], {'user': None, 'signup': True, 'first': False})
 
     def test_later_accounts_wait_for_approval(self):
@@ -345,6 +351,44 @@ class Accounts(ApiTestCase):
             {'email': EMAIL, 'password': '\ud800' * 10},
         ]:
             self.assertEqual(client.post('/api/register', body)['status'], 400, body)
+
+    def test_sign_up_refuses_addresses_that_could_email_strangers(self):
+        admin = self.signed_in()
+        conn = dayplan_api.connect()
+        dayplan_api.set_password(conn, 'old,one@example.com', PASSWORD)  # made before this check
+        conn.close()
+        invalid = Client().post('/api/register', {'email': 'not-an-email', 'password': PASSWORD})
+        self.assertEqual(invalid['status'], 400)
+        for email in [
+            # Encoded words, which mail programs decode: this one into three addresses.
+            'a@=?utf-8?q?x.com=2Cv1=40victim.org=2Cv2=40victim.net?=',
+            '=?utf-8?b?dkB2aWN0aW0ub3Jn?=@example.com',
+            'a=?b@example.com',
+            '=?UTF-8?Q?a?=@example.com',
+            # Characters that separate or quote addresses in a To line.
+            'a<b@example.com', 'a>b@example.com', 'a(b)@example.com', 'a,b@example.com', 'a;b@example.com',
+            'a:b@example.com', '"a"@example.com', 'a[b]@example.com', 'a\\b@example.com',
+            'old,one@example.com',  # the same answer for an account that exists
+            # Spaces, control characters and invisible formatting ones.
+            'a\x00b@example.com', 'a\x1fb@example.com', 'a\x7fb@example.com', 'a\x85b@example.com',
+            'a\x9bb@example.com', 'a\rb@example.com', 'a@example.com\nBcc: v@victim.org',
+            'a\u00a0b@example.com', 'a\u2028b@example.com', 'a\u200bb@example.com', 'a\u202eb@example.com',
+            'a\ufeffb@example.com', 'a\ue000b@example.com',
+        ]:
+            res = Client().post('/api/register', {'email': email, 'password': PASSWORD})
+            self.assertEqual((res['status'], res['json']), (invalid['status'], invalid['json']), repr(email))
+            self.assertNotIn('set_cookie', res)
+        self.assertEqual(admin.get('/api/me')['json']['pending'], 0)
+
+        # Everyday and international addresses still can, with spaces around them trimmed.
+        for email in ['first.last+dayplan@example.co.uk', "o'brien@example.com", 'josé@exämple.com',
+                      '用户@例子.广告', '  padded@example.com\t']:
+            res = Client().post('/api/register', {'email': email, 'password': PASSWORD})
+            self.assertEqual(res['status'], 202, email)
+        self.assertEqual(admin.get('/api/me')['json']['pending'], 5)
+        # An account made before sign-ups were checked this closely can still sign in.
+        res = Client().post('/api/login', {'email': 'old,one@example.com', 'password': PASSWORD})
+        self.assertEqual(res['status'], 200)
 
     def test_login_logout(self):
         self.signed_in()
@@ -1598,6 +1642,7 @@ class MeetingEmails(ApiTestCase):
             res = self.notify(status=502)
         self.assertIn('app password', res['error'])
         self.assertIn('setup-email', res['error'])
+        self.assertIs(res['retry'], False)  # the app password has to be fixed first
         self.assertNotIn(APP_PASSWORD, log.getvalue())
         self.assertIsNone(self.notice())  # nobody was told, so the next email is still the first
         self.gmail.login_error = None
@@ -1611,11 +1656,39 @@ class MeetingEmails(ApiTestCase):
         # Every address refused: an error, and what people were told is left as it was.
         self.gmail.refuse = {'friend@example.com', 'zoe@example.com'}
         self.save(self.meeting(dueTime='09:00'))
-        self.assertEqual(self.notify(status=502), {'error': 'Gmail refused every recipient.'})
+        self.assertEqual(self.notify(status=502), {'error': 'Gmail refused every recipient.', 'retry': True})
         snapshot, sequence, _ = self.notice()
         self.assertEqual((snapshot['dueTime'], sequence), ('14:00', 0))
         # Every round counts for the hour; only emails that went out count for the day.
         self.assertEqual([sent for _, sent in self.mail_log()], [0, 1, 0])
+
+    def test_whether_trying_again_can_help(self):
+        self.save(self.meeting())
+        # Gmail refused the sign-in, or the account reached its sending limit:
+        # the page shouldn't offer to try again. A dropped connection: it may.
+        for message, retry in [
+            ('smtp.gmail.com did not accept the email address and password.', False),
+            ("Gmail says this account has sent too many emails today. Please try again tomorrow.", False),
+            ('smtp.gmail.com closed the connection.', True),
+        ]:
+            error = mail_error(message, retry)
+            with mock.patch.object(dayplan_mail, 'send', side_effect=error):
+                res = self.notify(status=502)
+            self.assertEqual(res, {'error': message, 'retry': retry})
+        # An error that doesn't say (from an older dayplan_mail) may be tried again.
+        error = dayplan_mail.MailError('Could not connect to the email server smtp.gmail.com.')
+        vars(error).pop('retry', None)
+        with mock.patch.object(dayplan_mail, 'send', side_effect=error):
+            self.assertIs(self.notify(status=502)['retry'], True)
+        self.assertIsNone(self.notice())
+        self.assertEqual([sent for _, sent in self.mail_log()], [0, 0, 0, 0])
+
+        # No address could be emailed safely: nothing is sent, and it may be tried again.
+        with mock.patch.object(dayplan_mail, 'compose', side_effect=ValueError('unsafe address')):
+            res = self.notify(status=502)
+        self.assertEqual(res, {'error': 'Gmail refused every recipient.', 'retry': True})
+        self.assertEqual(self.gmail.connections, [])
+        self.assertEqual(len(self.mail_log()), 4)  # and it didn't use up a round
 
     def test_limits(self):
         self.save(self.meeting())
@@ -1691,6 +1764,23 @@ class MeetingEmails(ApiTestCase):
         self.assertFalse({u['email']: u['notify'] for u in overview['users']}['zoe@example.com'])
         dayplan_mail.delete_config(dayplan_api.mail_config_path())
         self.assertEqual(self.admin.get('/api/me')['json']['mail'], {**mail, 'ready': False, 'sender': '', 'recipients': 1})
+
+    def test_everyone_signed_in_sees_whether_email_is_set_up(self):
+        for client in (self.admin, self.friend):
+            self.assertIs(client.get('/api/me')['json']['mailReady'], True)
+        # A viewer learns only that: not the sending address or anything else about it.
+        me = self.friend.get('/api/me')
+        self.assertNotIn('mail', me['json'])
+        self.assertNotIn(SENDER.encode(), me['body'])
+        self.assertNotIn('mailReady', Client().get('/api/me')['json'])  # nor does anyone signed out
+
+        dayplan_mail.delete_config(dayplan_api.mail_config_path())
+        for client in (self.admin, self.friend):
+            self.assertIs(client.get('/api/me')['json']['mailReady'], False)
+        self.assertNotIn('mailReady', Client().get('/api/me')['json'])
+        # Set up from a console: it shows straight away, without a reload.
+        dayplan_mail.save_config(dayplan_api.mail_config_path(), {'username': SENDER, 'password': APP_PASSWORD})
+        self.assertIs(self.zoe.get('/api/me')['json']['mailReady'], True)
 
     def test_deleting_an_account_clears_its_notices(self):
         boss = self.member('boss@example.com', admin=True)

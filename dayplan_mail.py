@@ -1,10 +1,11 @@
 """Meeting emails for Dayplan, using only the Python standard library.
 
-When the admin schedules, changes or cancels a meeting, approved accounts
-that asked for it get an email: what the meeting is, when it is (in the
-meeting's own time zone and, when their clocks differ, in theirs), its
-links, and a calendar file (.ics) that adds it to a calendar. Notes, steps
-and tags never leave Dayplan, and the PDFs stay there too.
+When the admin sends one about a meeting they added, changed or cancelled,
+approved accounts get an email (unless they turned these emails off): what
+the meeting is, when it is (in the meeting's own time zone and, when their
+clocks differ, in theirs), its links, and a calendar file (.ics) that adds
+it to a calendar. Notes, steps and tags never leave Dayplan, and the PDFs
+stay there too.
 
 Emails go out through Gmail (smtp.gmail.com, port 587, STARTTLS), the only
 mail server a free PythonAnywhere account can reach, signed in with a Gmail
@@ -16,7 +17,9 @@ error message from here ever contains it.
 This module only writes and sends the emails. Who gets them, and when, is
 decided in dayplan_api.py.
 """
+import copy
 import html
+import io
 import json
 import os
 import re
@@ -26,6 +29,7 @@ import socket
 import ssl
 from collections import namedtuple
 from datetime import date, datetime, timedelta, timezone
+from email.generator import BytesGenerator
 from email.message import EmailMessage
 from email.utils import format_datetime, formataddr, make_msgid
 from pathlib import Path
@@ -58,8 +62,10 @@ FILE_NAME_MAX = 120
 SUBJECT_MAX = 150
 # The same check dayplan_api.py makes when an account is created.
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
-# ...plus characters that would let one address read as several in a To header.
-ADDRESS_UNSAFE = re.compile(r'[\x00-\x1f\x7f-\x9f<>(),;:"\[\]\\]')
+# ...plus characters that would let one address read as several in a To header,
+# and "=?", which starts an encoded word: a To header decodes
+# 'a@=?utf-8?q?x.com=2Cb=40y.org?=' into two addresses.
+ADDRESS_UNSAFE = re.compile(r'[\x00-\x1f\x7f-\x9f<>(),;:"\[\]\\]|=\?')
 DATE_RE = re.compile(r'(\d{4})-(\d{2})-(\d{2})')
 TIME_RE = re.compile(r'([01]\d|2[0-3]):([0-5]\d)')
 # An IANA time zone name such as America/New_York, Etc/GMT+3 or UTC.
@@ -68,7 +74,43 @@ ZONE_RE = re.compile(r'[A-Z][A-Za-z0-9_+-]*(?:/[A-Z][A-Za-z0-9_+-]*)*')
 CONTROL_RE = re.compile('[\x00-\x1f\x7f-\x9f  ]')
 WEEKDAYS = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
 MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
-# Time zone ids still use a few old city names (as in js/core.js).
+# Old names for time zones that browsers built on ICU (Chrome, Edge, Node)
+# still report, as Intl.supportedValuesOf('timeZone') lists them, with their
+# current names. A server whose time zone data leaves out the old names (the
+# tz "backward" links: Ubuntu 24.04 and Debian 13 without tzdata-legacy)
+# can't load them, and one with older data may not know the newer names
+# yet, so when one name can't be loaded the other is tried. The name as
+# saved is kept everywhere else, so it still matches what the browser uses.
+ZONE_ALIASES = {
+    'Africa/Asmera': 'Africa/Asmara',
+    'America/Buenos_Aires': 'America/Argentina/Buenos_Aires',
+    'America/Catamarca': 'America/Argentina/Catamarca',
+    'America/Coral_Harbour': 'America/Panama',
+    'America/Atikokan': 'America/Panama',
+    'America/Cordoba': 'America/Argentina/Cordoba',
+    'America/Godthab': 'America/Nuuk',
+    'America/Indianapolis': 'America/Indiana/Indianapolis',
+    'America/Jujuy': 'America/Argentina/Jujuy',
+    'America/Louisville': 'America/Kentucky/Louisville',
+    'America/Mendoza': 'America/Argentina/Mendoza',
+    'Asia/Calcutta': 'Asia/Kolkata',
+    'Asia/Katmandu': 'Asia/Kathmandu',
+    'Asia/Rangoon': 'Asia/Yangon',
+    'Asia/Saigon': 'Asia/Ho_Chi_Minh',
+    'Atlantic/Faeroe': 'Atlantic/Faroe',
+    'Europe/Kiev': 'Europe/Kyiv',
+    'Pacific/Enderbury': 'Pacific/Kanton',
+    'Pacific/Ponape': 'Pacific/Pohnpei',
+    'Pacific/Truk': 'Pacific/Chuuk',
+}
+# Each name with the names to try when it can't be loaded, both ways round.
+_ZONE_FALLBACKS = {}
+for _old, _new in ZONE_ALIASES.items():
+    _ZONE_FALLBACKS.setdefault(_old, []).append(_new)
+    _ZONE_FALLBACKS.setdefault(_new, []).append(_old)
+del _old, _new
+# Time zone ids still use a few old city names. The emails show the same
+# city as the app's time zone menu does (RENAMED_CITIES in js/core.js).
 RENAMED_CITIES = {
     'Calcutta': 'Kolkata',
     'Kiev': 'Kyiv',
@@ -109,7 +151,16 @@ FOOTER = (
 
 class MailError(Exception):
     """Email could not be sent. The message is plain English, safe to show the
-    admin, and never contains the password."""
+    admin, and never contains the password.
+
+    retry: False when trying again right away can't help (Gmail refused the
+    sign-in, or the account has reached Gmail's daily sending limit), so the
+    app shouldn't offer "Try again".
+    """
+
+    def __init__(self, message, retry=True):
+        super().__init__(message)
+        self.retry = bool(retry)
 
 
 # ------------------------------------------------------------------ settings
@@ -192,17 +243,25 @@ def delete_config(path):
 # --------------------------------------------------------------- time zones
 
 def _tz(name):
-    """The time zone for a valid name, or None when it can't be loaded (no zoneinfo)."""
+    """The time zone for a valid name, or None when it can't be loaded (no zoneinfo).
+
+    An old name such as Asia/Calcutta that this server's time zone data
+    doesn't have loads under its current one (Asia/Kolkata), and the other
+    way round (see ZONE_ALIASES).
+    """
     if ZoneInfo is None:
         return timezone.utc if name == 'UTC' else None
-    try:
-        return ZoneInfo(name)
-    except (KeyError, ValueError, OSError):  # ZoneInfoNotFoundError is a KeyError
-        return None
+    for candidate in [name] + _ZONE_FALLBACKS.get(name, []):
+        try:
+            return ZoneInfo(candidate)
+        except (KeyError, ValueError, OSError):  # ZoneInfoNotFoundError is a KeyError
+            continue
+    return None
 
 
 def valid_zone(name):
-    """True for an IANA time zone name such as America/New_York or UTC.
+    """True for an IANA time zone name such as America/New_York or UTC,
+    including the old names browsers still use (Asia/Calcutta, Europe/Kiev...).
 
     Without zoneinfo (Python 3.8) only the shape of the name can be checked.
     """
@@ -261,10 +320,16 @@ def changed_fields(before, after):
 
     Links count as changed only when the cleaned link differs, and documents
     only when a different file is attached (or one is added or removed).
+    The time zone counts only when dueTime is set on either side: for a date
+    alone it changes nothing people see. (notifyChanges in js/core.js
+    follows the same rules.)
     """
     old, new = snapshot(before), snapshot(after)
+    timed = bool(old['dueTime'] or new['dueTime'])
     changed = []
     for key in NOTIFY_FIELDS:
+        if key == 'timeZone' and not timed:
+            continue
         a, b = old[key], new[key]
         if key in URL_FIELDS:
             a, b = clean_url(a), clean_url(b)
@@ -610,10 +675,24 @@ def _ics_file_name(title, due_date):
 # -------------------------------------------------------------------- emails
 
 def _valid_address(address):
+    """True for one plain address (no name, no list) that a mail server is
+    asked to deliver to exactly as written."""
     return (
         isinstance(address, str) and len(address) <= 254
         and EMAIL_RE.fullmatch(address) is not None and not ADDRESS_UNSAFE.search(address)
+        # The address smtplib puts in RCPT TO (it reads it with parseaddr).
+        and smtplib.quoteaddr(address) == '<{}>'.format(address)
     )
+
+
+def _header_address(msg):
+    """The one address in an email's To header, or '' unless there is exactly one."""
+    try:
+        to = msg['To']
+        addresses = to.addresses if to is not None else ()
+        return addresses[0].addr_spec if len(addresses) == 1 else ''
+    except Exception:  # an email not made here, or a header the parser trips over
+        return ''
 
 
 def _message(config, recipient, subject, now):
@@ -621,17 +700,43 @@ def _message(config, recipient, subject, now):
     text from a meeting can add headers (or recipients) of its own."""
     config = _config(config)
     if config is None:
-        raise MailError(NOT_SET_UP)
+        raise MailError(NOT_SET_UP, retry=False)
     address = recipient.strip() if isinstance(recipient, str) else ''
     if not _valid_address(address):
         raise ValueError('Not a valid email address.')
     msg = EmailMessage()
     msg['Subject'] = _one_line(subject, SUBJECT_MAX)
     msg['From'] = formataddr((_one_line(config['from_name'], 100) or DEFAULT_FROM_NAME, _one_line(config['username'])))
-    msg['To'] = address
+    try:
+        msg['To'] = address
+    except Exception:  # the header parser trips over a few odd addresses
+        raise ValueError('Not a valid email address.') from None
+    # The To header must read back as this one address and nothing else:
+    # send() takes the address to deliver to from it.
+    if _header_address(msg) != address:
+        raise ValueError('Not a valid email address.')
     msg['Date'] = format_datetime(now, usegmt=True)
     msg['Message-ID'] = make_msgid(domain='dayplan')
     msg['Auto-Submitted'] = 'auto-generated'  # asks mail servers not to send out-of-office replies
+    return msg
+
+
+def _writable(msg, config):
+    """`msg`, after checking it can be written out the way smtplib's
+    send_message will write it. A few odd addresses make Python's header
+    writer fail (IndexError, HeaderWriteError...); that is a ValueError here,
+    so the address counts as one that can't be emailed rather than breaking
+    the whole send."""
+    address = _header_address(msg)
+    sender = _one_line(config['username'])
+    try:
+        # As send_message does: UTF-8 headers only when an address needs them.
+        international = not (address + sender).isascii()
+        policy = msg.policy.clone(utf8=True) if international else None
+        with io.BytesIO() as out:
+            BytesGenerator(out, policy=policy).flatten(copy.copy(msg), linesep='\r\n')
+    except Exception:
+        raise ValueError('This email could not be written for that address.') from None
     return msg
 
 
@@ -772,7 +877,11 @@ def compose(meeting, kind, *, recipient, site_url, config, recipient_zone='', ch
 
     Every kind but 'cancelled' carries a calendar file (.ics) when the
     meeting has a date. The subject of a change ends in "now <new start>"
-    when the start moved.
+    when the start people read moved. A 'changed' email whose changes don't
+    show (they read the same before and after) goes out as 'reminder'.
+
+    ValueError for an address that can't be emailed safely, MailError
+    without settings.
     """
     if kind not in KINDS:
         raise ValueError('Unknown kind of email: {}'.format(kind))
@@ -794,8 +903,20 @@ def compose(meeting, kind, *, recipient, site_url, config, recipient_zone='', ch
         wanted = set(changes or ())
         if not wanted and before is not None:
             wanted = set(changed_fields(before, snap))
+        if not (snap['dueTime'] or (before is not None and before['dueTime'])):
+            wanted.discard('timeZone')  # as in changed_fields: a date alone looks the same in every zone
         change_lines = _change_lines(wanted, before, snap, times)
-        moved = bool(wanted & {'dueDate', 'dueTime', 'timeZone'})
+        if not change_lines:
+            # Nothing people would see changed (the old and new versions read
+            # the same), so it goes out as the meeting's details instead of an
+            # empty "What changed" list.
+            kind = 'reminder'
+        elif any(key in wanted for key in WHEN_FIELDS):
+            # "now <start>" only when the start people read is different.
+            if before is not None:
+                moved = _short_when(_times(before)) != _short_when(times)
+            else:
+                moved = bool(wanted & {'dueDate', 'dueTime'}) or ('timeZone' in wanted and times.start is not None)
 
     name = company or _one_line(snap['title'], 80) or 'Meeting'
     subject = '{}: {}'.format(SUBJECTS[kind], _one_line(name, 80))
@@ -851,26 +972,27 @@ def compose(meeting, kind, *, recipient, site_url, config, recipient_zone='', ch
             ics.encode('utf-8'), maintype='text', subtype='calendar',
             filename=_ics_file_name(title, snap['dueDate']), params={'method': 'PUBLISH', 'charset': 'utf-8'},
         )
-    return msg
+    return _writable(msg, _config(config))
 
 
 def test_message(config, recipient, site_url=''):
     """A short email that shows email from Dayplan works."""
     config = _config(config)
     if config is None:
-        raise MailError(NOT_SET_UP)
+        raise MailError(NOT_SET_UP, retry=False)
     site = clean_url(site_url)
     lines = [
         'This is a test email from Dayplan. If you can read it, emails from Dayplan work.',
         '',
-        'Approved accounts that ask for them get an email when a meeting is added, changed or cancelled.',
+        'Approved accounts get an email when you send one about a meeting (added, changed or cancelled), '
+        'unless they turn these emails off in their account menu.',
         'They are sent from {} through {}.'.format(_one_line(config['username']), _one_line(config['host'])),
     ]
     if site:
         lines += ['', 'Open Dayplan: ' + site]
     msg = _message(config, recipient, 'Dayplan email test', _utc(None))
     msg.set_content('\n'.join(lines) + '\n', cte='quoted-printable')
-    return msg
+    return _writable(msg, config)
 
 
 # ------------------------------------------------------------------- sending
@@ -885,7 +1007,8 @@ def _failure(stage, error, config):
             '{} did not accept the email address and password. Dayplan needs a Gmail app password, '
             'not the normal Gmail password: turn on 2-Step Verification for the Google account, create an '
             'app password at https://myaccount.google.com/apppasswords, then run {} in a PythonAnywhere '
-            'console to save it.'.format(host, SETUP_COMMAND)
+            'console to save it.'.format(host, SETUP_COMMAND),
+            retry=False,
         )
     if isinstance(error, (socket.timeout, TimeoutError)):
         return MailError('The email server {} did not answer in time. Please try again in a few minutes.'.format(host))
@@ -903,7 +1026,8 @@ def _failure(stage, error, config):
         if isinstance(error, UnicodeError):
             return MailError(
                 'The email address or password has characters the email server does not accept. '
-                'Run {} to save them again.'.format(SETUP_COMMAND)
+                'Run {} to save them again.'.format(SETUP_COMMAND),
+                retry=False,
             )
         return MailError('Could not sign in to the email server {}. Run {} to check the settings.'.format(
             host, SETUP_COMMAND
@@ -911,15 +1035,57 @@ def _failure(stage, error, config):
     return MailError('The email server {} closed the connection. Please try again in a few minutes.'.format(host))
 
 
+def _sending_limit(code, reply):
+    """True for Gmail's "550 5.4.5 Daily user sending limit exceeded" (or quota)."""
+    text = reply if isinstance(reply, bytes) else str(reply).encode('utf-8', 'replace')
+    return code == 550 and (b'5.4.5' in text or re.search(rb'(?i)sending (limit|quota)', text) is not None)
+
+
+def _refused(code, reply, config):
+    """A MailError when a refusal is about the account, not one recipient:
+    the server's 421 (it is closing the connection: too many emails just
+    now, say) or Gmail's daily sending limit. None for anything else."""
+    if _sending_limit(code, reply):
+        return MailError(
+            "This Gmail account has reached Gmail's daily sending limit, so no more emails can go out today. "
+            'Please try again tomorrow.',
+            retry=False,
+        )
+    if code == 421:
+        return MailError('The email server {} is not taking emails just now. Please try again in a few minutes.'.format(
+            _one_line(str(config.get('host') or DEFAULT_HOST), 100)
+        ))
+    return None
+
+
+def _label(msg):
+    """Who an email was for, for the 'failed' list, when it has no address to send to."""
+    try:
+        return _one_line(str(msg['To'] or ''), 254)
+    except Exception:
+        return ''
+
+
 def send(config, messages, timeout=20):
     """Sends the emails over one connection. Returns {'sent': [...], 'failed': [...]}
     with each email's recipient (its To address).
 
+    Each email goes only to the one address in its To header: compose()
+    and test_message() checked that header reads back as exactly the
+    address they were given, and the server is told that one address (the
+    envelope), so no header can add recipients of its own. An email whose
+    To header isn't exactly one valid address isn't sent; it counts as failed.
+
     Raises MailError when nothing could be sent: no settings, no connection,
-    no secure connection, a refused sign-in, or no answer in time. A server
-    that refuses one email (a bad address, say) only fails that one; if the
-    connection breaks halfway, the rest fail. Without any messages, nothing
-    connects at all.
+    no secure connection, a refused sign-in, no answer in time, a connection
+    that broke before the first email went, or the server refusing to send
+    for this account (Gmail's daily sending limit, a 421 "try again later").
+    MailError.retry is False when trying again soon can't help.
+
+    A server that refuses one email (a bad address, a message it rejects)
+    only fails that one. If the connection breaks, or the server refuses the
+    account, after some emails went, the rest fail. Without any messages,
+    nothing connects at all.
     """
     messages = list(messages)
     result = {'sent': [], 'failed': []}
@@ -927,8 +1093,9 @@ def send(config, messages, timeout=20):
         return result
     config = _config(config)
     if config is None:
-        raise MailError(NOT_SET_UP)
+        raise MailError(NOT_SET_UP, retry=False)
     stage = 'connect'
+    stopped = None  # the MailError that stopped the batch, when the rest couldn't go
     finished = False
     try:
         with smtplib.SMTP(config['host'], config['port'], timeout=timeout) as smtp:
@@ -940,23 +1107,46 @@ def send(config, messages, timeout=20):
             smtp.login(config['username'], config['password'])
             stage = 'send'
             for index, msg in enumerate(messages):
-                recipient = str(msg['To'] or '')
+                recipient = _header_address(msg)
+                if not _valid_address(recipient):
+                    result['failed'].append(_label(msg))  # never handed to the server
+                    continue
                 try:
-                    smtp.send_message(msg)
-                except (
-                    smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError,
-                    smtplib.SMTPNotSupportedError, ValueError,
-                ):
-                    result['failed'].append(recipient)  # only this one was refused: carry on
-                except OSError:  # smtplib's other errors are OSErrors too
+                    smtp.send_message(msg, to_addrs=[recipient])
+                except smtplib.SMTPRecipientsRefused as error:
+                    # Usually about this address; a 421 or the sending limit is about the account.
+                    for code, reply in getattr(error, 'recipients', {}).values():
+                        stopped = stopped or _refused(code, reply, config)
+                except smtplib.SMTPSenderRefused as error:
+                    # The server won't send anything from this account just now.
+                    stopped = _refused(error.smtp_code, error.smtp_error, config) or MailError(
+                        'The email server {} would not send emails from this account just now. '
+                        'Please try again in a few minutes.'.format(_one_line(config['host'], 100))
+                    )
+                except smtplib.SMTPResponseException as error:  # SMTPDataError, say: the server rejected this email
+                    stopped = _refused(error.smtp_code, error.smtp_error, config)
+                except smtplib.SMTPNotSupportedError:
+                    pass  # an address the server can't take (no SMTPUTF8): only this one fails
+                except OSError as error:  # smtplib's other errors are OSErrors too
                     # The connection broke (or timed out): the rest can't go now.
-                    result['failed'] += [str(rest['To'] or '') for rest in messages[index:]]
-                    break
+                    stopped = _failure('send', error, config)
+                except Exception:
+                    pass  # this one email couldn't be written out or sent; the others still can
                 else:
                     result['sent'].append(recipient)
+                    continue
+                if stopped is None:
+                    result['failed'].append(recipient)  # only this one was refused: carry on
+                    continue
+                result['failed'] += [_header_address(rest) or _label(rest) for rest in messages[index:]]
+                break
             finished = True
     except (OSError, ValueError) as error:  # socket, TLS and smtplib errors are all OSErrors
         if not finished:
             raise _failure(stage, error, config) from None
         # Everything was handed over; only saying goodbye failed.
+    if stopped is not None and not result['sent']:
+        # Raised out here, after the connection is closed: closing a
+        # connection the server already dropped must not hide why.
+        raise stopped from None
     return result

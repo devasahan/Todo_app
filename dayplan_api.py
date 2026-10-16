@@ -116,6 +116,11 @@ SCHEDULE_FIELDS = (
     'timeZone', 'endTime', 'resume', 'coverLetter',
 )
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+# What a sign-up email may not contain, on top of EMAIL_RE: characters that
+# separate or quote addresses in an email's To line, and "=?", which starts an
+# encoded word (RFC 2047) that mail programs decode, e.g. into a comma and more
+# addresses. Either could turn one person's meeting email into one for strangers.
+EMAIL_UNSAFE_RE = re.compile(r'=\?|[<>(),;:"\[\]\\]')
 # Plan versions are compared by their ISO-8601 UTC time, e.g. 2026-10-14T09:30:00.000Z.
 STAMP_RE = re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?Z$')
 
@@ -367,10 +372,29 @@ def is_text(value, max_length):
     return True
 
 
+def new_email_ok(email):
+    """Whether a new account may sign up with `email` (already stripped).
+
+    Closer than the check for signing in: nothing in it may turn into more
+    recipients, a second header line or hidden text in a meeting email. That
+    rules out the characters in EMAIL_UNSAFE_RE, and any space, control or
+    invisible formatting character (one that can make an address read
+    backwards in Manage users, say).
+    """
+    return (
+        EMAIL_RE.match(email) is not None
+        and EMAIL_UNSAFE_RE.search(email) is None
+        and not any(unicodedata.category(ch)[0] in 'CZ' for ch in email)
+    )
+
+
 def read_credentials(body, creating):
     email = body.get('email')
     password = body.get('password')
-    if not is_text(email, 254) or not EMAIL_RE.match(email.strip()):
+    # Signing in keeps the plain check, so an account made before sign-ups were
+    # checked this closely can still sign in (meeting emails skip its address).
+    valid = new_email_ok if creating else EMAIL_RE.match
+    if not is_text(email, 254) or not valid(email.strip()):
         raise ApiError(400, 'Enter a valid email address.')
     if not is_text(password, MAX_PASSWORD):
         raise ApiError(400, 'Enter your password.')
@@ -490,6 +514,9 @@ def session_cookie(environ, token, max_age):
 # ---------------------------------------------------------------- endpoints
 
 def api_me(conn, environ, body):
+    """Who is signed in: {"user", "signup", "first"}. A signed-in account also
+    gets "mailReady" (whether meeting emails are set up); the admin also gets
+    "pending" and "mail" (see mail_status), which names the sending address."""
     user = current_user(conn, environ)
     payload = {
         'user': public_user(user) if user else None,
@@ -499,6 +526,11 @@ def api_me(conn, environ, body):
     if user and user['is_admin']:
         payload['pending'] = count_pending(conn)
         payload['mail'] = mail_status(conn)
+        payload['mailReady'] = payload['mail']['ready']
+    elif user:
+        # Everyone signed in may know whether email is set up at all (never who
+        # sends it), so the "Email me" switch can say when no email will come.
+        payload['mailReady'] = dayplan_mail.load_config(mail_config_path()) is not None
     return 200, payload, []
 
 
@@ -1134,8 +1166,10 @@ def api_notify(conn, environ, body):
     Each person gets their own email, so nobody sees who else got it. If
     email isn't set up, the answer is 409 with "notConfigured": true. If
     Gmail can't be reached or refuses every email, it is 502 and people's
-    last-emailed details are left as they were. Nobody to email is a 200
-    with "sent": 0.
+    last-emailed details are left as they were; its "retry" is false when
+    trying again right away can't help (Gmail refused the sign-in, or the
+    account reached Gmail's sending limit), so the page doesn't offer it.
+    Nobody to email is a 200 with "sent": 0.
     """
     user = require_admin(conn, environ)
     plan_id = body.get('id')
@@ -1214,7 +1248,7 @@ def api_notify(conn, environ, body):
         except ValueError:
             rejected += 1  # an address that can't be emailed safely
     if not messages:
-        raise ApiError(502, 'Gmail refused every recipient.')
+        raise ApiError(502, 'Gmail refused every recipient.', {'retry': True})
 
     reservation = reserve_emails(conn, len(messages))
     # No transaction is open here: sending can take a while, and the
@@ -1224,7 +1258,9 @@ def api_notify(conn, environ, body):
     except dayplan_mail.MailError as err:
         with conn:
             conn.execute('UPDATE mail_log SET recipients = 0 WHERE rowid = ?', (reservation,))
-        raise ApiError(502, str(err))
+        # Trying again is offered unless the error says it can't help
+        # (getattr: an older dayplan_mail's errors don't say).
+        raise ApiError(502, str(err), {'retry': bool(getattr(err, 'retry', True))})
     sent = len(result['sent'])
     failed = len(result['failed']) + rejected
     with conn:
@@ -1239,7 +1275,7 @@ def api_notify(conn, environ, body):
                  1 if cancel else 0, int(time.time())),
             )
     if not sent:
-        raise ApiError(502, 'Gmail refused every recipient.')
+        raise ApiError(502, 'Gmail refused every recipient.', {'retry': True})
     return 200, {'sent': sent, 'failed': failed, 'recipients': len(recipients), 'kind': kind}, []
 
 

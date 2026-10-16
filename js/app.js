@@ -1210,6 +1210,7 @@
     tags: [],
     checklist: [],
     snapshot: '',
+    notifyBase: null, // the meeting as the editor opened it, for "Email approved people"
     notifyTouched: false, // the admin ticked or unticked "Email approved people" themselves
   };
   const field = (name) => editor.form.elements.namedItem(name);
@@ -1300,8 +1301,11 @@
     $('#title-error').hidden = true;
     editor.snapshot = editorSnapshot();
     editor.original = editorValues(); // to save only what the user changes
+    // What the email box compares with: the meeting as shown, so a meeting
+    // saved before time zones existed doesn't count its zone as a change.
+    editor.notifyBase = editor.original;
     // A meeting saved before time zones existed: saving it stores the zone shown.
-    if (plan && C.isMeeting(plan)) editor.original.timeZone = plan.timeZone || '';
+    if (plan && C.isMeeting(plan)) editor.original = { ...editor.original, timeZone: plan.timeZone || '' };
     editor.notifyTouched = false;
     if (sync.admin) refreshAccountInfo({ maxAge: 30 * 1000 }); // who'd get an email
     applyKind();
@@ -1366,7 +1370,7 @@
     if (!ready) box.checked = false;
     else if (!editor.notifyTouched) {
       const wasMeeting = editor.id && editor.original?.kind === 'meeting';
-      box.checked = !wasMeeting || C.notifyChanges(editor.original, editorValues()).length > 0;
+      box.checked = !wasMeeting || C.notifyChanges(editor.notifyBase, editorValues()).length > 0;
     }
     const people = `${mail.recipients} ${mail.recipients === 1 ? 'person' : 'people'}`;
     let hint;
@@ -1753,8 +1757,8 @@
       if (values.status === 'done') celebrate(point);
       const addToCalendar = { action: 'Add to my calendar', onAction: () => downloadICS(findPlan(plan.id) || plan) };
       if (notify) {
-        toast(`Added “${truncate(plan.title)}”. Emailing people…`);
-        notifyPeople(plan.id, { done: plan.dueDate ? addToCalendar : null });
+        const own = toast(`Added “${truncate(plan.title)}”. Emailing people…`);
+        notifyPeople(plan.id, { done: plan.dueDate ? addToCalendar : null, own });
       } else if (C.isMeeting(plan) && plan.dueDate) {
         toast(`Added “${truncate(plan.title)}” for ${C.dueInfo(plan).full}`, addToCalendar);
       } else {
@@ -1788,7 +1792,7 @@
     }
     const newStatus = values.status !== editor.original.status && values.status !== before.status ? values.status : '';
     if (!Object.keys(changes).length && !newStatus) {
-      if (notify) notifyPeople(editor.id); // nothing changed: send the details again
+      if (notify) notifyPeople(editor.id, { own: toast('Emailing people…') }); // nothing changed: the details again
       return;
     }
 
@@ -1802,10 +1806,8 @@
     if (newStatus) plans = placeAtTop(plans, editor.id, newStatus);
     setPlans(plans);
     if (newStatus === 'done') celebrate(point);
-    if (notify) {
-      toast('Saved. Emailing people…');
-      notifyPeople(editor.id); // sent once this change has reached the server
-    }
+    // Sent once this change has reached the server.
+    if (notify) notifyPeople(editor.id, { own: toast('Saved. Emailing people…') });
   }
 
   function setupEditor() {
@@ -2159,11 +2161,15 @@
 
   let toastTimer = null;
   let toastDuration = 0;
+  let toastCount = 0;
+  let toastShown = { id: 0, action: false }; // the toast on screen, and whether it has a button
+  const laterToasts = []; // news waiting for a toast with a button (e.g. Undo) to go away
 
   function hideToast() {
     const el = $('#toast');
     el.classList.remove('show');
     clearTimeout(toastTimer);
+    toastShown = { id: 0, action: false };
     setTimeout(() => {
       if (el.classList.contains('show')) return;
       el.hidden = true;
@@ -2172,7 +2178,17 @@
       } catch {
         /* no Popover API */
       }
+      const next = laterToasts.shift();
+      if (next) toast(next.message, next.options);
     }, 250);
+  }
+
+  // For news that arrives a while after the action (e.g. an email went out):
+  // it waits while another toast offers a button, so that Undo isn't lost.
+  // `own` is the toast that announced the work, which the news replaces.
+  function toastLater(message, options = {}, own = 0) {
+    if (toastShown.action && toastShown.id !== own) laterToasts.push({ message, options });
+    else toast(message, options);
   }
 
   // Shown as a popover so it sits above any open dialog (e.g. Manage users).
@@ -2209,6 +2225,8 @@
     toastDuration = action2 ? 9000 : action ? 7000 : 3500;
     clearTimeout(toastTimer);
     toastTimer = setTimeout(hideToast, toastDuration);
+    toastShown = { id: ++toastCount, action: Boolean(action || action2) };
+    return toastShown.id;
   }
 
   /* ------------------------------------------------------------ confetti */
@@ -2471,6 +2489,7 @@
     notify: true,
     zone: '',
     mail: null,
+    mailReady: false, // email is set up on the server
     epoch: '', // id of the server database this browser synced with
     cursor: 0, // last server revision this browser has seen
     pending: new Set(), // plan ids changed here and not yet sent
@@ -2527,6 +2546,7 @@
     sync.notify = true;
     sync.zone = '';
     sync.mail = null;
+    sync.mailReady = false;
     sync.epoch = '';
     sync.cursor = 0;
     sync.pending.clear();
@@ -3343,26 +3363,45 @@
   /*
    * Emails everyone who can view the schedule about a meeting, once the
    * meeting as it is here has reached the server. The server works out what
-   * to say: new, changed, back on, or the same details again. `cancel` says
-   * it's cancelled instead. `done` is an optional toast button for success.
+   * to say: new, changed, back on, or the same details again. Options:
+   * - cancel: say it's cancelled instead (see cancelMeeting), with `undo`
+   *   bringing the deleted meeting back;
+   * - done: a toast button for success, e.g. Add to my calendar;
+   * - own: the toast that said "Emailing people…", which the result replaces;
+   * - title: the meeting's name, once it's deleted.
    */
-  function notifyPeople(id, { cancel = false, done = null, title = '', onCancelled = null } = {}) {
-    const run = () => sendNotice(id, { cancel, done, title, onCancelled });
+  function notifyPeople(id, options = {}) {
+    // A cancellation can't wait its turn: it must reach the server before
+    // the deletion does, while the server still has the meeting.
+    if (options.cancel) return sendNotice(id, options);
+    const run = () => sendNotice(id, options);
     notifyChain = notifyChain.then(run, run);
     return notifyChain;
   }
 
-  async function sendNotice(id, { cancel, done, title, onCancelled }) {
+  async function sendNotice(id, options) {
+    const { cancel = false, done = null, own = 0, title = '', undo = null } = options;
     const user = sync.user;
     const name = () => truncate((findPlan(id) || {}).title || title || 'the meeting');
-    const retry = () => notifyPeople(id, { cancel, done, title, onCancelled });
+    const back = (told) =>
+      toastLater(`“${name()}” is back, but ${told} it's cancelled.`, { action: 'Email people', onAction: () => notifyPeople(id) }, own);
+    // Brought back, or deleted, before this went out: it no longer applies.
+    if (cancel && findPlan(id)) {
+      toastLater(`“${name()}” is back, so no cancellation was sent.`, {}, own);
+      return;
+    }
+    if (!cancel && !findPlan(id)) return;
+
     let result;
     try {
       for (let attempt = 0; ; attempt++) {
-        if (!cancel) await syncedUp(id);
+        if (!cancel) {
+          await syncedUp(id);
+          if (!findPlan(id)) return; // deleted meanwhile
+        }
         const plan = findPlan(id);
         const body = { id, cancel };
-        if (!cancel && plan) body.updatedAt = plan.updatedAt;
+        if (!cancel) body.updatedAt = plan.updatedAt;
         try {
           result = await api('api/notify', body, { timeout: NOTIFY_TIMEOUT_MS });
           break;
@@ -3381,26 +3420,48 @@
         signedOutElsewhere();
         return;
       }
-      const reason = err.status || err.notSaved ? err.message : "Couldn't reach the server. Check your connection.";
-      const what = cancel ? `The cancellation email for “${name()}” wasn't sent.` : `The email about “${name()}” wasn't sent.`;
-      const notConfigured = Boolean(err.data && err.data.notConfigured);
-      if (notConfigured && sync.mail) sync.mail = { ...sync.mail, ready: false };
-      // Trying again helps unless email isn't set up or this account can't send.
-      if (notConfigured || err.status === 403) toast(`${what} ${reason}`);
-      else toast(`${what} ${reason}`, { action: 'Try again', onAction: retry });
+      const what = cancel ? `the cancellation email for “${name()}”` : `the email about “${name()}”`;
+      const data = err.data || {};
+      if (data.notConfigured && sync.mail) sync.mail = { ...sync.mail, ready: false };
+      let message;
+      let again = 'Try again';
+      if (!err.status && !err.notSaved) {
+        // The request may have reached the server, and the email gone out.
+        message = `Couldn't confirm that ${what} went out. Check your connection.`;
+        again = 'Send again';
+      } else {
+        message = `${what.charAt(0).toUpperCase()}${what.slice(1)} wasn't sent. ${err.message}`;
+      }
+      // Trying again only helps with a connection or Gmail hiccup.
+      const retryable = !err.status || err.notSaved || data.notSaved || err.status === 404 || (err.status >= 500 && data.retry !== false);
+      const retry = { label: retryable ? again : '', run: () => notifyPeople(id, { ...options, own: 0 }) };
+      if (cancel && undo && !findPlan(id)) {
+        toastLater(message, { action: 'Undo', onAction: undo, action2: retry.label, onAction2: retry.run }, own);
+      } else {
+        toastLater(message, retry.label ? { action: retry.label, onAction: retry.run } : {}, own);
+      }
       return;
     }
     if (sync.user !== user) return;
     if (sync.mail && typeof result.recipients === 'number') sync.mail = { ...sync.mail, recipients: result.recipients };
     if (!result.sent) {
-      toast(result.recipients ? `No email was sent about “${name()}”.` : `No one to email about “${name()}”: nobody has these emails turned on.`);
+      const nobody = `No one to email about “${name()}”: nobody has these emails turned on.`;
+      toastLater(result.recipients ? `No email was sent about “${name()}”.` : nobody, {}, own);
       return;
     }
     const people = peopleCount(result.sent);
     const failed = result.failed ? ` ${peopleCount(result.failed)} couldn't be reached.` : '';
+    const told = `${people} ${result.sent === 1 ? 'was' : 'were'} told`;
     if (result.kind === 'cancelled') {
-      if (onCancelled) onCancelled(`${people} ${result.sent === 1 ? 'was' : 'were'} told “${name()}” is cancelled.${failed}`);
-      else toast(`Told ${people} that “${name()}” is cancelled.${failed}`);
+      if (findPlan(id)) {
+        back(told); // undone while the email was being sent
+        return;
+      }
+      const undoAndOffer = () => {
+        undo();
+        if (findPlan(id)) back(told);
+      };
+      toastLater(`Deleted “${name()}”. Told ${people} it's cancelled.${failed}`, undo ? { action: 'Undo', onAction: undoAndOffer } : {}, own);
       return;
     }
     const message = {
@@ -3409,42 +3470,22 @@
       restored: `Emailed ${people} that “${name()}” is back on.`,
       reminder: `Emailed the details of “${name()}” to ${people}.`,
     }[result.kind] || `Emailed ${people} about “${name()}”.`;
-    toast(message + failed, done || {});
+    toastLater(message + failed, done || {}, own);
   }
 
-  // Deletes a meeting and tells people it's cancelled. The request goes out
-  // before the deletion is synced, while the server still has the meeting.
+  // Deletes a meeting and tells people it's cancelled.
   function cancelMeeting(plan) {
     const undo = deletePlan(plan.id);
-    toast(`Deleted “${truncate(plan.title)}”. Emailing people…`, { action: 'Undo', onAction: undo });
-    notifyPeople(plan.id, {
-      cancel: true,
-      title: plan.title,
-      onCancelled: (told) => {
-        const back = () => {
-          toast(`“${truncate(plan.title)}” is back. People still think it's cancelled.`, {
-            action: 'Email people',
-            onAction: () => notifyPeople(plan.id),
-          });
-        };
-        if (findPlan(plan.id)) back(); // undone while the email was being sent
-        else {
-          toast(`Deleted “${truncate(plan.title)}”. ${told}`, {
-            action: 'Undo',
-            onAction: () => {
-              undo();
-              back();
-            },
-          });
-        }
-      },
-    });
+    const own = toast(`Deleted “${truncate(plan.title)}”. Emailing people…`, { action: 'Undo', onAction: undo });
+    notifyPeople(plan.id, { cancel: true, title: plan.title, own, undo });
   }
 
   // What the server knows about this account's emails (and, for the admin,
   // whether email is set up and who would get one).
   function applyAccountInfo(me) {
     if (!me || !me.user || me.user.email !== sync.user) return;
+    accountInfoAt = Date.now();
+    sync.mailReady = me.mailReady === true;
     sync.notify = me.user.notify !== false;
     sync.zone = typeof me.user.timeZone === 'string' ? me.user.timeZone : '';
     sync.mail = sync.admin && me.mail && typeof me.mail === 'object' ? me.mail : null;
@@ -3461,10 +3502,7 @@
     if (accountInfoRequest) return accountInfoRequest;
     if (maxAge && Date.now() - accountInfoAt < maxAge) return Promise.resolve();
     accountInfoRequest = api('api/me')
-      .then((me) => {
-        accountInfoAt = Date.now();
-        applyAccountInfo(me);
-      })
+      .then(applyAccountInfo)
       .catch(() => {
         /* the next sync or reload tries again */
       })
@@ -3493,10 +3531,11 @@
       });
   }
 
-  // "Email me about meeting changes", in the account menu of people who view the schedule.
+  // "Email me about meeting changes", in the account menu of people who view
+  // the schedule, once the admin has set up email.
   function updateEmailMe() {
     const item = $('#email-me');
-    item.hidden = !viewing();
+    item.hidden = !(viewing() && sync.mailReady);
     item.setAttribute('aria-checked', String(sync.notify));
   }
 
@@ -3510,7 +3549,7 @@
       if (sync.user !== user) return;
       toast(
         wanted
-          ? "You'll get an email when a meeting is added, changed or cancelled."
+          ? "Meeting emails are on. You'll get one when the admin sends news about a meeting."
           : 'Meeting emails are off. You can still see every meeting here.'
       );
     } catch (err) {
@@ -4027,6 +4066,7 @@
       if (document.hidden) return;
       render();
       syncNow();
+      refreshAccountInfo({ maxAge: 60 * 1000 }); // e.g. email was set up meanwhile
     });
     window.addEventListener('online', () => {
       if (sync.connected) syncNow();

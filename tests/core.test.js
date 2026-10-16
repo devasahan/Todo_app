@@ -1631,3 +1631,13 @@ test('notifyChanges lists changes in NOTIFY_FIELDS order and copes with a missin
   assert.deepEqual(all, C.NOTIFY_FIELDS);
   assert.notEqual(all, C.NOTIFY_FIELDS);
 });
+
+test('notifyChanges ignores the time zone of a meeting without a time', () => {
+  const dateOnly = { dueDate: '2026-10-22', dueTime: '', timeZone: 'America/New_York' };
+  assert.deepEqual(C.notifyChanges(dateOnly, { ...dateOnly, timeZone: 'Europe/Paris' }), []);
+  assert.deepEqual(C.notifyChanges(dateOnly, { ...dateOnly, timeZone: '' }), []);
+  // Once either side has a time, the zone moves the meeting.
+  assert.deepEqual(C.notifyChanges(dateOnly, { ...dateOnly, dueTime: '14:00', timeZone: 'Europe/Paris' }), ['dueTime', 'timeZone']);
+  assert.deepEqual(C.notifyChanges({ ...dateOnly, dueTime: '14:00' }, { ...dateOnly, timeZone: 'Europe/Paris' }), ['dueTime', 'timeZone']);
+  assert.deepEqual(C.notifyChanges({ ...dateOnly, dueTime: '14:00' }, { ...dateOnly, dueTime: '14:00', timeZone: 'Europe/Paris' }), ['timeZone']);
+});
